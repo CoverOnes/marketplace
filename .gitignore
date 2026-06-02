@@ -1,0 +1,21 @@
+# Build artifacts
+build/
+*.exe
+*.test
+*.out
+
+# Environment files (never commit secrets)
+.env
+.env.local
+local.yaml
+application-local.yaml
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
