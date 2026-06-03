@@ -128,6 +128,30 @@ func TestConfig_Load(t *testing.T) {
 			},
 			wantErr: true,
 		},
+		{
+			name: "happy path: explicit db pool sizing",
+			envVars: map[string]string{
+				"MARKETPLACE_POSTGRES_DSN": testDSN,
+				"MARKETPLACE_PORT":         "8081",
+				"MARKETPLACE_LOG_LEVEL":    "INFO",
+				"MARKETPLACE_ENV":          "development",
+				"MARKETPLACE_DB_MAX_CONNS": "3",
+				"MARKETPLACE_DB_MIN_CONNS": "1",
+			},
+			wantErr: false,
+		},
+		{
+			name: "happy path: zero db pool sizing uses defaults",
+			envVars: map[string]string{
+				"MARKETPLACE_POSTGRES_DSN": testDSN,
+				"MARKETPLACE_PORT":         "8081",
+				"MARKETPLACE_LOG_LEVEL":    "INFO",
+				"MARKETPLACE_ENV":          "development",
+				"MARKETPLACE_DB_MAX_CONNS": "0",
+				"MARKETPLACE_DB_MIN_CONNS": "0",
+			},
+			wantErr: false,
+		},
 	}
 
 	for _, tc := range tests {
@@ -138,6 +162,7 @@ func TestConfig_Load(t *testing.T) {
 			allKnownVars := []string{
 				"MARKETPLACE_POSTGRES_DSN", "MARKETPLACE_PORT", "MARKETPLACE_LOG_LEVEL",
 				"MARKETPLACE_ENV", "MARKETPLACE_DB_SCHEMA", "MARKETPLACE_REDIS_URL",
+				"MARKETPLACE_DB_MAX_CONNS", "MARKETPLACE_DB_MIN_CONNS",
 			}
 			for _, k := range allKnownVars {
 				t.Setenv(k, "")

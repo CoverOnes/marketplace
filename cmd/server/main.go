@@ -82,7 +82,12 @@ func run() error {
 	// Postgres pool (CONVENTIONS §12).
 	// cfg.PostgresSchema is "" by default (public schema); set MARKETPLACE_DB_SCHEMA
 	// to isolate this service within a shared Aiven database.
-	pool, err := postgres.NewPool(ctx, cfg.PostgresDSN, cfg.PostgresSchema)
+	// cfg.DBMaxConns / cfg.DBMinConns default to 10 / 2; lower them when sharing a
+	// small Aiven plan across multiple services (MARKETPLACE_DB_MAX_CONNS / _MIN_CONNS).
+	pool, err := postgres.NewPool(ctx, cfg.PostgresDSN, cfg.PostgresSchema, postgres.PoolOptions{
+		MaxConns: int32(cfg.DBMaxConns),
+		MinConns: int32(cfg.DBMinConns),
+	})
 	if err != nil {
 		return fmt.Errorf("connect postgres: %w", err)
 	}

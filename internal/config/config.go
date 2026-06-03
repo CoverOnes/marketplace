@@ -29,6 +29,15 @@ type Config struct {
 	// Only alphanumeric characters and underscores are allowed ([a-zA-Z0-9_]+).
 	PostgresSchema string `mapstructure:"postgres_schema"`
 
+	// DBMaxConns is the maximum number of connections in the pgxpool (default: 10).
+	// Lower this when running multiple services against a small Aiven plan.
+	// Env: MARKETPLACE_DB_MAX_CONNS
+	DBMaxConns int `mapstructure:"db_max_conns"`
+
+	// DBMinConns is the minimum number of idle connections in the pgxpool (default: 2).
+	// Env: MARKETPLACE_DB_MIN_CONNS
+	DBMinConns int `mapstructure:"db_min_conns"`
+
 	// Redis (optional — nil Redis = event publish no-op + in-process rate limiter)
 	RedisURL string `mapstructure:"redis_url"`
 
@@ -54,6 +63,8 @@ func Load() (*Config, error) {
 		"redis_url":       "MARKETPLACE_REDIS_URL",
 		"log_level":       "MARKETPLACE_LOG_LEVEL",
 		"env":             "MARKETPLACE_ENV",
+		"db_max_conns":    "MARKETPLACE_DB_MAX_CONNS",
+		"db_min_conns":    "MARKETPLACE_DB_MIN_CONNS",
 	}
 
 	for key, envKey := range bindings {
@@ -65,6 +76,8 @@ func Load() (*Config, error) {
 	v.SetDefault("port", 8081)
 	v.SetDefault("log_level", "INFO")
 	v.SetDefault("env", "development")
+	v.SetDefault("db_max_conns", 10)
+	v.SetDefault("db_min_conns", 2)
 
 	var cfg Config
 
@@ -102,6 +115,14 @@ func (c *Config) validate() error {
 
 	if c.PostgresSchema != "" && !schemaNameRe.MatchString(c.PostgresSchema) {
 		errs = append(errs, "MARKETPLACE_DB_SCHEMA must start with a letter or underscore and contain only [a-zA-Z0-9_] characters")
+	}
+
+	if c.DBMaxConns < 0 || c.DBMaxConns > 65535 {
+		errs = append(errs, "MARKETPLACE_DB_MAX_CONNS must be 0-65535 (0 = use default of 10)")
+	}
+
+	if c.DBMinConns < 0 || c.DBMinConns > 65535 {
+		errs = append(errs, "MARKETPLACE_DB_MIN_CONNS must be 0-65535 (0 = use default of 2)")
 	}
 
 	if len(errs) > 0 {
