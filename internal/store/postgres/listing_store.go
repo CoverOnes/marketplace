@@ -54,6 +54,10 @@ func (s *txListingStore) List(ctx context.Context, filter store.ListingFilter) (
 	return listListings(ctx, s.tx, filter)
 }
 
+func (s *txListingStore) Search(ctx context.Context, filter store.SearchFilter) ([]*domain.Listing, error) {
+	return searchListings(ctx, s.tx, filter)
+}
+
 func (s *txListingStore) Update(ctx context.Context, l *domain.Listing) error {
 	return updateListing(ctx, s.tx, l)
 }
@@ -77,6 +81,11 @@ func (s *ListingStore) GetByIDForUpdate(ctx context.Context, id uuid.UUID) (*dom
 // List returns listings matching the filter.
 func (s *ListingStore) List(ctx context.Context, filter store.ListingFilter) ([]*domain.Listing, error) {
 	return listListings(ctx, s.q, filter)
+}
+
+// Search runs a full-text + structured filter query with keyset pagination.
+func (s *ListingStore) Search(ctx context.Context, filter store.SearchFilter) ([]*domain.Listing, error) {
+	return searchListings(ctx, s.q, filter)
 }
 
 // Update persists changes to a listing.
@@ -198,6 +207,111 @@ WHERE deleted_at IS NULL`)
 	}
 
 	return listings, nil
+}
+
+// ftsExpr is the full-text vector expression. It MUST stay byte-for-byte
+// identical to the GIN index expression in migration 000004 so the planner can
+// use the index; otherwise Postgres falls back to a sequential scan.
+const ftsExpr = `to_tsvector('simple', coalesce(title, '') || ' ' || coalesce(description, ''))`
+
+// searchListings runs the full-text + structured-filter search query with
+// keyset pagination. Rows are ordered newest-first (created_at DESC, id DESC),
+// a stable total order that the (created_at, id) cursor pages through. When a
+// query string is supplied it is additionally filtered by plainto_tsquery; the
+// ordering stays keyset-stable on (created_at, id) so the cursor remains sound.
+func searchListings(ctx context.Context, q querier, filter store.SearchFilter) ([]*domain.Listing, error) {
+	sb, args := buildSearchQuery(filter)
+
+	rows, err := q.Query(ctx, sb, args...)
+	if err != nil {
+		return nil, fmt.Errorf("search listings: %w", err)
+	}
+
+	defer rows.Close()
+
+	var listings []*domain.Listing
+
+	for rows.Next() {
+		l, scanErr := scanListing(rows)
+		if scanErr != nil {
+			return nil, scanErr
+		}
+
+		listings = append(listings, l)
+	}
+
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("iterate search listings: %w", err)
+	}
+
+	return listings, nil
+}
+
+// buildSearchQuery assembles the parameterised SQL string and argument slice for
+// searchListings. Split out from searchListings to keep both functions under the
+// gocyclo limit (.golangci.yml min-complexity: 15).
+func buildSearchQuery(filter store.SearchFilter) (query string, args []any) {
+	var (
+		sb strings.Builder
+		n  = 1
+	)
+
+	sb.WriteString(`
+SELECT id, owner_user_id, title, description, budget_min, budget_max,
+       currency, status, awarded_bid_id, deleted_at, created_at, updated_at
+FROM listings
+WHERE deleted_at IS NULL`)
+
+	// Visibility: OPEN listings are public; non-OPEN only to their owner.
+	// Enforced in SQL so keyset pagination stays correct (see SearchFilter docs).
+	fmt.Fprintf(&sb, " AND (status = 'OPEN' OR owner_user_id = $%d)", n)
+	args = append(args, filter.VisibleToUserID)
+	n++
+
+	if filter.Query != "" {
+		fmt.Fprintf(&sb, " AND "+ftsExpr+" @@ plainto_tsquery('simple', $%d)", n)
+		args = append(args, filter.Query)
+		n++
+	}
+
+	if filter.Status != nil {
+		fmt.Fprintf(&sb, " AND status = $%d", n)
+		args = append(args, string(*filter.Status))
+		n++
+	}
+
+	if filter.BudgetMin != nil {
+		// Listings whose advertised budget_max is at least the requested floor
+		// (or have no budget_max set) remain candidates.
+		fmt.Fprintf(&sb, " AND (budget_max IS NULL OR budget_max >= $%d)", n)
+		args = append(args, decimalToString(filter.BudgetMin))
+		n++
+	}
+
+	if filter.BudgetMax != nil {
+		fmt.Fprintf(&sb, " AND (budget_min IS NULL OR budget_min <= $%d)", n)
+		args = append(args, decimalToString(filter.BudgetMax))
+		n++
+	}
+
+	if filter.After != nil {
+		// Keyset: strictly older than the cursor position, ties broken by id.
+		fmt.Fprintf(&sb, " AND (created_at, id) < ($%d, $%d)", n, n+1)
+		args = append(args, filter.After.CreatedAt, filter.After.ID)
+		n += 2
+	}
+
+	sb.WriteString(" ORDER BY created_at DESC, id DESC")
+
+	limit := filter.Limit
+	if limit <= 0 {
+		limit = 20
+	}
+
+	fmt.Fprintf(&sb, " LIMIT $%d", n)
+	args = append(args, limit)
+
+	return sb.String(), args
 }
 
 func updateListing(ctx context.Context, q querier, l *domain.Listing) error {

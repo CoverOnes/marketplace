@@ -339,6 +339,184 @@ func TestListingStore_Integration(t *testing.T) {
 	})
 }
 
+// seedSearchListing inserts a listing with explicit timestamps for deterministic
+// ordering in search integration tests.
+func seedSearchListing(
+	t *testing.T, ctx context.Context, ls *postgres.ListingStore,
+	owner uuid.UUID, title, desc, status string, createdAt time.Time,
+	budgetMin, budgetMax *decimal.Decimal,
+) *domain.Listing {
+	t.Helper()
+
+	l := &domain.Listing{
+		ID:          uuid.New(),
+		OwnerUserID: owner,
+		Title:       title,
+		Description: desc,
+		BudgetMin:   budgetMin,
+		BudgetMax:   budgetMax,
+		Currency:    "TWD",
+		Status:      domain.ListingStatus(status),
+		CreatedAt:   createdAt,
+		UpdatedAt:   createdAt,
+	}
+	require.NoError(t, ls.Create(ctx, l))
+
+	return l
+}
+
+func dptr(v int64) *decimal.Decimal {
+	d := decimal.NewFromInt(v)
+	return &d
+}
+
+// TestListingStore_Search_Integration exercises full-text search, structured
+// filters, and keyset pagination against a real Postgres + the 000004 GIN index.
+func TestListingStore_Search_Integration(t *testing.T) {
+	if testing.Short() {
+		t.Skip("skipping integration test in short mode")
+	}
+
+	ctx := context.Background()
+	dsn := startTestDB(t)
+	runMigrations(t, ctx, dsn)
+
+	pool, err := postgres.NewPool(ctx, dsn, "", postgres.PoolOptions{})
+	require.NoError(t, err)
+
+	defer pool.Close()
+
+	ls := postgres.NewListingStore(pool)
+	owner := uuid.New()
+	stranger := uuid.New()
+	base := time.Now().UTC().Truncate(time.Millisecond)
+
+	// Full-text + budget candidates (newest first: go1 > go2 > go3).
+	go1 := seedSearchListing(t, ctx, ls, owner, "Senior Go developer wanted", "build a payments API",
+		"OPEN", base.Add(-1*time.Minute), dptr(100), dptr(500))
+	go2 := seedSearchListing(t, ctx, ls, owner, "Golang backend engineer", "go microservices and gRPC",
+		"OPEN", base.Add(-2*time.Minute), dptr(200), dptr(800))
+	go3 := seedSearchListing(t, ctx, ls, owner, "Need a Go developer", "concurrency expert",
+		"OPEN", base.Add(-3*time.Minute), nil, nil)
+	// Non-matching keyword.
+	_ = seedSearchListing(t, ctx, ls, owner, "React frontend designer", "tailwind ui work",
+		"OPEN", base.Add(-4*time.Minute), nil, nil)
+	// Matching keyword but CLOSED + owned by stranger (visibility handled in service; store returns it).
+	closedStranger := seedSearchListing(t, ctx, ls, stranger, "Go developer position (closed)", "already filled",
+		"CLOSED", base.Add(-30*time.Second), nil, nil)
+
+	t.Run("full-text keyword returns matching listings newest-first", func(t *testing.T) {
+		got, err := ls.Search(ctx, store.SearchFilter{Query: "go developer", VisibleToUserID: owner, Limit: 10})
+		require.NoError(t, err)
+
+		ids := idsOf(got)
+		// plainto_tsquery('simple', 'go developer') requires BOTH lexemes. The
+		// 'simple' config does not stem, so go2 ("Golang ... go microservices")
+		// lacks the "developer" lexeme and is excluded. closedStranger is CLOSED +
+		// owned by the stranger, so it is hidden from the owner via the SQL
+		// visibility clause.
+		assert.Contains(t, ids, go1.ID)
+		assert.NotContains(t, ids, go2.ID)
+		assert.Contains(t, ids, go3.ID)
+		assert.NotContains(t, ids, closedStranger.ID)
+		// Newest-first ordering (created_at DESC): go1 > go3.
+		assert.True(t, indexOf(ids, go1.ID) < indexOf(ids, go3.ID), "go1 newer than go3")
+	})
+
+	t.Run("visibility: stranger CLOSED listing visible to its owner", func(t *testing.T) {
+		got, err := ls.Search(ctx, store.SearchFilter{Query: "go developer", VisibleToUserID: stranger, Limit: 10})
+		require.NoError(t, err)
+		ids := idsOf(got)
+		// From the stranger's perspective their CLOSED listing is visible; the
+		// owner's OPEN listings remain public too.
+		assert.Contains(t, ids, closedStranger.ID)
+		assert.Contains(t, ids, go1.ID)
+	})
+
+	t.Run("keyword excludes non-matching listings", func(t *testing.T) {
+		got, err := ls.Search(ctx, store.SearchFilter{Query: "react designer", VisibleToUserID: owner, Limit: 10})
+		require.NoError(t, err)
+		ids := idsOf(got)
+		assert.NotContains(t, ids, go1.ID)
+		assert.NotContains(t, ids, go2.ID)
+	})
+
+	t.Run("status filter restricts to CLOSED (owner of that listing)", func(t *testing.T) {
+		closed := domain.ListingStatusClosed
+		got, err := ls.Search(ctx, store.SearchFilter{
+			Query: "go", Status: &closed, VisibleToUserID: stranger, Limit: 10,
+		})
+		require.NoError(t, err)
+		ids := idsOf(got)
+		assert.Equal(t, []uuid.UUID{closedStranger.ID}, ids)
+	})
+
+	t.Run("budget range filter", func(t *testing.T) {
+		// minBudget=600 keeps listings whose budget_max >= 600 OR budget_max is NULL.
+		// go1(max 500) is excluded; go2(max 800) kept; go3(NULL) kept.
+		got, err := ls.Search(ctx, store.SearchFilter{
+			Query: "go", BudgetMin: dptr(600), VisibleToUserID: owner, Limit: 10,
+		})
+		require.NoError(t, err)
+		ids := idsOf(got)
+		assert.NotContains(t, ids, go1.ID)
+		assert.Contains(t, ids, go2.ID)
+		assert.Contains(t, ids, go3.ID)
+	})
+
+	t.Run("keyset pagination walks all pages without overlap", func(t *testing.T) {
+		// OPEN listings whose text contains the "go" lexeme, visible to the owner:
+		// go1, go2, go3 (3 rows, newest-first), page size 2.
+		page1, err := ls.Search(ctx, store.SearchFilter{Query: "go", VisibleToUserID: owner, Limit: 2})
+		require.NoError(t, err)
+		require.Len(t, page1, 2)
+		assert.Equal(t, go1.ID, page1[0].ID)
+		assert.Equal(t, go2.ID, page1[1].ID)
+
+		last := page1[len(page1)-1]
+		page2, err := ls.Search(ctx, store.SearchFilter{
+			Query:           "go",
+			VisibleToUserID: owner,
+			Limit:           2,
+			After:           &store.SearchCursor{CreatedAt: last.CreatedAt, ID: last.ID},
+		})
+		require.NoError(t, err)
+		require.Len(t, page2, 1)
+		assert.Equal(t, go3.ID, page2[0].ID)
+	})
+
+	t.Run("soft-deleted listings are excluded", func(t *testing.T) {
+		del := seedSearchListing(t, ctx, ls, owner, "Go developer to be deleted", "temp",
+			"OPEN", base.Add(-10*time.Second), nil, nil)
+		// Soft delete via direct update of deleted_at (no FK, no special API needed).
+		_, err := pool.Exec(ctx, "UPDATE listings SET deleted_at = now() WHERE id = $1", del.ID)
+		require.NoError(t, err)
+
+		got, err := ls.Search(ctx, store.SearchFilter{Query: "go developer", VisibleToUserID: owner, Limit: 50})
+		require.NoError(t, err)
+		assert.NotContains(t, idsOf(got), del.ID)
+	})
+}
+
+func idsOf(ls []*domain.Listing) []uuid.UUID {
+	out := make([]uuid.UUID, 0, len(ls))
+	for _, l := range ls {
+		out = append(out, l.ID)
+	}
+
+	return out
+}
+
+func indexOf(ids []uuid.UUID, target uuid.UUID) int {
+	for i, id := range ids {
+		if id == target {
+			return i
+		}
+	}
+
+	return -1
+}
+
 // TestBidStore_Integration tests the BidStore against a real Postgres instance.
 func TestBidStore_Integration(t *testing.T) {
 	if testing.Short() {

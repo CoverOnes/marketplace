@@ -3,9 +3,11 @@ package store
 
 import (
 	"context"
+	"time"
 
 	"github.com/CoverOnes/marketplace/internal/domain"
 	"github.com/google/uuid"
+	"github.com/shopspring/decimal"
 )
 
 // ListingStore defines persistence operations for listings.
@@ -16,6 +18,8 @@ type ListingStore interface {
 	// Must be called inside an active transaction (txListingStore).
 	GetByIDForUpdate(ctx context.Context, id uuid.UUID) (*domain.Listing, error)
 	List(ctx context.Context, filter ListingFilter) ([]*domain.Listing, error)
+	// Search runs a full-text + structured filter query with keyset pagination.
+	Search(ctx context.Context, filter SearchFilter) ([]*domain.Listing, error)
 	Update(ctx context.Context, l *domain.Listing) error
 }
 
@@ -25,6 +29,36 @@ type ListingFilter struct {
 	OwnerUserID *uuid.UUID
 	Limit       int
 	Offset      int
+}
+
+// SearchCursor is the keyset cursor for stable search pagination.
+// It encodes the (created_at, id) of the last row of the previous page so the
+// next page selects rows strictly older than this position. id is the
+// tiebreaker for rows sharing an identical created_at.
+type SearchCursor struct {
+	CreatedAt time.Time `json:"c"`
+	ID        uuid.UUID `json:"i"`
+}
+
+// SearchFilter carries the parameters for ListingStore.Search.
+//
+// Query, when non-empty, is matched against to_tsvector(title || description)
+// via plainto_tsquery. Status/BudgetMin/BudgetMax are optional structured
+// filters. After is the keyset cursor for pagination (nil = first page).
+// Limit caps the page size (defaulted/clamped by the service layer).
+//
+// VisibleToUserID enforces the visibility rule IN SQL: only OPEN listings, plus
+// any listing owned by this user, are returned. Pushing this into the query
+// (rather than post-filtering in the service) keeps keyset pagination correct —
+// post-filtering could silently shorten a page and break the next cursor.
+type SearchFilter struct {
+	Query           string
+	Status          *domain.ListingStatus
+	BudgetMin       *decimal.Decimal
+	BudgetMax       *decimal.Decimal
+	After           *SearchCursor
+	VisibleToUserID uuid.UUID
+	Limit           int
 }
 
 // BidStore defines persistence operations for bids.

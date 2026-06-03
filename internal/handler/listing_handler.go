@@ -2,6 +2,7 @@ package handler
 
 import (
 	"net/http"
+	"strconv"
 
 	"github.com/CoverOnes/marketplace/internal/domain"
 	"github.com/CoverOnes/marketplace/internal/platform/httpx"
@@ -133,6 +134,68 @@ func (h *ListingHandler) List(c *gin.Context) {
 	}
 
 	httpx.OK(c, listings)
+}
+
+// Search handles GET /v1/listings/search.
+//
+// Query params: q (full-text), status, minBudget, maxBudget, cursor, limit.
+// Results are keyset-paginated (newest-first). Non-OPEN listings are only
+// visible to their owner — enforced in the service layer.
+func (h *ListingHandler) Search(c *gin.Context) {
+	identity, ok := middleware.IdentityFromCtx(c)
+	if !ok {
+		httpx.ErrCode(c, http.StatusUnauthorized, "UNAUTHORIZED", "authentication required")
+		return
+	}
+
+	in := &service.SearchListingsInput{
+		CallerID: identity.UserID,
+		Query:    c.Query("q"),
+		Cursor:   c.Query("cursor"),
+	}
+
+	if statusStr := c.Query("status"); statusStr != "" {
+		s := domain.ListingStatus(statusStr)
+		in.Status = &s
+	}
+
+	if minStr := c.Query("minBudget"); minStr != "" {
+		d, err := decimal.NewFromString(minStr)
+		if err != nil {
+			httpx.ErrCode(c, http.StatusBadRequest, "VALIDATION_ERROR", "minBudget must be a valid decimal")
+			return
+		}
+
+		in.BudgetMin = &d
+	}
+
+	if maxStr := c.Query("maxBudget"); maxStr != "" {
+		d, err := decimal.NewFromString(maxStr)
+		if err != nil {
+			httpx.ErrCode(c, http.StatusBadRequest, "VALIDATION_ERROR", "maxBudget must be a valid decimal")
+			return
+		}
+
+		in.BudgetMax = &d
+	}
+
+	if limitStr := c.Query("limit"); limitStr != "" {
+		limit, err := strconv.Atoi(limitStr)
+		if err != nil || limit < 0 {
+			httpx.ErrCode(c, http.StatusBadRequest, "VALIDATION_ERROR", "limit must be a non-negative integer")
+			return
+		}
+
+		in.Limit = limit
+	}
+
+	result, err := h.svc.SearchListings(c.Request.Context(), in)
+	if err != nil {
+		httpx.Err(c, err)
+		return
+	}
+
+	httpx.OK(c, result)
 }
 
 // GetByID handles GET /v1/listings/:id.
