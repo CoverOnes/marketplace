@@ -117,6 +117,17 @@ func TestConfig_Load(t *testing.T) {
 			},
 			wantErr: true,
 		},
+		{
+			name: "error: schema name with leading digit rejected (invalid PG identifier)",
+			envVars: map[string]string{
+				"MARKETPLACE_POSTGRES_DSN": testDSN,
+				"MARKETPLACE_PORT":         "8081",
+				"MARKETPLACE_LOG_LEVEL":    "INFO",
+				"MARKETPLACE_ENV":          "development",
+				"MARKETPLACE_DB_SCHEMA":    "1marketplace",
+			},
+			wantErr: true,
+		},
 	}
 
 	for _, tc := range tests {
