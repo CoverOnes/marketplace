@@ -3,6 +3,7 @@ package config_test
 import (
 	"testing"
 
+	"github.com/CoverOnes/marketplace/internal/config"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
@@ -27,6 +28,28 @@ func TestConfig_Load(t *testing.T) {
 				"MARKETPLACE_PORT":         "8081",
 				"MARKETPLACE_LOG_LEVEL":    "INFO",
 				"MARKETPLACE_ENV":          "development",
+			},
+			wantErr: false,
+		},
+		{
+			name: "happy path: valid schema name",
+			envVars: map[string]string{
+				"MARKETPLACE_POSTGRES_DSN": testDSN,
+				"MARKETPLACE_PORT":         "8081",
+				"MARKETPLACE_LOG_LEVEL":    "INFO",
+				"MARKETPLACE_ENV":          "development",
+				"MARKETPLACE_DB_SCHEMA":    "marketplace",
+			},
+			wantErr: false,
+		},
+		{
+			name: "happy path: empty schema is allowed (public)",
+			envVars: map[string]string{
+				"MARKETPLACE_POSTGRES_DSN": testDSN,
+				"MARKETPLACE_PORT":         "8081",
+				"MARKETPLACE_LOG_LEVEL":    "INFO",
+				"MARKETPLACE_ENV":          "development",
+				"MARKETPLACE_DB_SCHEMA":    "",
 			},
 			wantErr: false,
 		},
@@ -61,6 +84,50 @@ func TestConfig_Load(t *testing.T) {
 			},
 			wantErr: true,
 		},
+		{
+			name: "error: schema name with hyphen rejected",
+			envVars: map[string]string{
+				"MARKETPLACE_POSTGRES_DSN": testDSN,
+				"MARKETPLACE_PORT":         "8081",
+				"MARKETPLACE_LOG_LEVEL":    "INFO",
+				"MARKETPLACE_ENV":          "development",
+				"MARKETPLACE_DB_SCHEMA":    "bad-schema",
+			},
+			wantErr: true,
+		},
+		{
+			name: "error: schema name with space rejected",
+			envVars: map[string]string{
+				"MARKETPLACE_POSTGRES_DSN": testDSN,
+				"MARKETPLACE_PORT":         "8081",
+				"MARKETPLACE_LOG_LEVEL":    "INFO",
+				"MARKETPLACE_ENV":          "development",
+				"MARKETPLACE_DB_SCHEMA":    "bad schema",
+			},
+			wantErr: true,
+		},
+		{
+			name: "error: schema name with semicolon rejected (SQL injection attempt)",
+			envVars: map[string]string{
+				"MARKETPLACE_POSTGRES_DSN": testDSN,
+				"MARKETPLACE_PORT":         "8081",
+				"MARKETPLACE_LOG_LEVEL":    "INFO",
+				"MARKETPLACE_ENV":          "development",
+				"MARKETPLACE_DB_SCHEMA":    "s;DROP TABLE listings--",
+			},
+			wantErr: true,
+		},
+		{
+			name: "error: schema name with leading digit rejected (invalid PG identifier)",
+			envVars: map[string]string{
+				"MARKETPLACE_POSTGRES_DSN": testDSN,
+				"MARKETPLACE_PORT":         "8081",
+				"MARKETPLACE_LOG_LEVEL":    "INFO",
+				"MARKETPLACE_ENV":          "development",
+				"MARKETPLACE_DB_SCHEMA":    "1marketplace",
+			},
+			wantErr: true,
+		},
 	}
 
 	for _, tc := range tests {
@@ -68,7 +135,11 @@ func TestConfig_Load(t *testing.T) {
 			// NOTE: t.Parallel() is intentionally omitted; t.Setenv requires sequential subtests.
 
 			// Clear known env vars first to avoid cross-test pollution.
-			for k := range tc.envVars {
+			allKnownVars := []string{
+				"MARKETPLACE_POSTGRES_DSN", "MARKETPLACE_PORT", "MARKETPLACE_LOG_LEVEL",
+				"MARKETPLACE_ENV", "MARKETPLACE_DB_SCHEMA", "MARKETPLACE_REDIS_URL",
+			}
+			for _, k := range allKnownVars {
 				t.Setenv(k, "")
 			}
 
@@ -76,12 +147,12 @@ func TestConfig_Load(t *testing.T) {
 				t.Setenv(k, v)
 			}
 
-			require.NotNil(t, tc.envVars, "test case must have env vars")
+			_, err := config.Load()
 
 			if tc.wantErr {
-				assert.True(t, tc.wantErr, "expected error for this case")
+				require.Error(t, err, "expected error for case %q", tc.name)
 			} else {
-				assert.False(t, tc.wantErr, "should not expect error for valid config")
+				assert.NoError(t, err, "should not get error for valid config in case %q", tc.name)
 			}
 		})
 	}

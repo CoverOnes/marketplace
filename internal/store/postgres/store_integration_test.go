@@ -52,7 +52,7 @@ func startTestDB(t *testing.T) string {
 func runMigrations(t *testing.T, ctx context.Context, dsn string) {
 	t.Helper()
 
-	pool, err := postgres.NewPool(ctx, dsn)
+	pool, err := postgres.NewPool(ctx, dsn, "") // empty schema = public (test default)
 	require.NoError(t, err)
 
 	defer pool.Close()
@@ -84,6 +84,79 @@ func runMigrations(t *testing.T, ctx context.Context, dsn string) {
 	}
 }
 
+// TestSchemaIsolation_Integration verifies that NewPool with a non-empty schema
+// creates the schema and isolates migrations within it. It builds a pool with
+// schema="dev_test_schema", runs migrations against that schema, then asserts
+// that the service's main table (listings) exists in information_schema.tables
+// under table_schema='dev_test_schema' and NOT in 'public'.
+func TestSchemaIsolation_Integration(t *testing.T) {
+	if testing.Short() {
+		t.Skip("skipping integration test in short mode")
+	}
+
+	const testSchema = "dev_test_schema"
+
+	ctx := context.Background()
+	dsn := startTestDB(t)
+
+	// Build pool with non-empty schema — this should CREATE SCHEMA IF NOT EXISTS
+	// and SET search_path on every connection.
+	pool, err := postgres.NewPool(ctx, dsn, testSchema)
+	require.NoError(t, err)
+
+	defer pool.Close()
+
+	// Run migrations through the schema-aware pool so all tables land in testSchema.
+	var upFiles []string
+
+	err = fs.WalkDir(migrations.FS, ".", func(path string, d fs.DirEntry, walkErr error) error {
+		if walkErr != nil {
+			return walkErr
+		}
+
+		if !d.IsDir() && strings.HasSuffix(path, ".up.sql") {
+			upFiles = append(upFiles, path)
+		}
+
+		return nil
+	})
+	require.NoError(t, err, "walk embedded migrations FS")
+	require.NotEmpty(t, upFiles, "no *.up.sql files found")
+
+	sort.Strings(upFiles)
+
+	for _, file := range upFiles {
+		data, readErr := migrations.FS.ReadFile(file)
+		require.NoError(t, readErr, "read migration file %s", file)
+
+		_, execErr := pool.Exec(ctx, string(data))
+		require.NoError(t, execErr, "apply migration %s in schema %s", file, testSchema)
+	}
+
+	t.Run("listings table exists in dev_test_schema", func(t *testing.T) {
+		var count int
+
+		err := pool.QueryRow(
+			ctx,
+			"SELECT COUNT(*) FROM information_schema.tables WHERE table_schema = $1 AND table_name = $2",
+			testSchema, "listings",
+		).Scan(&count)
+		require.NoError(t, err)
+		assert.Equal(t, 1, count, "listings table must exist in schema %q", testSchema)
+	})
+
+	t.Run("listings table does NOT exist in public schema", func(t *testing.T) {
+		var count int
+
+		err := pool.QueryRow(
+			ctx,
+			"SELECT COUNT(*) FROM information_schema.tables WHERE table_schema = 'public' AND table_name = 'listings'",
+		).Scan(&count)
+		require.NoError(t, err)
+		assert.Equal(t, 0, count, "listings table must NOT exist in public schema when using schema isolation")
+	})
+}
+
 // TestListingStore_Integration tests the ListingStore against a real Postgres instance.
 func TestListingStore_Integration(t *testing.T) {
 	if testing.Short() {
@@ -94,7 +167,7 @@ func TestListingStore_Integration(t *testing.T) {
 	dsn := startTestDB(t)
 	runMigrations(t, ctx, dsn)
 
-	pool, err := postgres.NewPool(ctx, dsn)
+	pool, err := postgres.NewPool(ctx, dsn, "") // empty schema = public (test default)
 	require.NoError(t, err)
 
 	defer pool.Close()
@@ -202,7 +275,7 @@ func TestBidStore_Integration(t *testing.T) {
 	dsn := startTestDB(t)
 	runMigrations(t, ctx, dsn)
 
-	pool, err := postgres.NewPool(ctx, dsn)
+	pool, err := postgres.NewPool(ctx, dsn, "") // empty schema = public (test default)
 	require.NoError(t, err)
 
 	defer pool.Close()
@@ -352,7 +425,7 @@ func TestAwardStore_Integration(t *testing.T) {
 	dsn := startTestDB(t)
 	runMigrations(t, ctx, dsn)
 
-	pool, err := postgres.NewPool(ctx, dsn)
+	pool, err := postgres.NewPool(ctx, dsn, "") // empty schema = public (test default)
 	require.NoError(t, err)
 
 	defer pool.Close()

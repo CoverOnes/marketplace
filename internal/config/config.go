@@ -4,10 +4,16 @@ package config
 import (
 	"errors"
 	"fmt"
+	"regexp"
 	"strings"
 
 	"github.com/spf13/viper"
 )
+
+// schemaNameRe validates that a Postgres schema name only contains safe characters
+// to prevent SQL injection when the name is interpolated into CREATE SCHEMA.
+// First character must be a letter or underscore (leading digits are invalid PG identifiers).
+var schemaNameRe = regexp.MustCompile(`^[a-zA-Z_][a-zA-Z0-9_]*$`)
 
 // Config holds all configuration for the marketplace service.
 type Config struct {
@@ -16,6 +22,12 @@ type Config struct {
 
 	// Postgres
 	PostgresDSN string `mapstructure:"postgres_dsn"`
+
+	// PostgresSchema is the optional Postgres schema to use (default: "" = public).
+	// Set to "marketplace" when sharing one Aiven database across multiple services
+	// so each service is isolated by schema rather than by database.
+	// Only alphanumeric characters and underscores are allowed ([a-zA-Z0-9_]+).
+	PostgresSchema string `mapstructure:"postgres_schema"`
 
 	// Redis (optional — nil Redis = event publish no-op + in-process rate limiter)
 	RedisURL string `mapstructure:"redis_url"`
@@ -36,11 +48,12 @@ func Load() (*Config, error) {
 	v.SetEnvKeyReplacer(strings.NewReplacer(".", "_"))
 
 	bindings := map[string]string{
-		"port":         "MARKETPLACE_PORT",
-		"postgres_dsn": "MARKETPLACE_POSTGRES_DSN",
-		"redis_url":    "MARKETPLACE_REDIS_URL",
-		"log_level":    "MARKETPLACE_LOG_LEVEL",
-		"env":          "MARKETPLACE_ENV",
+		"port":            "MARKETPLACE_PORT",
+		"postgres_dsn":    "MARKETPLACE_POSTGRES_DSN",
+		"postgres_schema": "MARKETPLACE_DB_SCHEMA",
+		"redis_url":       "MARKETPLACE_REDIS_URL",
+		"log_level":       "MARKETPLACE_LOG_LEVEL",
+		"env":             "MARKETPLACE_ENV",
 	}
 
 	for key, envKey := range bindings {
@@ -85,6 +98,10 @@ func (c *Config) validate() error {
 	validEnvs := map[string]bool{"development": true, "production": true, "test": true}
 	if !validEnvs[strings.ToLower(c.Env)] {
 		errs = append(errs, "MARKETPLACE_ENV must be development|production|test")
+	}
+
+	if c.PostgresSchema != "" && !schemaNameRe.MatchString(c.PostgresSchema) {
+		errs = append(errs, "MARKETPLACE_DB_SCHEMA must start with a letter or underscore and contain only [a-zA-Z0-9_] characters")
 	}
 
 	if len(errs) > 0 {
