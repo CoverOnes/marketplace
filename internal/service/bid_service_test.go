@@ -21,6 +21,10 @@ import (
 type stubListingStore struct {
 	listings map[uuid.UUID]*domain.Listing
 	updated  []*domain.Listing
+	// searchResult, when set, is returned verbatim by Search so service-layer
+	// tests can assert visibility filtering / cursor emission deterministically.
+	searchResult []*domain.Listing
+	lastSearch   *store.SearchFilter
 }
 
 func newStubListingStore(listings ...*domain.Listing) *stubListingStore {
@@ -59,6 +63,13 @@ func (s *stubListingStore) GetByIDForUpdate(_ context.Context, id uuid.UUID) (*d
 
 func (s *stubListingStore) List(_ context.Context, _ store.ListingFilter) ([]*domain.Listing, error) {
 	return nil, nil
+}
+
+func (s *stubListingStore) Search(_ context.Context, filter store.SearchFilter) ([]*domain.Listing, error) {
+	f := filter
+	s.lastSearch = &f
+
+	return s.searchResult, nil
 }
 
 func (s *stubListingStore) Update(_ context.Context, l *domain.Listing) error {

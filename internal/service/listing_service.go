@@ -71,6 +71,121 @@ func (s *ListingService) ListListings(ctx context.Context, filter store.ListingF
 	return s.listings.List(ctx, filter)
 }
 
+const (
+	// searchDefaultLimit is the page size used when no/invalid limit is supplied.
+	searchDefaultLimit = 20
+	// searchMaxLimit caps the page size to bound memory + DB work per request.
+	searchMaxLimit = 100
+)
+
+// SearchListingsInput carries validated input for SearchListings.
+//
+// CallerID is the authenticated caller (X-User-Id). Visibility: non-OPEN
+// listings are only returned to their owner; everyone else sees OPEN only.
+type SearchListingsInput struct {
+	CallerID  uuid.UUID
+	Query     string
+	Status    *domain.ListingStatus
+	BudgetMin *decimal.Decimal
+	BudgetMax *decimal.Decimal
+	Cursor    string // opaque, base64-encoded keyset cursor ("" = first page)
+	Limit     int
+}
+
+// SearchListingsResult is the paginated search response.
+type SearchListingsResult struct {
+	Listings   []*domain.Listing `json:"listings"`
+	NextCursor string            `json:"nextCursor,omitempty"` // empty when no further pages
+}
+
+// SearchListings runs a full-text + structured-filter search over listings.
+//
+// Visibility (MK security): callers may always see OPEN listings. Non-OPEN
+// listings (AWARDED/CLOSED) are restricted to their owner, mirroring the
+// List/Get visibility rules. When a status filter is supplied it is honored,
+// but a non-OPEN status filter is silently scoped to the caller's own listings
+// so it cannot be used to enumerate other users' awarded/closed cases.
+func (s *ListingService) SearchListings(ctx context.Context, in *SearchListingsInput) (*SearchListingsResult, error) {
+	if err := validateSearchInput(in); err != nil {
+		return nil, err
+	}
+
+	cursor, err := decodeSearchCursor(in.Cursor)
+	if err != nil {
+		return nil, fmt.Errorf("%w: invalid cursor", domain.ErrValidation)
+	}
+
+	limit := in.Limit
+	if limit <= 0 {
+		limit = searchDefaultLimit
+	}
+
+	if limit > searchMaxLimit {
+		limit = searchMaxLimit
+	}
+
+	filter := store.SearchFilter{
+		Query:           in.Query,
+		Status:          in.Status,
+		BudgetMin:       in.BudgetMin,
+		BudgetMax:       in.BudgetMax,
+		After:           cursor,
+		VisibleToUserID: in.CallerID, // visibility enforced in SQL
+		Limit:           limit + 1,   // over-fetch one row to detect a next page
+	}
+
+	rows, err := s.listings.Search(ctx, filter)
+	if err != nil {
+		return nil, fmt.Errorf("search listings: %w", err)
+	}
+
+	return buildSearchResult(rows, limit), nil
+}
+
+// buildSearchResult trims the over-fetched page to limit and emits the next
+// cursor (keyed on the last returned row) when more rows remain.
+func buildSearchResult(rows []*domain.Listing, limit int) *SearchListingsResult {
+	res := &SearchListingsResult{Listings: []*domain.Listing{}}
+
+	hasMore := len(rows) > limit
+	if hasMore {
+		rows = rows[:limit]
+	}
+
+	res.Listings = rows
+
+	if hasMore && len(rows) > 0 {
+		last := rows[len(rows)-1]
+		res.NextCursor = encodeSearchCursor(store.SearchCursor{
+			CreatedAt: last.CreatedAt,
+			ID:        last.ID,
+		})
+	}
+
+	return res
+}
+
+// validateSearchInput enforces field-level constraints on search parameters.
+func validateSearchInput(in *SearchListingsInput) error {
+	if err := sanitizeText(in.Query); err != nil {
+		return fmt.Errorf("%w: query: %s", domain.ErrValidation, err)
+	}
+
+	if utf8.RuneCountInString(in.Query) > 200 {
+		return fmt.Errorf("%w: query exceeds 200 characters", domain.ErrValidation)
+	}
+
+	if in.Status != nil {
+		switch *in.Status {
+		case domain.ListingStatusOpen, domain.ListingStatusAwarded, domain.ListingStatusClosed:
+		default:
+			return fmt.Errorf("%w: invalid status filter", domain.ErrValidation)
+		}
+	}
+
+	return validateBudget(in.BudgetMin, in.BudgetMax)
+}
+
 // UpdateListingInput carries validated input for updating a listing.
 type UpdateListingInput struct {
 	ID          uuid.UUID

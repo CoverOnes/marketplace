@@ -58,7 +58,10 @@ func NewRouter(cfg RouterConfig) *gin.Engine {
 	api.Use(middleware.RequireValidIdentity())
 
 	// Listings — Tier>=1 for browse, Tier>=2 for create/update.
+	// /listings/search is registered before /listings/:id so the static segment
+	// takes precedence over the param route.
 	api.GET("/listings", middleware.RequireTier(1), listingH.List)
+	api.GET("/listings/search", middleware.RequireTier(1), listingH.Search)
 	api.GET("/listings/:id", middleware.RequireTier(1), listingH.GetByID)
 	api.POST("/listings", middleware.RequireTier(2), listingH.Create)
 	api.PATCH("/listings/:id", middleware.RequireTier(2), listingH.Update)
