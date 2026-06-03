@@ -46,6 +46,19 @@ type Config struct {
 
 	// Environment: development | production
 	Env string `mapstructure:"env"`
+
+	// WorkspaceBaseURL is the base URL of the workspace service, used for the
+	// server-to-server contract-create call after AcceptBid.
+	// Example: "http://workspace:8082"
+	// Optional: if empty, the workspace call is skipped (local dev without workspace).
+	// Env: MARKETPLACE_WORKSPACE_BASE_URL
+	WorkspaceBaseURL string `mapstructure:"workspace_base_url"`
+
+	// WorkspaceServiceToken is the shared secret sent in X-Service-Token when
+	// calling workspace's internal endpoint. Required when WorkspaceBaseURL is set.
+	// Must be at least 32 characters.
+	// Env: MARKETPLACE_WORKSPACE_SERVICE_TOKEN
+	WorkspaceServiceToken string `mapstructure:"workspace_service_token"`
 }
 
 // Load reads configuration from environment variables (prefix MARKETPLACE_).
@@ -57,14 +70,16 @@ func Load() (*Config, error) {
 	v.SetEnvKeyReplacer(strings.NewReplacer(".", "_"))
 
 	bindings := map[string]string{
-		"port":            "MARKETPLACE_PORT",
-		"postgres_dsn":    "MARKETPLACE_POSTGRES_DSN",
-		"postgres_schema": "MARKETPLACE_DB_SCHEMA",
-		"redis_url":       "MARKETPLACE_REDIS_URL",
-		"log_level":       "MARKETPLACE_LOG_LEVEL",
-		"env":             "MARKETPLACE_ENV",
-		"db_max_conns":    "MARKETPLACE_DB_MAX_CONNS",
-		"db_min_conns":    "MARKETPLACE_DB_MIN_CONNS",
+		"port":                    "MARKETPLACE_PORT",
+		"postgres_dsn":            "MARKETPLACE_POSTGRES_DSN",
+		"postgres_schema":         "MARKETPLACE_DB_SCHEMA",
+		"redis_url":               "MARKETPLACE_REDIS_URL",
+		"log_level":               "MARKETPLACE_LOG_LEVEL",
+		"env":                     "MARKETPLACE_ENV",
+		"db_max_conns":            "MARKETPLACE_DB_MAX_CONNS",
+		"db_min_conns":            "MARKETPLACE_DB_MIN_CONNS",
+		"workspace_base_url":      "MARKETPLACE_WORKSPACE_BASE_URL",
+		"workspace_service_token": "MARKETPLACE_WORKSPACE_SERVICE_TOKEN",
 	}
 
 	for key, envKey := range bindings {
@@ -123,6 +138,11 @@ func (c *Config) validate() error {
 
 	if c.DBMinConns < 0 || c.DBMinConns > 65535 {
 		errs = append(errs, "MARKETPLACE_DB_MIN_CONNS must be 0-65535 (0 = use default of 2)")
+	}
+
+	// WorkspaceServiceToken is required when WorkspaceBaseURL is configured.
+	if c.WorkspaceBaseURL != "" && len(c.WorkspaceServiceToken) < 32 {
+		errs = append(errs, "MARKETPLACE_WORKSPACE_SERVICE_TOKEN must be at least 32 characters when MARKETPLACE_WORKSPACE_BASE_URL is set")
 	}
 
 	if len(errs) > 0 {

@@ -152,7 +152,7 @@ func buildBidRouter(listingStore store.ListingStore, bidStore store.BidStore, aw
 	txMgr := &stubTxManagerH{listings: listingStore, bids: bidStore, awards: awardStore}
 	publisher := events.NewNoopPublisher()
 
-	bidSvc := service.NewBidService(bidStore, listingStore, awardStore, txMgr, publisher)
+	bidSvc := service.NewBidService(bidStore, listingStore, awardStore, txMgr, publisher, nil)
 	bidH := handler.NewBidHandler(bidSvc)
 
 	r := gin.New()

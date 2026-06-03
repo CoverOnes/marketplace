@@ -13,6 +13,7 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/CoverOnes/marketplace/internal/client"
 	"github.com/CoverOnes/marketplace/internal/config"
 	"github.com/CoverOnes/marketplace/internal/events"
 	"github.com/CoverOnes/marketplace/internal/handler"
@@ -51,9 +52,9 @@ func runHealthCheck() error {
 
 	url := fmt.Sprintf("http://127.0.0.1:%s/healthz", port)
 
-	client := &http.Client{Timeout: 2 * time.Second}
+	httpClient := &http.Client{Timeout: 2 * time.Second}
 
-	resp, err := client.Get(url) //nolint:noctx // healthcheck is a one-shot process; no request context needed
+	resp, err := httpClient.Get(url) //nolint:noctx // healthcheck is a one-shot process; no request context needed
 	if err != nil {
 		return fmt.Errorf("GET %s: %w", url, err)
 	}
@@ -132,9 +133,20 @@ func run() error {
 	awardStore := postgres.NewAwardStore(pool)
 	txManager := postgres.NewTxManager(pool)
 
+	// Workspace S2S client (M-2 fix): marketplace calls workspace after AcceptBid
+	// to create the contract with authoritative award values.
+	// When MARKETPLACE_WORKSPACE_BASE_URL is empty, the call is skipped (local dev).
+	var workspaceClient client.WorkspaceClient
+	if cfg.WorkspaceBaseURL != "" {
+		workspaceClient = client.NewHTTPWorkspaceClient(cfg.WorkspaceBaseURL, cfg.WorkspaceServiceToken)
+		slog.Info("workspace client configured", "base_url", cfg.WorkspaceBaseURL)
+	} else {
+		slog.Warn("MARKETPLACE_WORKSPACE_BASE_URL not set; workspace contract creation is disabled")
+	}
+
 	// Service layer.
 	listingSvc := service.NewListingService(listingStore)
-	bidSvc := service.NewBidService(bidStore, listingStore, awardStore, txManager, publisher)
+	bidSvc := service.NewBidService(bidStore, listingStore, awardStore, txManager, publisher, workspaceClient)
 
 	// Router.
 	r := handler.NewRouter(handler.RouterConfig{
