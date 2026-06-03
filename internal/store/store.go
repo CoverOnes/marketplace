@@ -24,11 +24,18 @@ type ListingStore interface {
 }
 
 // ListingFilter carries optional filters for listing queries.
+//
+// VisibleToUserID enforces the listing visibility rule IN SQL (P0 IDOR fix):
+// only OPEN listings, plus any listing owned by this user, are returned. When
+// the zero UUID is supplied no caller owns a private listing, so only OPEN rows
+// are returned. Pushing this into the query (rather than post-filtering in the
+// service) prevents ?status=AWARDED|CLOSED from enumerating other users' rows.
 type ListingFilter struct {
-	Status      *domain.ListingStatus
-	OwnerUserID *uuid.UUID
-	Limit       int
-	Offset      int
+	Status          *domain.ListingStatus
+	OwnerUserID     *uuid.UUID
+	VisibleToUserID uuid.UUID
+	Limit           int
+	Offset          int
 }
 
 // SearchCursor is the keyset cursor for stable search pagination.

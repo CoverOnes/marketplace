@@ -67,10 +67,26 @@ func (s *stubListingStoreH) GetByIDForUpdate(_ context.Context, id uuid.UUID) (*
 	return l, nil
 }
 
-func (s *stubListingStoreH) List(_ context.Context, _ store.ListingFilter) ([]*domain.Listing, error) {
+// List mirrors the SQL store: applies the visibility rule (OPEN is public,
+// non-OPEN only to its owner via VisibleToUserID), plus optional status / owner
+// filters. This lets the handler test exercise the P0 IDOR fix end-to-end.
+func (s *stubListingStoreH) List(_ context.Context, filter store.ListingFilter) ([]*domain.Listing, error) {
 	var result []*domain.Listing
 
 	for _, l := range s.listings {
+		// Visibility (mirrors SQL "(status = 'OPEN' OR owner_user_id = $n)").
+		if l.Status != domain.ListingStatusOpen && l.OwnerUserID != filter.VisibleToUserID {
+			continue
+		}
+
+		if filter.Status != nil && l.Status != *filter.Status {
+			continue
+		}
+
+		if filter.OwnerUserID != nil && l.OwnerUserID != *filter.OwnerUserID {
+			continue
+		}
+
 		result = append(result, l)
 	}
 
@@ -371,11 +387,15 @@ func TestListingHandler_GetByID(t *testing.T) {
 	t.Parallel()
 
 	ownerID := uuid.New()
-	listingID := uuid.New()
-	existingListing := &domain.Listing{
-		ID:          listingID,
+	strangerID := uuid.New()
+
+	openID := uuid.New()
+	awardedID := uuid.New()
+
+	openListing := &domain.Listing{
+		ID:          openID,
 		OwnerUserID: ownerID,
-		Title:       "Existing",
+		Title:       "Existing OPEN",
 		Currency:    "TWD",
 		Status:      domain.ListingStatusOpen,
 		BudgetMin:   func() *decimal.Decimal { d := decimal.NewFromInt(100); return &d }(),
@@ -383,26 +403,60 @@ func TestListingHandler_GetByID(t *testing.T) {
 		UpdatedAt:   time.Now().UTC(),
 	}
 
+	// A non-OPEN listing owned by ownerID — must be invisible to a stranger.
+	awardedListing := &domain.Listing{
+		ID:          awardedID,
+		OwnerUserID: ownerID,
+		Title:       "Awarded private",
+		Currency:    "TWD",
+		Status:      domain.ListingStatusAwarded,
+		CreatedAt:   time.Now().UTC(),
+		UpdatedAt:   time.Now().UTC(),
+	}
+
 	tests := []struct {
 		name       string
 		listingID  string
+		callerID   uuid.UUID
 		wantStatus int
 		wantCode   string
 	}{
 		{
-			name:       "happy path: existing listing",
-			listingID:  listingID.String(),
+			name:       "happy path: OPEN listing visible to owner",
+			listingID:  openID.String(),
+			callerID:   ownerID,
 			wantStatus: http.StatusOK,
+		},
+		{
+			name:       "happy path: OPEN listing visible to stranger",
+			listingID:  openID.String(),
+			callerID:   strangerID,
+			wantStatus: http.StatusOK,
+		},
+		{
+			name:       "happy path: AWARDED listing visible to owner",
+			listingID:  awardedID.String(),
+			callerID:   ownerID,
+			wantStatus: http.StatusOK,
+		},
+		{
+			name:       "IDOR: non-owner gets 404 on another's AWARDED listing",
+			listingID:  awardedID.String(),
+			callerID:   strangerID,
+			wantStatus: http.StatusNotFound,
+			wantCode:   "LISTING_NOT_FOUND",
 		},
 		{
 			name:       "error: not found",
 			listingID:  uuid.New().String(),
+			callerID:   ownerID,
 			wantStatus: http.StatusNotFound,
 			wantCode:   "LISTING_NOT_FOUND",
 		},
 		{
 			name:       "error: invalid id",
 			listingID:  "not-a-uuid",
+			callerID:   ownerID,
 			wantStatus: http.StatusBadRequest,
 			wantCode:   "VALIDATION_ERROR",
 		},
@@ -412,11 +466,11 @@ func TestListingHandler_GetByID(t *testing.T) {
 		t.Run(tc.name, func(t *testing.T) {
 			t.Parallel()
 
-			ls := newStubListingStoreH(existingListing)
+			ls := newStubListingStoreH(openListing, awardedListing)
 			r := buildListingRouter(ls)
 
 			req := httptest.NewRequestWithContext(context.Background(), http.MethodGet, "/v1/listings/"+tc.listingID, nil)
-			req.Header.Set("X-User-Id", ownerID.String())
+			req.Header.Set("X-User-Id", tc.callerID.String())
 			req.Header.Set("X-Kyc-Tier", "1")
 
 			w := httptest.NewRecorder()
@@ -431,6 +485,82 @@ func TestListingHandler_GetByID(t *testing.T) {
 				require.True(t, ok)
 				assert.Equal(t, tc.wantCode, errBody["code"])
 			}
+		})
+	}
+}
+
+// TestListingHandler_List_StatusVisibility verifies the P0 IDOR fix for the list
+// endpoint: ?status=AWARDED|CLOSED must only return the caller's own non-OPEN
+// listings, never other users'.
+func TestListingHandler_List_StatusVisibility(t *testing.T) {
+	t.Parallel()
+
+	callerID := uuid.New()
+	strangerID := uuid.New()
+	base := time.Now().UTC()
+
+	myAwarded := mkListing(callerID, "My awarded", "", "AWARDED", base.Add(-1*time.Minute))
+	strangerAwarded := mkListing(strangerID, "Stranger awarded", "", "AWARDED", base.Add(-2*time.Minute))
+	strangerClosed := mkListing(strangerID, "Stranger closed", "", "CLOSED", base.Add(-3*time.Minute))
+	myOpen := mkListing(callerID, "My open", "", "OPEN", base.Add(-4*time.Minute))
+	strangerOpen := mkListing(strangerID, "Stranger open", "", "OPEN", base.Add(-5*time.Minute))
+
+	titlesOf := func(body []byte) []string {
+		var resp struct {
+			Data []struct {
+				Title string `json:"title"`
+			} `json:"data"`
+		}
+		require.NoError(t, json.Unmarshal(body, &resp))
+
+		out := make([]string, 0, len(resp.Data))
+		for _, l := range resp.Data {
+			out = append(out, l.Title)
+		}
+
+		sort.Strings(out)
+
+		return out
+	}
+
+	tests := []struct {
+		name       string
+		query      string
+		wantTitles []string
+	}{
+		{
+			name:       "status=AWARDED returns only caller's own awarded listing",
+			query:      "?status=AWARDED",
+			wantTitles: []string{"My awarded"},
+		},
+		{
+			name:       "status=CLOSED hides stranger's closed listing",
+			query:      "?status=CLOSED",
+			wantTitles: []string{},
+		},
+		{
+			name:       "default (no status) returns all OPEN listings from everyone",
+			query:      "",
+			wantTitles: []string{"My open", "Stranger open"},
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+
+			ls := newStubListingStoreH(myAwarded, strangerAwarded, strangerClosed, myOpen, strangerOpen)
+			r := buildListingRouter(ls)
+
+			req := httptest.NewRequestWithContext(context.Background(), http.MethodGet, "/v1/listings"+tc.query, nil)
+			req.Header.Set("X-User-Id", callerID.String())
+			req.Header.Set("X-Kyc-Tier", "1")
+
+			w := httptest.NewRecorder()
+			r.ServeHTTP(w, req)
+
+			require.Equal(t, http.StatusOK, w.Code, "body: %s", w.Body.String())
+			assert.Equal(t, tc.wantTitles, titlesOf(w.Body.Bytes()))
 		})
 	}
 }

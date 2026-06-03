@@ -215,4 +215,100 @@ func TestListingService_UpdateListing(t *testing.T) {
 	}
 }
 
+// TestListingService_GetListing_Visibility verifies the P0 IDOR fix: OPEN
+// listings are visible to any caller, non-OPEN listings only to their owner, and
+// a non-owner of a non-OPEN listing gets ErrListingNotFound (404), never the row.
+func TestListingService_GetListing_Visibility(t *testing.T) {
+	t.Parallel()
+
+	ownerID := uuid.New()
+	strangerID := uuid.New()
+
+	mk := func(status domain.ListingStatus) *domain.Listing {
+		return &domain.Listing{
+			ID:          uuid.New(),
+			OwnerUserID: ownerID,
+			Title:       "Listing",
+			Currency:    "TWD",
+			Status:      status,
+			CreatedAt:   time.Now().UTC(),
+			UpdatedAt:   time.Now().UTC(),
+		}
+	}
+
+	tests := []struct {
+		name      string
+		listing   *domain.Listing
+		callerID  uuid.UUID
+		wantErr   error
+		wantNoErr bool
+	}{
+		{
+			name:      "OPEN listing visible to owner",
+			listing:   mk(domain.ListingStatusOpen),
+			callerID:  ownerID,
+			wantNoErr: true,
+		},
+		{
+			name:      "OPEN listing visible to stranger",
+			listing:   mk(domain.ListingStatusOpen),
+			callerID:  strangerID,
+			wantNoErr: true,
+		},
+		{
+			name:      "AWARDED listing visible to owner",
+			listing:   mk(domain.ListingStatusAwarded),
+			callerID:  ownerID,
+			wantNoErr: true,
+		},
+		{
+			name:     "AWARDED listing hidden from stranger -> 404",
+			listing:  mk(domain.ListingStatusAwarded),
+			callerID: strangerID,
+			wantErr:  domain.ErrListingNotFound,
+		},
+		{
+			name:     "CLOSED listing hidden from stranger -> 404",
+			listing:  mk(domain.ListingStatusClosed),
+			callerID: strangerID,
+			wantErr:  domain.ErrListingNotFound,
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+
+			ls := newStubListingStore(tc.listing)
+			svc := service.NewListingService(ls)
+
+			got, err := svc.GetListing(context.Background(), tc.listing.ID, tc.callerID)
+
+			if tc.wantNoErr {
+				require.NoError(t, err)
+				require.NotNil(t, got)
+				assert.Equal(t, tc.listing.ID, got.ID)
+			} else {
+				require.Error(t, err)
+				assert.True(t, errors.Is(err, tc.wantErr), "got %v, want %v", err, tc.wantErr)
+				assert.Nil(t, got)
+			}
+		})
+	}
+}
+
+// TestListingService_GetListing_NotFound verifies a missing listing surfaces
+// ErrListingNotFound regardless of caller.
+func TestListingService_GetListing_NotFound(t *testing.T) {
+	t.Parallel()
+
+	ls := newStubListingStore()
+	svc := service.NewListingService(ls)
+
+	got, err := svc.GetListing(context.Background(), uuid.New(), uuid.New())
+	require.Error(t, err)
+	assert.True(t, errors.Is(err, domain.ErrListingNotFound))
+	assert.Nil(t, got)
+}
+
 func strPtr(s string) *string { return &s }

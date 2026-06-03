@@ -337,6 +337,60 @@ func TestListingStore_Integration(t *testing.T) {
 		require.NotNil(t, got.AwardedBidID)
 		assert.Equal(t, bidID, *got.AwardedBidID)
 	})
+
+	// P0 IDOR fix: List enforces the visibility rule in SQL — non-OPEN listings
+	// are only returned to their owner. status=AWARDED must NOT leak a stranger's
+	// awarded listing to another caller.
+	t.Run("list status=AWARDED returns only caller's own (visibility filter)", func(t *testing.T) {
+		now := time.Now().UTC().Truncate(time.Millisecond)
+		listingOwner := uuid.New()
+		stranger := uuid.New()
+
+		mineAwarded := &domain.Listing{
+			ID: uuid.New(), OwnerUserID: listingOwner,
+			Title: "Mine awarded", Currency: "TWD", Status: domain.ListingStatusAwarded,
+			CreatedAt: now, UpdatedAt: now,
+		}
+		strangerAwarded := &domain.Listing{
+			ID: uuid.New(), OwnerUserID: stranger,
+			Title: "Stranger awarded", Currency: "TWD", Status: domain.ListingStatusAwarded,
+			CreatedAt: now, UpdatedAt: now,
+		}
+		require.NoError(t, listingStore.Create(ctx, mineAwarded))
+		require.NoError(t, listingStore.Create(ctx, strangerAwarded))
+
+		awarded := domain.ListingStatusAwarded
+
+		// Caller = listingOwner: sees only their own awarded listing.
+		got, err := listingStore.List(ctx, store.ListingFilter{
+			Status:          &awarded,
+			VisibleToUserID: listingOwner,
+			Limit:           50,
+		})
+		require.NoError(t, err)
+
+		ids := make(map[uuid.UUID]bool, len(got))
+		for _, l := range got {
+			ids[l.ID] = true
+		}
+
+		assert.True(t, ids[mineAwarded.ID], "owner must see own AWARDED listing")
+		assert.False(t, ids[strangerAwarded.ID], "owner must NOT see stranger's AWARDED listing (IDOR)")
+
+		// Caller = a third party: sees neither owner's nor stranger's awarded.
+		thirdParty := uuid.New()
+		got2, err := listingStore.List(ctx, store.ListingFilter{
+			Status:          &awarded,
+			VisibleToUserID: thirdParty,
+			Limit:           50,
+		})
+		require.NoError(t, err)
+
+		for _, l := range got2 {
+			assert.NotEqual(t, mineAwarded.ID, l.ID, "third party must not see others' AWARDED listings")
+			assert.NotEqual(t, strangerAwarded.ID, l.ID, "third party must not see others' AWARDED listings")
+		}
+	})
 }
 
 // seedSearchListing inserts a listing with explicit timestamps for deterministic

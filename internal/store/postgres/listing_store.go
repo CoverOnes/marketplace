@@ -156,6 +156,13 @@ SELECT id, owner_user_id, title, description, budget_min, budget_max,
 FROM listings
 WHERE deleted_at IS NULL`)
 
+	// Visibility (P0 IDOR fix): OPEN listings are public; non-OPEN listings are
+	// only returned to their owner. Enforced in SQL so ?status=AWARDED|CLOSED
+	// cannot enumerate other users' rows. Mirrors buildSearchQuery.
+	fmt.Fprintf(&sb, " AND (status = 'OPEN' OR owner_user_id = $%d)", n)
+	args = append(args, filter.VisibleToUserID)
+	n++
+
 	if filter.Status != nil {
 		fmt.Fprintf(&sb, " AND status = $%d", n)
 		args = append(args, string(*filter.Status))

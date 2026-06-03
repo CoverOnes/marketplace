@@ -61,12 +61,36 @@ func (s *ListingService) CreateListing(ctx context.Context, in *CreateListingInp
 	return l, nil
 }
 
-// GetListing returns a listing by ID. Returns ErrListingNotFound if not found.
-func (s *ListingService) GetListing(ctx context.Context, id uuid.UUID) (*domain.Listing, error) {
-	return s.listings.GetByID(ctx, id)
+// GetListing returns a listing by ID, applying the listing visibility rule
+// (P0 IDOR fix): OPEN listings are visible to any authenticated caller, while
+// non-OPEN listings (AWARDED/CLOSED) are visible only to their owner. A caller
+// who is neither sees ErrListingNotFound (404) — never a 403 — so the endpoint
+// cannot be used to probe the existence of other users' non-OPEN listings.
+//
+// callerID is the authenticated user (X-User-Id). Returns ErrListingNotFound if
+// the listing does not exist OR the caller is not permitted to see it.
+func (s *ListingService) GetListing(ctx context.Context, id, callerID uuid.UUID) (*domain.Listing, error) {
+	l, err := s.listings.GetByID(ctx, id)
+	if err != nil {
+		return nil, err
+	}
+
+	// Visibility rule (mirrors SearchListings / ListListings): non-OPEN listings
+	// are private to their owner. Collapse "forbidden" into "not found" to avoid
+	// resource enumeration.
+	if l.Status != domain.ListingStatusOpen && l.OwnerUserID != callerID {
+		return nil, domain.ErrListingNotFound
+	}
+
+	return l, nil
 }
 
 // ListListings returns paginated listings, optionally filtered by status or owner.
+// The filter's VisibleToUserID MUST be set by the caller (handler) to the
+// authenticated user so the store can enforce the listing visibility rule in SQL:
+// OPEN listings are public, non-OPEN listings are restricted to their owner. This
+// closes the P0 IDOR where ?status=AWARDED|CLOSED enumerated every user's
+// non-OPEN listings.
 func (s *ListingService) ListListings(ctx context.Context, filter store.ListingFilter) ([]*domain.Listing, error) {
 	return s.listings.List(ctx, filter)
 }
