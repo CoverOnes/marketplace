@@ -271,63 +271,115 @@ func (s *BidService) AcceptBid(ctx context.Context, bidID, callerID uuid.UUID) (
 
 // RejectBid rejects a PENDING bid.
 // IDOR guard: callerID must equal listing.OwnerUserID.
+//
+// TOCTOU protection: all status checks are performed INSIDE the transaction on
+// SELECT ... FOR UPDATE locked rows. A concurrent AcceptBid or WithdrawBid call
+// blocks on the row lock and then observes the already-terminal bid status,
+// returning ErrBidNotPending (mapped to 409 Conflict at the handler layer).
 func (s *BidService) RejectBid(ctx context.Context, bidID, callerID uuid.UUID) (*domain.Bid, error) {
-	bid, err := s.bids.GetByID(ctx, bidID)
+	// Pre-flight: load bid outside the tx to obtain listing_id for context.
+	// This is a non-authoritative read — all invariants are re-checked under row locks
+	// inside the transaction below.
+	preflight, err := s.bids.GetByID(ctx, bidID)
 	if err != nil {
 		return nil, err
 	}
 
-	if bid.Status != domain.BidStatusPending {
-		return nil, domain.ErrBidNotPending
-	}
+	listingID := preflight.ListingID
 
-	// IDOR: load listing to verify ownership.
-	listing, err := s.listings.GetByID(ctx, bid.ListingID)
+	var result *domain.Bid
+
+	err = s.txManager.WithTx(ctx, func(txCtx context.Context, txListings store.ListingStore, txBids store.BidStore, _ store.AwardStore) error {
+		// 1. Lock bid row with SELECT ... FOR UPDATE.
+		lockedBid, lockBidErr := txBids.GetByIDForUpdate(txCtx, bidID)
+		if lockBidErr != nil {
+			return lockBidErr
+		}
+
+		// Re-check bid status under the lock.
+		if lockedBid.Status != domain.BidStatusPending {
+			return domain.ErrBidNotPending
+		}
+
+		// 2. Lock listing row to verify ownership authz under the lock.
+		lockedListing, lockListingErr := txListings.GetByIDForUpdate(txCtx, listingID)
+		if lockListingErr != nil {
+			return lockListingErr
+		}
+
+		if lockedListing.OwnerUserID != callerID {
+			return domain.ErrBidNotFound // 404 to avoid enumeration (IDOR posture)
+		}
+
+		now := time.Now().UTC()
+		lockedBid.Status = domain.BidStatusRejected
+		lockedBid.DecidedAt = &now
+
+		if updateErr := txBids.Update(txCtx, lockedBid); updateErr != nil {
+			return fmt.Errorf("reject bid: %w", updateErr)
+		}
+
+		result = lockedBid
+
+		return nil
+	})
 	if err != nil {
 		return nil, err
 	}
 
-	if listing.OwnerUserID != callerID {
-		return nil, domain.ErrBidNotFound // 404 to avoid enumeration
-	}
-
-	now := time.Now().UTC()
-	bid.Status = domain.BidStatusRejected
-	bid.DecidedAt = &now
-
-	if err := s.bids.Update(ctx, bid); err != nil {
-		return nil, err
-	}
-
-	return bid, nil
+	return result, nil
 }
 
 // WithdrawBid withdraws a PENDING bid.
 // IDOR guard: callerID must equal bid.BidderUserID.
+//
+// TOCTOU protection: all status checks are performed INSIDE the transaction on
+// SELECT ... FOR UPDATE locked rows. A concurrent AcceptBid or RejectBid call
+// blocks on the row lock and then observes the already-terminal bid status,
+// returning ErrBidNotPending (mapped to 409 Conflict at the handler layer).
 func (s *BidService) WithdrawBid(ctx context.Context, bidID, callerID uuid.UUID) (*domain.Bid, error) {
-	bid, err := s.bids.GetByID(ctx, bidID)
+	// Pre-flight: non-authoritative read to fail fast on obvious 404 without opening a tx.
+	// All invariants are re-checked under row locks inside the transaction below.
+	if _, err := s.bids.GetByID(ctx, bidID); err != nil {
+		return nil, err
+	}
+
+	var result *domain.Bid
+
+	err := s.txManager.WithTx(ctx, func(txCtx context.Context, _ store.ListingStore, txBids store.BidStore, _ store.AwardStore) error {
+		// Lock bid row with SELECT ... FOR UPDATE.
+		lockedBid, lockBidErr := txBids.GetByIDForUpdate(txCtx, bidID)
+		if lockBidErr != nil {
+			return lockBidErr
+		}
+
+		// Re-check bid status under the lock.
+		if lockedBid.Status != domain.BidStatusPending {
+			return domain.ErrBidNotPending
+		}
+
+		// IDOR: bidder can only withdraw their own bid.
+		if lockedBid.BidderUserID != callerID {
+			return domain.ErrBidNotFound // 404 to avoid enumeration (IDOR posture)
+		}
+
+		now := time.Now().UTC()
+		lockedBid.Status = domain.BidStatusWithdrawn
+		lockedBid.DecidedAt = &now
+
+		if updateErr := txBids.Update(txCtx, lockedBid); updateErr != nil {
+			return fmt.Errorf("withdraw bid: %w", updateErr)
+		}
+
+		result = lockedBid
+
+		return nil
+	})
 	if err != nil {
 		return nil, err
 	}
 
-	if bid.Status != domain.BidStatusPending {
-		return nil, domain.ErrBidNotPending
-	}
-
-	// IDOR: bidder can only withdraw their own bid.
-	if bid.BidderUserID != callerID {
-		return nil, domain.ErrBidNotFound // 404 to avoid enumeration
-	}
-
-	now := time.Now().UTC()
-	bid.Status = domain.BidStatusWithdrawn
-	bid.DecidedAt = &now
-
-	if err := s.bids.Update(ctx, bid); err != nil {
-		return nil, err
-	}
-
-	return bid, nil
+	return result, nil
 }
 
 // buildBidAcceptedEvent constructs the marketplace.bid_accepted event payload.
