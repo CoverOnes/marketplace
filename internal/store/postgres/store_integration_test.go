@@ -52,7 +52,7 @@ func startTestDB(t *testing.T) string {
 func runMigrations(t *testing.T, ctx context.Context, dsn string) {
 	t.Helper()
 
-	pool, err := postgres.NewPool(ctx, dsn, "") // empty schema = public (test default)
+	pool, err := postgres.NewPool(ctx, dsn, "", postgres.PoolOptions{}) // empty schema = public (test default)
 	require.NoError(t, err)
 
 	defer pool.Close()
@@ -101,7 +101,7 @@ func TestSchemaIsolation_Integration(t *testing.T) {
 
 	// Build pool with non-empty schema — this should CREATE SCHEMA IF NOT EXISTS
 	// and SET search_path on every connection.
-	pool, err := postgres.NewPool(ctx, dsn, testSchema)
+	pool, err := postgres.NewPool(ctx, dsn, testSchema, postgres.PoolOptions{})
 	require.NoError(t, err)
 
 	defer pool.Close()
@@ -157,6 +157,80 @@ func TestSchemaIsolation_Integration(t *testing.T) {
 	})
 }
 
+// TestReservedWordSchema_Integration verifies that NewPool correctly double-quotes PG
+// reserved-word schema names (e.g. "user") so they do not cause a 42601 syntax error.
+// The existing TestSchemaIsolation_Integration used "dev_test_schema" which is not a
+// reserved word and therefore did not exercise the quoting path.
+func TestReservedWordSchema_Integration(t *testing.T) {
+	if testing.Short() {
+		t.Skip("skipping integration test in short mode")
+	}
+
+	// "user" is a PG reserved word; without double-quoting it causes:
+	//   ERROR 42601: syntax error at or near "user"
+	const reservedSchema = "user"
+
+	ctx := context.Background()
+	dsn := startTestDB(t)
+
+	// NewPool must CREATE SCHEMA IF NOT EXISTS "user" and SET search_path = "user", public
+	// without hitting syntax error 42601.
+	pool, err := postgres.NewPool(ctx, dsn, reservedSchema, postgres.PoolOptions{})
+	require.NoError(t, err, "NewPool with reserved-word schema %q must not fail", reservedSchema)
+
+	defer pool.Close()
+
+	// Run migrations through the reserved-word schema pool so all tables land in "user".
+	var upFiles []string
+
+	err = fs.WalkDir(migrations.FS, ".", func(path string, d fs.DirEntry, walkErr error) error {
+		if walkErr != nil {
+			return walkErr
+		}
+
+		if !d.IsDir() && strings.HasSuffix(path, ".up.sql") {
+			upFiles = append(upFiles, path)
+		}
+
+		return nil
+	})
+	require.NoError(t, err, "walk embedded migrations FS")
+	require.NotEmpty(t, upFiles, "no *.up.sql files found")
+
+	sort.Strings(upFiles)
+
+	for _, file := range upFiles {
+		data, readErr := migrations.FS.ReadFile(file)
+		require.NoError(t, readErr, "read migration file %s", file)
+
+		_, execErr := pool.Exec(ctx, string(data))
+		require.NoError(t, execErr, "apply migration %s in schema %q", file, reservedSchema)
+	}
+
+	t.Run("listings table exists in user schema", func(t *testing.T) {
+		var count int
+
+		err := pool.QueryRow(
+			ctx,
+			"SELECT COUNT(*) FROM information_schema.tables WHERE table_schema = $1 AND table_name = $2",
+			reservedSchema, "listings",
+		).Scan(&count)
+		require.NoError(t, err)
+		assert.Equal(t, 1, count, "listings table must exist in reserved-word schema %q", reservedSchema)
+	})
+
+	t.Run("listings table does NOT exist in public schema", func(t *testing.T) {
+		var count int
+
+		err := pool.QueryRow(
+			ctx,
+			"SELECT COUNT(*) FROM information_schema.tables WHERE table_schema = 'public' AND table_name = 'listings'",
+		).Scan(&count)
+		require.NoError(t, err)
+		assert.Equal(t, 0, count, "listings table must NOT exist in public schema when using reserved-word schema %q", reservedSchema)
+	})
+}
+
 // TestListingStore_Integration tests the ListingStore against a real Postgres instance.
 func TestListingStore_Integration(t *testing.T) {
 	if testing.Short() {
@@ -167,7 +241,7 @@ func TestListingStore_Integration(t *testing.T) {
 	dsn := startTestDB(t)
 	runMigrations(t, ctx, dsn)
 
-	pool, err := postgres.NewPool(ctx, dsn, "") // empty schema = public (test default)
+	pool, err := postgres.NewPool(ctx, dsn, "", postgres.PoolOptions{}) // empty schema = public (test default)
 	require.NoError(t, err)
 
 	defer pool.Close()
@@ -275,7 +349,7 @@ func TestBidStore_Integration(t *testing.T) {
 	dsn := startTestDB(t)
 	runMigrations(t, ctx, dsn)
 
-	pool, err := postgres.NewPool(ctx, dsn, "") // empty schema = public (test default)
+	pool, err := postgres.NewPool(ctx, dsn, "", postgres.PoolOptions{}) // empty schema = public (test default)
 	require.NoError(t, err)
 
 	defer pool.Close()
@@ -425,7 +499,7 @@ func TestAwardStore_Integration(t *testing.T) {
 	dsn := startTestDB(t)
 	runMigrations(t, ctx, dsn)
 
-	pool, err := postgres.NewPool(ctx, dsn, "") // empty schema = public (test default)
+	pool, err := postgres.NewPool(ctx, dsn, "", postgres.PoolOptions{}) // empty schema = public (test default)
 	require.NoError(t, err)
 
 	defer pool.Close()
