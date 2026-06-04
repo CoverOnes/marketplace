@@ -132,6 +132,11 @@ func (s *TenderService) CloseRole(ctx context.Context, in *CloseRoleInput) (*dom
 		return nil, err
 	}
 
+	// Fix 4: guard against non-tender listings (every other tender method asserts IsTender).
+	if !listing.IsTender {
+		return nil, domain.ErrNotTenderListing
+	}
+
 	if listing.OwnerUserID != in.CallerID {
 		return nil, domain.ErrTenderRoleNotFound // 404 to avoid enumeration
 	}
@@ -185,6 +190,13 @@ func (s *TenderService) ApplyToRole(ctx context.Context, in *ApplyToRoleInput) (
 		return nil, domain.ErrNotTenderListing
 	}
 
+	// Fix 2: reject applications to tenders that are not actively recruiting.
+	// Phase 1 accepts OPEN and PARTIALLY_STAFFED only.
+	// Recruit-while-EXECUTING is Phase 4; SETTLING/COMPLETED/CANCELED never accept new applicants.
+	if !isTenderAcceptingApplications(listing.TenderStatus) {
+		return nil, fmt.Errorf("%w: tender is not accepting applications", domain.ErrValidation)
+	}
+
 	// Phase 1: reject OPEN recruiter mode.
 	if listing.RecruiterMode == domain.RecruiterModeOpen {
 		return nil, domain.ErrOpenRecruiterNotEnabled
@@ -229,6 +241,10 @@ type AcceptCollaboratorInput struct {
 // Uses SELECT FOR UPDATE on the role row + count-APPROVED inside the same tx
 // to prevent TOCTOU races on max_collaborators.
 // If max_collaborators is reached after this accept, the role is set to FILLED.
+//
+// TODO Phase 2: auto-advance tender_status (OPEN→PARTIALLY_STAFFED when first
+// collaborator is approved; PARTIALLY_STAFFED→EXECUTING when all roles filled).
+// ValidTenderTransition is defined and tested but NOT yet wired here in Phase 1.
 func (s *TenderService) AcceptCollaborator(ctx context.Context, in *AcceptCollaboratorInput) (*domain.TenderCollaborator, error) {
 	// Pre-flight: non-authoritative read to get IDs before locking.
 	preflight, err := s.collaborators.GetByID(ctx, in.CollaboratorID)
@@ -378,38 +394,74 @@ type RejectCollaboratorInput struct {
 	CallerID       uuid.UUID // must equal listing.OwnerUserID
 }
 
-// RejectCollaborator rejects a PENDING collaborator application.
+// RejectCollaborator atomically rejects a PENDING collaborator application.
+//
+// Fix 1 (TOCTOU): all reads and the update run inside a single transaction with
+// SELECT ... FOR UPDATE locks on both the collaborator and listing rows.
+// A concurrent AcceptCollaborator that already promoted the row to APPROVED will
+// be visible here (the locked read sees the committed APPROVED status), and we
+// return ErrConflict instead of silently downgrading the row back to REJECTED.
 func (s *TenderService) RejectCollaborator(ctx context.Context, in *RejectCollaboratorInput) (*domain.TenderCollaborator, error) {
-	collab, err := s.collaborators.GetByID(ctx, in.CollaboratorID)
+	// Pre-flight: non-authoritative read to get the role_id before locking.
+	preflight, err := s.collaborators.GetByID(ctx, in.CollaboratorID)
 	if err != nil {
 		return nil, err
 	}
 
-	role, err := s.roles.GetByID(ctx, collab.TenderRoleID)
-	if err != nil {
-		return nil, err
+	var result *domain.TenderCollaborator
+
+	txErr := s.tenderTx.WithTenderTx(ctx, func(
+		txCtx context.Context,
+		txListings store.ListingStore,
+		txRoles store.TenderRoleStore,
+		txCollaborators store.TenderCollaboratorStore,
+	) error {
+		// 1. Lock the role row (establishes lock-ordering with AcceptCollaborator).
+		lockedRole, lockRoleErr := txRoles.GetByIDForUpdate(txCtx, preflight.TenderRoleID)
+		if lockRoleErr != nil {
+			return lockRoleErr
+		}
+
+		// 2. Lock the listing row to verify ownership under the lock.
+		lockedListing, lockListingErr := txListings.GetByIDForUpdate(txCtx, lockedRole.ListingID)
+		if lockListingErr != nil {
+			return lockListingErr
+		}
+
+		if lockedListing.OwnerUserID != in.CallerID {
+			return domain.ErrTenderCollaboratorNotFound // 404 to avoid enumeration
+		}
+
+		// 3. Lock the collaborator row and re-check status under the lock.
+		lockedCollab, lockCollabErr := txCollaborators.GetByIDForUpdate(txCtx, in.CollaboratorID)
+		if lockCollabErr != nil {
+			return lockCollabErr
+		}
+
+		// If the row is no longer PENDING (e.g. concurrently APPROVED), do NOT
+		// overwrite it. Return a conflict error so the caller knows the state changed.
+		if lockedCollab.Status != domain.CollaboratorStatusPending {
+			result = lockedCollab
+
+			return fmt.Errorf("%w: collaborator is no longer pending (current status: %s)",
+				domain.ErrConflict, lockedCollab.Status)
+		}
+
+		lockedCollab.Status = domain.CollaboratorStatusRejected
+
+		if updateErr := txCollaborators.Update(txCtx, lockedCollab); updateErr != nil {
+			return fmt.Errorf("reject collaborator: %w", updateErr)
+		}
+
+		result = lockedCollab
+
+		return nil
+	})
+	if txErr != nil {
+		return result, txErr
 	}
 
-	listing, err := s.listings.GetByID(ctx, role.ListingID)
-	if err != nil {
-		return nil, err
-	}
-
-	if listing.OwnerUserID != in.CallerID {
-		return nil, domain.ErrTenderCollaboratorNotFound // 404 to avoid enumeration
-	}
-
-	if collab.Status != domain.CollaboratorStatusPending {
-		return nil, fmt.Errorf("%w: collaborator is not pending", domain.ErrValidation)
-	}
-
-	collab.Status = domain.CollaboratorStatusRejected
-
-	if err := s.collaborators.Update(ctx, collab); err != nil {
-		return nil, fmt.Errorf("reject collaborator: %w", err)
-	}
-
-	return collab, nil
+	return result, nil
 }
 
 // ExitCollaboratorInput carries input for a vendor exiting a role.
@@ -421,6 +473,11 @@ type ExitCollaboratorInput struct {
 
 // ExitCollaborator allows a vendor to exit a role.
 // PENDING → WITHDRAWN; APPROVED → EXITED.
+//
+// TODO Phase 2: after an APPROVED vendor exits, check if the role should
+// revert from FILLED→OPEN, and whether tender_status should step back
+// (e.g. EXECUTING→PARTIALLY_STAFFED). ValidTenderTransition covers these
+// edges but they are not wired in Phase 1.
 func (s *TenderService) ExitCollaborator(ctx context.Context, in *ExitCollaboratorInput) (*domain.TenderCollaborator, error) {
 	if err := sanitizeMessage(in.Reason); err != nil {
 		return nil, fmt.Errorf("%w: reason: %s", domain.ErrValidation, err)
@@ -567,6 +624,23 @@ const (
 	maxBPS                  = 10000
 )
 
+// isTenderAcceptingApplications returns true when a tender's current status
+// permits new PENDING collaborator applications (Phase 1: OPEN or PARTIALLY_STAFFED only).
+// EXECUTING is reserved for Phase 4 (recruit-while-executing).
+// nil tender_status means the listing is CLASSIC (not a tender) — return false.
+func isTenderAcceptingApplications(ts *domain.TenderStatus) bool {
+	if ts == nil {
+		return false
+	}
+
+	switch *ts {
+	case domain.TenderStatusOpen, domain.TenderStatusPartiallyStaffed:
+		return true
+	}
+
+	return false
+}
+
 func validateRoleInput(title, description string, maxCollaborators, profitShareBPS *int) error {
 	if err := sanitizeText(title); err != nil {
 		return fmt.Errorf("%w: title: %s", domain.ErrValidation, err)
@@ -610,6 +684,19 @@ func validateMilestoneInput(title string, amount, currency *string) error {
 
 	if currency != nil && len(*currency) != 3 {
 		return fmt.Errorf("%w: currency must be a 3-letter code", domain.ErrValidation)
+	}
+
+	// Fix 3: reject amounts that exceed the numeric(14,2) column maximum to prevent
+	// DB overflow → 500 instead of 400 (mirrors validateBudget in listing_service.go).
+	if amount != nil {
+		d, parseErr := parseDecimal(*amount)
+		if parseErr != nil {
+			return fmt.Errorf("%w: amount: %s", domain.ErrValidation, parseErr)
+		}
+
+		if d.GreaterThan(maxNumeric14_2) {
+			return fmt.Errorf("%w: amount exceeds maximum allowed value", domain.ErrValidation)
+		}
 	}
 
 	return nil

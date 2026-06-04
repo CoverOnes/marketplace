@@ -13,7 +13,8 @@ package domain
 //	PARTIALLY_STAFFED → EXECUTING
 //
 // SETTLING, COMPLETED, CANCELED are defined but only driven by later phases.
-// Note: the DB enum value is the British-spelling "CANCELED" (see migrations/000005).
+// Note: the DB enum value uses British spelling (double-L); the Go constant is
+// TenderStatusCancelled — see the //nolint:misspell annotation in domain/listing.go.
 // Self-transitions (from == to) are always invalid.
 func ValidTenderTransition(from, to TenderStatus) bool {
 	if from == to {
