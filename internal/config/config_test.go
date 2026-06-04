@@ -13,6 +13,9 @@ import (
 //nolint:gosec // G101: test fixture placeholder, not a real credential; user:pass are inert strings
 const testDSN = "postgres://user:pass@localhost/db"
 
+// testServiceToken is a 32-char placeholder token used in tests only — not a real secret.
+const testServiceToken = "abcdefghijklmnopqrstuvwxyz012345"
+
 // TestConfig_Load covers config loading and validation paths.
 // t.Setenv is not compatible with t.Parallel(); subtests run sequentially.
 func TestConfig_Load(t *testing.T) {
@@ -152,6 +155,66 @@ func TestConfig_Load(t *testing.T) {
 			},
 			wantErr: false,
 		},
+		{
+			// FIX 2 (M-2): production MUST configure the workspace service or the
+			// S2S contract-create path silently fails open. Missing base URL fails.
+			name: "error: production without workspace base URL",
+			envVars: map[string]string{
+				"MARKETPLACE_POSTGRES_DSN":            testDSN,
+				"MARKETPLACE_PORT":                    "8081",
+				"MARKETPLACE_LOG_LEVEL":               "INFO",
+				"MARKETPLACE_ENV":                     "production",
+				"MARKETPLACE_WORKSPACE_SERVICE_TOKEN": testServiceToken,
+			},
+			wantErr: true,
+		},
+		{
+			name: "error: production without workspace service token",
+			envVars: map[string]string{
+				"MARKETPLACE_POSTGRES_DSN":       testDSN,
+				"MARKETPLACE_PORT":               "8081",
+				"MARKETPLACE_LOG_LEVEL":          "INFO",
+				"MARKETPLACE_ENV":                "production",
+				"MARKETPLACE_WORKSPACE_BASE_URL": "http://workspace:8082",
+			},
+			wantErr: true,
+		},
+		{
+			name: "error: production with short workspace service token",
+			envVars: map[string]string{
+				"MARKETPLACE_POSTGRES_DSN":            testDSN,
+				"MARKETPLACE_PORT":                    "8081",
+				"MARKETPLACE_LOG_LEVEL":               "INFO",
+				"MARKETPLACE_ENV":                     "production",
+				"MARKETPLACE_WORKSPACE_BASE_URL":      "http://workspace:8082",
+				"MARKETPLACE_WORKSPACE_SERVICE_TOKEN": "tooshort",
+			},
+			wantErr: true,
+		},
+		{
+			name: "happy path: production with workspace fully configured",
+			envVars: map[string]string{
+				"MARKETPLACE_POSTGRES_DSN":            testDSN,
+				"MARKETPLACE_PORT":                    "8081",
+				"MARKETPLACE_LOG_LEVEL":               "INFO",
+				"MARKETPLACE_ENV":                     "production",
+				"MARKETPLACE_WORKSPACE_BASE_URL":      "http://workspace:8082",
+				"MARKETPLACE_WORKSPACE_SERVICE_TOKEN": testServiceToken,
+			},
+			wantErr: false,
+		},
+		{
+			// Dev is exempt from the production workspace guard: an unset base URL
+			// is allowed so local dev can run without the workspace service.
+			name: "happy path: development without workspace config (exempt)",
+			envVars: map[string]string{
+				"MARKETPLACE_POSTGRES_DSN": testDSN,
+				"MARKETPLACE_PORT":         "8081",
+				"MARKETPLACE_LOG_LEVEL":    "INFO",
+				"MARKETPLACE_ENV":          "development",
+			},
+			wantErr: false,
+		},
 	}
 
 	for _, tc := range tests {
@@ -163,6 +226,7 @@ func TestConfig_Load(t *testing.T) {
 				"MARKETPLACE_POSTGRES_DSN", "MARKETPLACE_PORT", "MARKETPLACE_LOG_LEVEL",
 				"MARKETPLACE_ENV", "MARKETPLACE_DB_SCHEMA", "MARKETPLACE_REDIS_URL",
 				"MARKETPLACE_DB_MAX_CONNS", "MARKETPLACE_DB_MIN_CONNS",
+				"MARKETPLACE_WORKSPACE_BASE_URL", "MARKETPLACE_WORKSPACE_SERVICE_TOKEN",
 			}
 			for _, k := range allKnownVars {
 				t.Setenv(k, "")

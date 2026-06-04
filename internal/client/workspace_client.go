@@ -53,10 +53,12 @@ type createContractRequest struct {
 	Currency         string    `json:"currency"`
 }
 
-// CreateContract sends the authoritative award data to workspace to create a DRAFT contract.
-// The token is transmitted in the X-Service-Token header — NEVER in the URL.
-func (c *HTTPWorkspaceClient) CreateContract(ctx context.Context, award *domain.Award) error {
-	body := createContractRequest{
+// awardToContractRequest is the single authoritative Award→request mapping (M-2 / CWE-915).
+// It is the ONE place that defines which award field becomes which contract field:
+// owner→client, bidder→freelancer, bid→awardBid. Keeping it as a named function lets
+// tests pin the mapping so an accidental client/freelancer transposition is caught.
+func awardToContractRequest(award *domain.Award) createContractRequest {
+	return createContractRequest{
 		ListingID:        award.ListingID,
 		AwardBidID:       award.BidID,
 		ClientUserID:     award.OwnerUserID,
@@ -64,6 +66,12 @@ func (c *HTTPWorkspaceClient) CreateContract(ctx context.Context, award *domain.
 		Amount:           award.Amount.StringFixed(2),
 		Currency:         award.Currency,
 	}
+}
+
+// CreateContract sends the authoritative award data to workspace to create a DRAFT contract.
+// The token is transmitted in the X-Service-Token header — NEVER in the URL.
+func (c *HTTPWorkspaceClient) CreateContract(ctx context.Context, award *domain.Award) error {
+	body := awardToContractRequest(award)
 
 	encoded, err := json.Marshal(body)
 	if err != nil {
