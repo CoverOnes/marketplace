@@ -90,7 +90,52 @@ type AwardStore interface {
 	MarkEventPublished(ctx context.Context, awardID uuid.UUID) error
 }
 
+// TenderRoleStore defines persistence operations for tender roles.
+type TenderRoleStore interface {
+	Create(ctx context.Context, r *domain.TenderRole) error
+	GetByID(ctx context.Context, id uuid.UUID) (*domain.TenderRole, error)
+	// GetByIDForUpdate fetches a tender role with SELECT ... FOR UPDATE row-lock.
+	// Must be called inside an active transaction.
+	GetByIDForUpdate(ctx context.Context, id uuid.UUID) (*domain.TenderRole, error)
+	ListByListing(ctx context.Context, listingID uuid.UUID) ([]*domain.TenderRole, error)
+	Update(ctx context.Context, r *domain.TenderRole) error
+}
+
+// TenderCollaboratorStore defines persistence operations for tender collaborators.
+type TenderCollaboratorStore interface {
+	Create(ctx context.Context, c *domain.TenderCollaborator) error
+	GetByID(ctx context.Context, id uuid.UUID) (*domain.TenderCollaborator, error)
+	// GetByIDForUpdate fetches a collaborator with SELECT ... FOR UPDATE row-lock.
+	// Must be called inside an active transaction.
+	GetByIDForUpdate(ctx context.Context, id uuid.UUID) (*domain.TenderCollaborator, error)
+	// CountApprovedByRole counts APPROVED collaborators for a role, used inside
+	// a transaction to enforce max_collaborators cap atomically.
+	CountApprovedByRole(ctx context.Context, roleID uuid.UUID) (int, error)
+	ListByListing(ctx context.Context, listingID uuid.UUID) ([]*domain.TenderCollaborator, error)
+	ListByRole(ctx context.Context, roleID uuid.UUID) ([]*domain.TenderCollaborator, error)
+	Update(ctx context.Context, c *domain.TenderCollaborator) error
+}
+
+// TenderMilestoneStore defines persistence operations for tender milestones.
+type TenderMilestoneStore interface {
+	Create(ctx context.Context, m *domain.TenderMilestone) error
+	GetByID(ctx context.Context, id uuid.UUID) (*domain.TenderMilestone, error)
+	ListByListing(ctx context.Context, listingID uuid.UUID) ([]*domain.TenderMilestone, error)
+	Update(ctx context.Context, m *domain.TenderMilestone) error
+}
+
 // TxManager runs a function inside a single Postgres transaction.
 type TxManager interface {
 	WithTx(ctx context.Context, fn func(ctx context.Context, listings ListingStore, bids BidStore, awards AwardStore) error) error
+}
+
+// TenderTxManager runs tender-specific operations inside a single Postgres transaction.
+// Separate from TxManager to avoid bloating the classic 1:1 transaction interface.
+type TenderTxManager interface {
+	WithTenderTx(ctx context.Context, fn func(
+		ctx context.Context,
+		listings ListingStore,
+		roles TenderRoleStore,
+		collaborators TenderCollaboratorStore,
+	) error) error
 }

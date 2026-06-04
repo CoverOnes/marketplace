@@ -82,6 +82,12 @@ func (s *BidService) CreateBid(ctx context.Context, in *CreateBidInput) (*domain
 		return nil, err
 	}
 
+	// CLASSIC bids are forbidden on tender listings (discriminator guard).
+	// Tender vendors must use the tender collaborator API instead.
+	if listing.IsTender {
+		return nil, domain.ErrTenderBidNotAllowed
+	}
+
 	if listing.Status != domain.ListingStatusOpen {
 		return nil, domain.ErrListingNotOpen
 	}

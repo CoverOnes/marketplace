@@ -19,6 +19,7 @@ const (
 
 // Bid represents a contractor's bid on a listing.
 // listing_id and bidder_user_id are soft references — NO foreign key constraints.
+// role_id is a soft reference to tender_roles.id — NULL for classic (1:1) bids.
 type Bid struct {
 	ID           uuid.UUID       `json:"id"`
 	ListingID    uuid.UUID       `json:"listingId"`
@@ -27,6 +28,7 @@ type Bid struct {
 	Currency     string          `json:"currency"`
 	Message      string          `json:"message"`
 	Status       BidStatus       `json:"status"`
+	RoleID       *uuid.UUID      `json:"roleId,omitempty"` // nil = classic bid
 	DecidedAt    *time.Time      `json:"decidedAt,omitempty"`
 	CreatedAt    time.Time       `json:"createdAt"`
 	UpdatedAt    time.Time       `json:"updatedAt"`

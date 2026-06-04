@@ -120,6 +120,7 @@ issues:
         - goconst
         - lll
         - noctx     # httptest.NewRequest without context is standard test pattern
+        - misspell  # test case names use canonical DB enum values (e.g. CANCELLED) which differ from US spelling
 
     - path: tests/integration/
       linters:

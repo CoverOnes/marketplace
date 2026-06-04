@@ -99,17 +99,25 @@ func createListing(ctx context.Context, q querier, l *domain.Listing) error {
 	const query = `
 INSERT INTO listings
 	(id, owner_user_id, title, description, budget_min, budget_max,
-	 currency, status, awarded_bid_id, deleted_at, created_at, updated_at)
+	 currency, status, awarded_bid_id,
+	 is_tender, recruiter_mode, tender_status, kyc_tier_required,
+	 deleted_at, created_at, updated_at)
 VALUES
-	($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)
+	($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16)
 `
+
+	recruiterMode := l.RecruiterMode
+	if recruiterMode == "" {
+		recruiterMode = domain.RecruiterModeClosed
+	}
 
 	_, err := q.Exec(
 		ctx, query,
 		l.ID, l.OwnerUserID, l.Title, l.Description,
 		decimalToString(l.BudgetMin), decimalToString(l.BudgetMax),
-		l.Currency, l.Status, l.AwardedBidID, l.DeletedAt,
-		l.CreatedAt, l.UpdatedAt,
+		l.Currency, l.Status, l.AwardedBidID,
+		l.IsTender, string(recruiterMode), tenderStatusToString(l.TenderStatus), l.KYCTierRequired,
+		l.DeletedAt, l.CreatedAt, l.UpdatedAt,
 	)
 	if err != nil {
 		return fmt.Errorf("insert listing: %w", err)
@@ -121,7 +129,9 @@ VALUES
 func getListingByID(ctx context.Context, q querier, id uuid.UUID) (*domain.Listing, error) {
 	const query = `
 SELECT id, owner_user_id, title, description, budget_min, budget_max,
-       currency, status, awarded_bid_id, deleted_at, created_at, updated_at
+       currency, status, awarded_bid_id,
+       is_tender, recruiter_mode, tender_status, kyc_tier_required,
+       deleted_at, created_at, updated_at
 FROM listings
 WHERE id = $1 AND deleted_at IS NULL
 `
@@ -134,7 +144,9 @@ WHERE id = $1 AND deleted_at IS NULL
 func getListingByIDForUpdate(ctx context.Context, q querier, id uuid.UUID) (*domain.Listing, error) {
 	const query = `
 SELECT id, owner_user_id, title, description, budget_min, budget_max,
-       currency, status, awarded_bid_id, deleted_at, created_at, updated_at
+       currency, status, awarded_bid_id,
+       is_tender, recruiter_mode, tender_status, kyc_tier_required,
+       deleted_at, created_at, updated_at
 FROM listings
 WHERE id = $1 AND deleted_at IS NULL
 FOR UPDATE
@@ -152,7 +164,9 @@ func listListings(ctx context.Context, q querier, filter store.ListingFilter) ([
 
 	sb.WriteString(`
 SELECT id, owner_user_id, title, description, budget_min, budget_max,
-       currency, status, awarded_bid_id, deleted_at, created_at, updated_at
+       currency, status, awarded_bid_id,
+       is_tender, recruiter_mode, tender_status, kyc_tier_required,
+       deleted_at, created_at, updated_at
 FROM listings
 WHERE deleted_at IS NULL`)
 
@@ -265,7 +279,9 @@ func buildSearchQuery(filter store.SearchFilter) (query string, args []any) {
 
 	sb.WriteString(`
 SELECT id, owner_user_id, title, description, budget_min, budget_max,
-       currency, status, awarded_bid_id, deleted_at, created_at, updated_at
+       currency, status, awarded_bid_id,
+       is_tender, recruiter_mode, tender_status, kyc_tier_required,
+       deleted_at, created_at, updated_at
 FROM listings
 WHERE deleted_at IS NULL`)
 
@@ -325,15 +341,24 @@ func updateListing(ctx context.Context, q querier, l *domain.Listing) error {
 	const query = `
 UPDATE listings
 SET title = $2, description = $3, budget_min = $4, budget_max = $5,
-    currency = $6, status = $7, awarded_bid_id = $8, updated_at = $9
+    currency = $6, status = $7, awarded_bid_id = $8,
+    is_tender = $9, recruiter_mode = $10, tender_status = $11, kyc_tier_required = $12,
+    updated_at = $13
 WHERE id = $1 AND deleted_at IS NULL
 `
+
+	recruiterMode := l.RecruiterMode
+	if recruiterMode == "" {
+		recruiterMode = domain.RecruiterModeClosed
+	}
 
 	tag, err := q.Exec(
 		ctx, query,
 		l.ID, l.Title, l.Description,
 		decimalToString(l.BudgetMin), decimalToString(l.BudgetMax),
-		l.Currency, l.Status, l.AwardedBidID, time.Now().UTC(),
+		l.Currency, l.Status, l.AwardedBidID,
+		l.IsTender, string(recruiterMode), tenderStatusToString(l.TenderStatus), l.KYCTierRequired,
+		time.Now().UTC(),
 	)
 	if err != nil {
 		return fmt.Errorf("update listing: %w", err)
@@ -353,16 +378,19 @@ type rowScanner interface {
 
 func scanListing(row rowScanner) (*domain.Listing, error) {
 	var (
-		l         domain.Listing
-		budgetMin *string
-		budgetMax *string
+		l             domain.Listing
+		budgetMin     *string
+		budgetMax     *string
+		recruiterMode string
+		tenderStatus  *string
 	)
 
 	err := row.Scan(
 		&l.ID, &l.OwnerUserID, &l.Title, &l.Description,
 		&budgetMin, &budgetMax,
-		&l.Currency, &l.Status, &l.AwardedBidID, &l.DeletedAt,
-		&l.CreatedAt, &l.UpdatedAt,
+		&l.Currency, &l.Status, &l.AwardedBidID,
+		&l.IsTender, &recruiterMode, &tenderStatus, &l.KYCTierRequired,
+		&l.DeletedAt, &l.CreatedAt, &l.UpdatedAt,
 	)
 	if err != nil {
 		if errors.Is(err, pgx.ErrNoRows) {
@@ -390,7 +418,25 @@ func scanListing(row rowScanner) (*domain.Listing, error) {
 		l.BudgetMax = &d
 	}
 
+	l.RecruiterMode = domain.RecruiterMode(recruiterMode)
+
+	if tenderStatus != nil {
+		ts := domain.TenderStatus(*tenderStatus)
+		l.TenderStatus = &ts
+	}
+
 	return &l, nil
+}
+
+// tenderStatusToString converts *TenderStatus to *string for pgx NULL handling.
+func tenderStatusToString(ts *domain.TenderStatus) *string {
+	if ts == nil {
+		return nil
+	}
+
+	s := string(*ts)
+
+	return &s
 }
 
 // decimalToString converts a *decimal.Decimal to *string for pgx numeric scanning.

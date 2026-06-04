@@ -31,13 +31,23 @@ type CreateListingInput struct {
 	BudgetMin   *decimal.Decimal
 	BudgetMax   *decimal.Decimal
 	Currency    string
+	// Tender discriminator fields. IsTender=false → CLASSIC 1:1 listing (default).
+	IsTender        bool
+	KYCTierRequired int // 0..5; only meaningful when IsTender=true
 }
 
 // CreateListing creates a new listing owned by the calling user.
 // The OwnerUserID MUST be set exclusively from the X-User-Id header — never from the request body.
+// When IsTender=true the listing is created with tender_status='OPEN' and recruiter_mode='CLOSED'.
 func (s *ListingService) CreateListing(ctx context.Context, in *CreateListingInput) (*domain.Listing, error) {
 	if err := validateListingInput(in.Title, in.Description, in.BudgetMin, in.BudgetMax, in.Currency); err != nil {
 		return nil, err
+	}
+
+	if in.IsTender {
+		if in.KYCTierRequired < 0 || in.KYCTierRequired > 5 {
+			return nil, fmt.Errorf("%w: kyc_tier_required must be 0..5", domain.ErrValidation)
+		}
 	}
 
 	now := time.Now().UTC()
@@ -52,6 +62,14 @@ func (s *ListingService) CreateListing(ctx context.Context, in *CreateListingInp
 		Status:      domain.ListingStatusOpen,
 		CreatedAt:   now,
 		UpdatedAt:   now,
+	}
+
+	if in.IsTender {
+		ts := domain.TenderStatusOpen
+		l.IsTender = true
+		l.TenderStatus = &ts
+		l.RecruiterMode = domain.RecruiterModeClosed
+		l.KYCTierRequired = in.KYCTierRequired
 	}
 
 	if err := s.listings.Create(ctx, l); err != nil {
@@ -328,6 +346,21 @@ func validateBudget(budgetMin, budgetMax *decimal.Decimal) error {
 	}
 
 	return nil
+}
+
+// parseDecimal parses a decimal string and returns a pointer to the result.
+// Returns an error if the string is not a valid decimal or is negative.
+func parseDecimal(s string) (*decimal.Decimal, error) {
+	d, err := decimal.NewFromString(s)
+	if err != nil {
+		return nil, fmt.Errorf("invalid decimal: %w", err)
+	}
+
+	if d.IsNegative() {
+		return nil, fmt.Errorf("value must be >= 0")
+	}
+
+	return &d, nil
 }
 
 // sanitizeText rejects null bytes, carriage returns, newlines, and ASCII control chars
