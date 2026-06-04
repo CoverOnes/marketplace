@@ -337,7 +337,7 @@ func TestBidService_CreateBid(t *testing.T) {
 			txMgr := &stubTxManager{listings: listingStore, bids: bidStore, awards: awardStore}
 			publisher := events.NewNoopPublisher()
 
-			svc := service.NewBidService(bidStore, listingStore, awardStore, txMgr, publisher)
+			svc := service.NewBidService(bidStore, listingStore, awardStore, txMgr, publisher, nil)
 
 			bid, err := svc.CreateBid(context.Background(), &tc.input)
 
@@ -476,7 +476,7 @@ func TestBidService_AcceptBid(t *testing.T) {
 			txMgr := &stubTxManager{listings: listingStore, bids: bidStore, awards: awardStore}
 			publisher := events.NewNoopPublisher()
 
-			svc := service.NewBidService(bidStore, listingStore, awardStore, txMgr, publisher)
+			svc := service.NewBidService(bidStore, listingStore, awardStore, txMgr, publisher, nil)
 
 			award, err := svc.AcceptBid(context.Background(), targetBidID, tc.callerID)
 
@@ -586,7 +586,7 @@ func TestBidService_WithdrawBid(t *testing.T) { //nolint:dupl // similar structu
 			txMgr := &stubTxManager{listings: listingStore, bids: bidStore, awards: awardStore}
 			publisher := events.NewNoopPublisher()
 
-			svc := service.NewBidService(bidStore, listingStore, awardStore, txMgr, publisher)
+			svc := service.NewBidService(bidStore, listingStore, awardStore, txMgr, publisher, nil)
 
 			bid, err := svc.WithdrawBid(context.Background(), bidID, tc.callerID)
 
@@ -685,7 +685,7 @@ func TestBidService_RejectBid(t *testing.T) { //nolint:dupl // similar structure
 			txMgr := &stubTxManager{listings: listingStore, bids: bidStore, awards: awardStore}
 			publisher := events.NewNoopPublisher()
 
-			svc := service.NewBidService(bidStore, listingStore, awardStore, txMgr, publisher)
+			svc := service.NewBidService(bidStore, listingStore, awardStore, txMgr, publisher, nil)
 
 			bid, err := svc.RejectBid(context.Background(), bidID, tc.callerID)
 
@@ -756,7 +756,7 @@ func TestBidService_CreateBid_UpperBound(t *testing.T) {
 			txMgr := &stubTxManager{listings: listingStore, bids: bidStore, awards: awardStore}
 			publisher := events.NewNoopPublisher()
 
-			svc := service.NewBidService(bidStore, listingStore, awardStore, txMgr, publisher)
+			svc := service.NewBidService(bidStore, listingStore, awardStore, txMgr, publisher, nil)
 
 			_, err := svc.CreateBid(context.Background(), &service.CreateBidInput{
 				ListingID:    listingID,
@@ -813,7 +813,7 @@ func TestBidService_AcceptBid_DoubleAccept(t *testing.T) {
 	txMgr := &stubTxManager{listings: listingStore, bids: bidStore, awards: awardStore}
 	publisher := events.NewNoopPublisher()
 
-	svc := service.NewBidService(bidStore, listingStore, awardStore, txMgr, publisher)
+	svc := service.NewBidService(bidStore, listingStore, awardStore, txMgr, publisher, nil)
 
 	// First accept: must succeed.
 	award, err := svc.AcceptBid(context.Background(), bidID, ownerID)

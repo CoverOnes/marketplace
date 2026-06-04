@@ -6,6 +6,7 @@ import (
 	"log/slog"
 	"time"
 
+	"github.com/CoverOnes/marketplace/internal/client"
 	"github.com/CoverOnes/marketplace/internal/domain"
 	"github.com/CoverOnes/marketplace/internal/events"
 	"github.com/CoverOnes/marketplace/internal/store"
@@ -15,27 +16,32 @@ import (
 
 // BidService handles bid business logic including the accept transaction.
 type BidService struct {
-	bids      store.BidStore
-	listings  store.ListingStore
-	awards    store.AwardStore
-	txManager store.TxManager
-	publisher events.Publisher
+	bids            store.BidStore
+	listings        store.ListingStore
+	awards          store.AwardStore
+	txManager       store.TxManager
+	publisher       events.Publisher
+	workspaceClient client.WorkspaceClient // nil = workspace call skipped (dev/test)
 }
 
 // NewBidService returns a BidService.
+// workspaceClient may be nil; when nil, the workspace contract-create call is
+// skipped (useful for local dev without the workspace service running).
 func NewBidService(
 	bids store.BidStore,
 	listings store.ListingStore,
 	awards store.AwardStore,
 	txManager store.TxManager,
 	publisher events.Publisher,
+	workspaceClient client.WorkspaceClient,
 ) *BidService {
 	return &BidService{
-		bids:      bids,
-		listings:  listings,
-		awards:    awards,
-		txManager: txManager,
-		publisher: publisher,
+		bids:            bids,
+		listings:        listings,
+		awards:          awards,
+		txManager:       txManager,
+		publisher:       publisher,
+		workspaceClient: workspaceClient,
 	}
 }
 
@@ -233,10 +239,23 @@ func (s *BidService) AcceptBid(ctx context.Context, bidID, callerID uuid.UUID) (
 		return nil, err
 	}
 
-	// After commit: best-effort publish marketplace.bid_accepted.
-	// Event publish uses a detached context so a client disconnect does not
-	// suppress the publish attempt (backend-security §5 / goroutine MUST NOT inherit
-	// request context — DB write must survive client disconnect).
+	// After commit: best-effort side effects, each in a detached goroutine so a
+	// client disconnect does not suppress them (backend-security §5 — goroutine
+	// MUST NOT inherit request context). ctx is passed only to satisfy the
+	// contextcheck call-chain analysis; it is intentionally NOT propagated into
+	// the detached goroutines, which build their own context.Background().
+	s.publishBidAcceptedAsync(ctx, award)
+	s.createWorkspaceContractAsync(ctx, award)
+
+	return award, nil
+}
+
+// publishBidAcceptedAsync publishes marketplace.bid_accepted and marks the award
+// as published, all best-effort in a detached goroutine. Failures are logged but
+// never propagated — the committed award row is authoritative.
+// The ctx parameter is accepted only for contextcheck call-chain analysis; the
+// detached goroutine deliberately uses context.Background() (backend-security §5).
+func (s *BidService) publishBidAcceptedAsync(_ context.Context, award *domain.Award) {
 	go func() { //nolint:contextcheck,gosec // G118+contextcheck: detached context per backend-security §5; goroutine must not be canceled on client disconnect
 		publishCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 		defer cancel()
@@ -265,8 +284,33 @@ func (s *BidService) AcceptBid(ctx context.Context, bidID, callerID uuid.UUID) (
 			)
 		}
 	}()
+}
 
-	return award, nil
+// createWorkspaceContractAsync performs the server-to-server contract creation:
+// it calls workspace with authoritative award data (M-2 fix) in a detached
+// goroutine so a slow workspace response does not block the AcceptBid caller.
+// Failure is logged but not propagated — the award row is authoritative; workspace
+// can be reconciled later. No-op when the workspace client is not configured.
+// The ctx parameter is accepted only for contextcheck call-chain analysis; the
+// detached goroutine deliberately uses context.Background() (backend-security §5).
+func (s *BidService) createWorkspaceContractAsync(_ context.Context, award *domain.Award) {
+	if s.workspaceClient == nil {
+		return
+	}
+
+	go func() { //nolint:contextcheck,gosec // G118+contextcheck: detached context per backend-security §5; goroutine must not be canceled on client disconnect
+		wsCtx, wsCancel := context.WithTimeout(context.Background(), 10*time.Second)
+		defer wsCancel()
+
+		if wsErr := s.workspaceClient.CreateContract(wsCtx, award); wsErr != nil {
+			slog.Warn(
+				"workspace create-contract failed; award row is authoritative, reconcile manually",
+				"award_id", award.ID,
+				"listing_id", award.ListingID,
+				"err", wsErr,
+			)
+		}
+	}()
 }
 
 // RejectBid rejects a PENDING bid.

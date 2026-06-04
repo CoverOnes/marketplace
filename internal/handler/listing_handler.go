@@ -102,7 +102,10 @@ func (h *ListingHandler) List(c *gin.Context) {
 		return
 	}
 
-	filter := store.ListingFilter{Limit: 20}
+	// VisibleToUserID enforces the listing visibility rule in SQL (P0 IDOR fix):
+	// OPEN listings are public; non-OPEN (AWARDED/CLOSED) are restricted to their
+	// owner. Without this, ?status=AWARDED|CLOSED enumerated every user's rows.
+	filter := store.ListingFilter{Limit: 20, VisibleToUserID: identity.UserID}
 
 	if mine := c.Query("mine"); mine == "true" {
 		filter.OwnerUserID = &identity.UserID
@@ -199,14 +202,23 @@ func (h *ListingHandler) Search(c *gin.Context) {
 }
 
 // GetByID handles GET /v1/listings/:id.
+// Applies the listing visibility rule (P0 IDOR fix): OPEN listings are visible
+// to any authenticated caller, non-OPEN listings only to their owner; otherwise
+// 404 (never 403, to avoid resource enumeration).
 func (h *ListingHandler) GetByID(c *gin.Context) {
+	identity, ok := middleware.IdentityFromCtx(c)
+	if !ok {
+		httpx.ErrCode(c, http.StatusUnauthorized, "UNAUTHORIZED", "authentication required")
+		return
+	}
+
 	id, err := uuid.Parse(c.Param("id"))
 	if err != nil {
 		httpx.ErrCode(c, http.StatusBadRequest, "VALIDATION_ERROR", "invalid listing id")
 		return
 	}
 
-	listing, err := h.svc.GetListing(c.Request.Context(), id)
+	listing, err := h.svc.GetListing(c.Request.Context(), id, identity.UserID)
 	if err != nil {
 		httpx.Err(c, err)
 		return
