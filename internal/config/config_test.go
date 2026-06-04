@@ -16,6 +16,9 @@ const testDSN = "postgres://user:pass@localhost/db"
 // testServiceToken is a 32-char placeholder token used in tests only — not a real secret.
 const testServiceToken = "abcdefghijklmnopqrstuvwxyz012345"
 
+// testHMACSecret is a 32-char placeholder HMAC secret used in tests only — not a real secret.
+const testHMACSecret = "0123456789abcdef0123456789abcdef"
+
 // TestConfig_Load covers config loading and validation paths.
 // t.Setenv is not compatible with t.Parallel(); subtests run sequentially.
 func TestConfig_Load(t *testing.T) {
@@ -200,8 +203,95 @@ func TestConfig_Load(t *testing.T) {
 				"MARKETPLACE_ENV":                     "production",
 				"MARKETPLACE_WORKSPACE_BASE_URL":      "http://workspace:8082",
 				"MARKETPLACE_WORKSPACE_SERVICE_TOKEN": testServiceToken,
+				"MARKETPLACE_GATEWAY_HMAC_SECRET":     testHMACSecret,
 			},
 			wantErr: false,
+		},
+		{
+			// Fail-closed env posture: an unset MARKETPLACE_ENV must be a boot
+			// error, never a silent default to production/development.
+			name: "error: empty env is rejected (no silent default)",
+			envVars: map[string]string{
+				"MARKETPLACE_POSTGRES_DSN": testDSN,
+				"MARKETPLACE_PORT":         "8081",
+				"MARKETPLACE_LOG_LEVEL":    "INFO",
+				// MARKETPLACE_ENV intentionally unset.
+			},
+			wantErr: true,
+		},
+		{
+			name: "error: unknown env value is rejected",
+			envVars: map[string]string{
+				"MARKETPLACE_POSTGRES_DSN": testDSN,
+				"MARKETPLACE_PORT":         "8081",
+				"MARKETPLACE_LOG_LEVEL":    "INFO",
+				"MARKETPLACE_ENV":          "prod",
+			},
+			wantErr: true,
+		},
+		{
+			name: "happy path: staging is a valid explicit env",
+			envVars: map[string]string{
+				"MARKETPLACE_POSTGRES_DSN":            testDSN,
+				"MARKETPLACE_PORT":                    "8081",
+				"MARKETPLACE_LOG_LEVEL":               "INFO",
+				"MARKETPLACE_ENV":                     "staging",
+				"MARKETPLACE_WORKSPACE_BASE_URL":      "http://workspace:8082",
+				"MARKETPLACE_WORKSPACE_SERVICE_TOKEN": testServiceToken,
+				"MARKETPLACE_GATEWAY_HMAC_SECRET":     testHMACSecret,
+			},
+			wantErr: false,
+		},
+		{
+			// §24.1 fail-closed: non-dev MUST have a gateway HMAC secret or boot fails.
+			name: "error: production without gateway HMAC secret",
+			envVars: map[string]string{
+				"MARKETPLACE_POSTGRES_DSN":            testDSN,
+				"MARKETPLACE_PORT":                    "8081",
+				"MARKETPLACE_LOG_LEVEL":               "INFO",
+				"MARKETPLACE_ENV":                     "production",
+				"MARKETPLACE_WORKSPACE_BASE_URL":      "http://workspace:8082",
+				"MARKETPLACE_WORKSPACE_SERVICE_TOKEN": testServiceToken,
+				// MARKETPLACE_GATEWAY_HMAC_SECRET intentionally unset.
+			},
+			wantErr: true,
+		},
+		{
+			name: "error: production with short gateway HMAC secret",
+			envVars: map[string]string{
+				"MARKETPLACE_POSTGRES_DSN":            testDSN,
+				"MARKETPLACE_PORT":                    "8081",
+				"MARKETPLACE_LOG_LEVEL":               "INFO",
+				"MARKETPLACE_ENV":                     "production",
+				"MARKETPLACE_WORKSPACE_BASE_URL":      "http://workspace:8082",
+				"MARKETPLACE_WORKSPACE_SERVICE_TOKEN": testServiceToken,
+				"MARKETPLACE_GATEWAY_HMAC_SECRET":     "tooshort",
+			},
+			wantErr: true,
+		},
+		{
+			// Dev exempt: empty gateway secret is allowed (verification disabled).
+			name: "happy path: development without gateway HMAC secret (exempt)",
+			envVars: map[string]string{
+				"MARKETPLACE_POSTGRES_DSN": testDSN,
+				"MARKETPLACE_PORT":         "8081",
+				"MARKETPLACE_LOG_LEVEL":    "INFO",
+				"MARKETPLACE_ENV":          "development",
+			},
+			wantErr: false,
+		},
+		{
+			// Even in dev, a provided-but-too-short secret is rejected so it can't
+			// masquerade as valid.
+			name: "error: development with short gateway HMAC secret",
+			envVars: map[string]string{
+				"MARKETPLACE_POSTGRES_DSN":        testDSN,
+				"MARKETPLACE_PORT":                "8081",
+				"MARKETPLACE_LOG_LEVEL":           "INFO",
+				"MARKETPLACE_ENV":                 "development",
+				"MARKETPLACE_GATEWAY_HMAC_SECRET": "tooshort",
+			},
+			wantErr: true,
 		},
 		{
 			// Dev is exempt from the production workspace guard: an unset base URL
@@ -227,6 +317,7 @@ func TestConfig_Load(t *testing.T) {
 				"MARKETPLACE_ENV", "MARKETPLACE_DB_SCHEMA", "MARKETPLACE_REDIS_URL",
 				"MARKETPLACE_DB_MAX_CONNS", "MARKETPLACE_DB_MIN_CONNS",
 				"MARKETPLACE_WORKSPACE_BASE_URL", "MARKETPLACE_WORKSPACE_SERVICE_TOKEN",
+				"MARKETPLACE_GATEWAY_HMAC_SECRET",
 			}
 			for _, k := range allKnownVars {
 				t.Setenv(k, "")
