@@ -44,7 +44,12 @@ type Config struct {
 	// Log level: DEBUG, INFO, WARN, ERROR
 	LogLevel string `mapstructure:"log_level"`
 
-	// Environment: development | production
+	// Environment: development | staging | production. REQUIRED — there is no
+	// safe default. An empty or unknown value is a boot error (fail-closed): a
+	// silent default to "production" would mask a misconfigured deploy, and a
+	// silent default to "development" would disable gateway-signature
+	// verification §24.1 (the forged-identity-header hole). Operators MUST set
+	// MARKETPLACE_ENV explicitly.
 	Env string `mapstructure:"env"`
 
 	// WorkspaceBaseURL is the base URL of the workspace service, used for the
@@ -59,6 +64,15 @@ type Config struct {
 	// Must be at least 32 characters.
 	// Env: MARKETPLACE_WORKSPACE_SERVICE_TOKEN
 	WorkspaceServiceToken string `mapstructure:"workspace_service_token"`
+
+	// GatewayHMACSecret is the shared secret used to verify the gateway-origin
+	// identity signature (conventions §24.1). It MUST equal the gateway's
+	// GATEWAY_HMAC_SECRET. Non-dev (staging/production) fails fast at boot if
+	// empty or shorter than 32 chars; development may omit it (verification
+	// disabled, mirroring the gateway which also disables signing in dev).
+	// chmod 0600 the file that provides it; prefer the env var as canonical.
+	// Env: MARKETPLACE_GATEWAY_HMAC_SECRET
+	GatewayHMACSecret string `mapstructure:"gateway_hmac_secret"`
 }
 
 // Load reads configuration from environment variables (prefix MARKETPLACE_).
@@ -80,6 +94,7 @@ func Load() (*Config, error) {
 		"db_min_conns":            "MARKETPLACE_DB_MIN_CONNS",
 		"workspace_base_url":      "MARKETPLACE_WORKSPACE_BASE_URL",
 		"workspace_service_token": "MARKETPLACE_WORKSPACE_SERVICE_TOKEN",
+		"gateway_hmac_secret":     "MARKETPLACE_GATEWAY_HMAC_SECRET",
 	}
 
 	for key, envKey := range bindings {
@@ -90,7 +105,10 @@ func Load() (*Config, error) {
 
 	v.SetDefault("port", 8081)
 	v.SetDefault("log_level", "INFO")
-	v.SetDefault("env", "development")
+	// NOTE: MARKETPLACE_ENV has NO default — it is required and validated
+	// explicitly below. A silent default to "production" would mask a
+	// misconfigured deploy; a default to "development" would disable
+	// gateway-signature verification §24.1. Fail-closed: empty env → boot error.
 	v.SetDefault("db_max_conns", 10)
 	v.SetDefault("db_min_conns", 2)
 
@@ -123,9 +141,13 @@ func (c *Config) validate() error {
 		errs = append(errs, "MARKETPLACE_LOG_LEVEL must be DEBUG|INFO|WARN|ERROR")
 	}
 
-	validEnvs := map[string]bool{"development": true, "production": true, "test": true}
+	// Fail-closed env posture: MARKETPLACE_ENV MUST be one of the three known
+	// values. Empty (unset) or any unknown string is a boot error — no silent
+	// default. This guards §24.1: a misconfigured env must never silently land
+	// in a posture that disables gateway-signature verification.
+	validEnvs := map[string]bool{"development": true, "staging": true, "production": true}
 	if !validEnvs[strings.ToLower(c.Env)] {
-		errs = append(errs, "MARKETPLACE_ENV must be development|production|test")
+		errs = append(errs, "MARKETPLACE_ENV must be explicitly set to development|staging|production")
 	}
 
 	if c.PostgresSchema != "" && !schemaNameRe.MatchString(c.PostgresSchema) {
@@ -141,6 +163,7 @@ func (c *Config) validate() error {
 	}
 
 	errs = append(errs, c.validateWorkspace()...)
+	errs = append(errs, c.validateGatewayHMAC()...)
 
 	if len(errs) > 0 {
 		return errors.New("config validation failed: " + strings.Join(errs, "; "))
@@ -175,6 +198,35 @@ func (c *Config) validateWorkspace() []string {
 	// even in dev — a configured base URL without a valid token is always a misconfig.
 	if c.WorkspaceBaseURL != "" && len(c.WorkspaceServiceToken) < minServiceTokenLen {
 		errs = append(errs, "MARKETPLACE_WORKSPACE_SERVICE_TOKEN must be at least 32 characters when MARKETPLACE_WORKSPACE_BASE_URL is set")
+	}
+
+	return errs
+}
+
+// minHMACSecretLen is the minimum length of the gateway HMAC secret. It mirrors
+// the gateway's GATEWAY_HMAC_SECRET ≥32-char requirement (conventions §24.1).
+const minHMACSecretLen = 32
+
+// validateGatewayHMAC enforces the §24.1 fail-closed secret posture:
+//   - non-dev (staging/production): secret is REQUIRED and MUST be ≥32 chars —
+//     boot fails fast otherwise (mirrors the gateway which fails fast in non-dev).
+//   - dev: secret may be empty (verification disabled, mirroring the gateway's
+//     dev signing-skip); but if a secret IS provided it must still be ≥32 chars
+//     so a too-short dev secret never masquerades as a valid one.
+func (c *Config) validateGatewayHMAC() []string {
+	var errs []string
+
+	if !c.IsDev() {
+		if len(c.GatewayHMACSecret) < minHMACSecretLen {
+			errs = append(errs, "MARKETPLACE_GATEWAY_HMAC_SECRET must be at least 32 characters in non-dev (staging/production) environments")
+		}
+
+		return errs
+	}
+
+	// Dev: empty is allowed (verification disabled); non-empty must be ≥32.
+	if c.GatewayHMACSecret != "" && len(c.GatewayHMACSecret) < minHMACSecretLen {
+		errs = append(errs, "MARKETPLACE_GATEWAY_HMAC_SECRET, when set, must be at least 32 characters")
 	}
 
 	return errs

@@ -18,6 +18,11 @@ type RouterConfig struct {
 	BidSvc     *service.BidService
 	Pool       *pgxpool.Pool
 	Redis      *redis.Client // may be nil in dev
+
+	// GatewayHMACSecret is the §24.1 shared secret used to verify the
+	// gateway-origin identity signature. Empty == dev posture (verification
+	// disabled); config validation guarantees it is non-empty in non-dev.
+	GatewayHMACSecret string
 }
 
 // NewRouter builds and returns the configured Gin engine.
@@ -55,6 +60,11 @@ func NewRouter(cfg RouterConfig) *gin.Engine {
 	bidH := NewBidHandler(cfg.BidSvc)
 
 	api := r.Group("/v1")
+	// Defense-in-depth (§24.1): verify the gateway-origin HMAC signature BEFORE
+	// RequireValidIdentity trusts any X-User-Id / X-Kyc-Tier / X-Account-Type /
+	// X-Email-Verified header. When the secret is empty (dev) this is a no-op
+	// passthrough, matching the gateway's dev signing-skip.
+	api.Use(middleware.VerifyGatewaySignature(cfg.GatewayHMACSecret))
 	api.Use(middleware.RequireValidIdentity())
 
 	// Listings — Tier>=1 for browse, Tier>=2 for create/update.
