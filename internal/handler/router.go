@@ -16,6 +16,7 @@ import (
 type RouterConfig struct {
 	ListingSvc *service.ListingService
 	BidSvc     *service.BidService
+	TenderSvc  *service.TenderService
 	Pool       *pgxpool.Pool
 	Redis      *redis.Client // may be nil in dev
 
@@ -58,6 +59,7 @@ func NewRouter(cfg RouterConfig) *gin.Engine {
 	// RequireValidIdentity is applied as a group-level middleware.
 	listingH := NewListingHandler(cfg.ListingSvc)
 	bidH := NewBidHandler(cfg.BidSvc)
+	tenderH := NewTenderHandler(cfg.TenderSvc)
 
 	api := r.Group("/v1")
 	// Defense-in-depth (§24.1): verify the gateway-origin HMAC signature BEFORE
@@ -83,6 +85,21 @@ func NewRouter(cfg RouterConfig) *gin.Engine {
 	api.POST("/bids/:id/accept", middleware.RequireTier(2), bidH.AcceptBid)
 	api.POST("/bids/:id/reject", middleware.RequireTier(2), bidH.RejectBid)
 	api.POST("/bids/:id/withdraw", middleware.RequireTier(2), bidH.WithdrawBid)
+
+	// Tender — owner-only role/milestone management (Tier>=2); collaborator apply/exit (Tier>=2).
+	// Roles sub-resource under /listings/:id/tender/.
+	api.POST("/listings/:id/tender/roles", middleware.RequireTier(2), tenderH.CreateRole)
+	api.GET("/listings/:id/tender/roles", middleware.RequireTier(2), tenderH.ListRoles)
+	api.POST("/listings/:id/tender/roles/:roleId/close", middleware.RequireTier(2), tenderH.CloseRole)
+	// Milestones sub-resource under /listings/:id/tender/.
+	api.POST("/listings/:id/tender/milestones", middleware.RequireTier(2), tenderH.CreateMilestone)
+	api.GET("/listings/:id/tender/milestones", middleware.RequireTier(2), tenderH.ListMilestones)
+	// Collaborators: apply is vendor-initiated; accept/reject are owner-initiated; exit is vendor-initiated.
+	api.POST("/tender/roles/:roleId/apply", middleware.RequireTier(2), tenderH.ApplyToRole)
+	api.GET("/listings/:id/tender/collaborators", middleware.RequireTier(2), tenderH.ListCollaborators)
+	api.POST("/tender/collaborators/:id/accept", middleware.RequireTier(2), tenderH.AcceptCollaborator)
+	api.POST("/tender/collaborators/:id/reject", middleware.RequireTier(2), tenderH.RejectCollaborator)
+	api.POST("/tender/collaborators/:id/exit", middleware.RequireTier(2), tenderH.ExitCollaborator)
 
 	return r
 }

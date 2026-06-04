@@ -95,16 +95,16 @@ func createBid(ctx context.Context, q querier, b *domain.Bid) error {
 	const query = `
 INSERT INTO bids
 	(id, listing_id, bidder_user_id, amount, currency, message,
-	 status, decided_at, created_at, updated_at)
+	 status, role_id, decided_at, created_at, updated_at)
 VALUES
-	($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
+	($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)
 `
 
 	_, err := q.Exec(
 		ctx, query,
 		b.ID, b.ListingID, b.BidderUserID,
 		b.Amount.String(), b.Currency, b.Message,
-		b.Status, b.DecidedAt, b.CreatedAt, b.UpdatedAt,
+		b.Status, b.RoleID, b.DecidedAt, b.CreatedAt, b.UpdatedAt,
 	)
 	if err != nil {
 		var pgErr *pgconn.PgError
@@ -121,7 +121,7 @@ VALUES
 func getBidByID(ctx context.Context, q querier, id uuid.UUID) (*domain.Bid, error) {
 	const query = `
 SELECT id, listing_id, bidder_user_id, amount, currency, message,
-       status, decided_at, created_at, updated_at
+       status, role_id, decided_at, created_at, updated_at
 FROM bids
 WHERE id = $1
 `
@@ -134,7 +134,7 @@ WHERE id = $1
 func getBidByIDForUpdate(ctx context.Context, q querier, id uuid.UUID) (*domain.Bid, error) {
 	const query = `
 SELECT id, listing_id, bidder_user_id, amount, currency, message,
-       status, decided_at, created_at, updated_at
+       status, role_id, decided_at, created_at, updated_at
 FROM bids
 WHERE id = $1
 FOR UPDATE
@@ -146,7 +146,7 @@ FOR UPDATE
 func listBidsByListing(ctx context.Context, q querier, listingID uuid.UUID) ([]*domain.Bid, error) {
 	const query = `
 SELECT id, listing_id, bidder_user_id, amount, currency, message,
-       status, decided_at, created_at, updated_at
+       status, role_id, decided_at, created_at, updated_at
 FROM bids
 WHERE listing_id = $1
 ORDER BY created_at DESC
@@ -158,7 +158,7 @@ ORDER BY created_at DESC
 func listBidsByBidder(ctx context.Context, q querier, bidderUserID uuid.UUID) ([]*domain.Bid, error) {
 	const query = `
 SELECT id, listing_id, bidder_user_id, amount, currency, message,
-       status, decided_at, created_at, updated_at
+       status, role_id, decided_at, created_at, updated_at
 FROM bids
 WHERE bidder_user_id = $1
 ORDER BY created_at DESC
@@ -239,7 +239,7 @@ func scanBid(row rowScanner) (*domain.Bid, error) {
 	err := row.Scan(
 		&b.ID, &b.ListingID, &b.BidderUserID,
 		&amount, &b.Currency, &b.Message,
-		&b.Status, &b.DecidedAt, &b.CreatedAt, &b.UpdatedAt,
+		&b.Status, &b.RoleID, &b.DecidedAt, &b.CreatedAt, &b.UpdatedAt,
 	)
 	if err != nil {
 		if errors.Is(err, pgx.ErrNoRows) {

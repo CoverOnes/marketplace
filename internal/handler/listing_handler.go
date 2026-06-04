@@ -33,11 +33,15 @@ type CreateListingRequest struct {
 	BudgetMin   *string `json:"budgetMin"` // numeric as string to preserve precision
 	BudgetMax   *string `json:"budgetMax"`
 	Currency    string  `json:"currency"`
+	// Tender discriminator. Omit or set false for CLASSIC 1:1 listings.
+	IsTender        bool `json:"isTender"`
+	KYCTierRequired int  `json:"kycTierRequired"` // 0..5; only meaningful when is_tender=true
 }
 
 // Create handles POST /v1/listings.
 // Requires valid identity (RequireValidIdentity) + Tier>=2.
 // owner_user_id is set from X-User-Id — NEVER from the request body.
+// When is_tender=true, recruiter_mode defaults to CLOSED (OPEN is rejected in Phase 1).
 func (h *ListingHandler) Create(c *gin.Context) {
 	c.Request.Body = http.MaxBytesReader(c.Writer, c.Request.Body, maxBodyBytes)
 
@@ -54,10 +58,12 @@ func (h *ListingHandler) Create(c *gin.Context) {
 	}
 
 	in := &service.CreateListingInput{
-		OwnerUserID: identity.UserID, // from header only
-		Title:       req.Title,
-		Description: req.Description,
-		Currency:    req.Currency,
+		OwnerUserID:     identity.UserID, // from header only
+		Title:           req.Title,
+		Description:     req.Description,
+		Currency:        req.Currency,
+		IsTender:        req.IsTender,
+		KYCTierRequired: req.KYCTierRequired,
 	}
 
 	if req.BudgetMin != nil {

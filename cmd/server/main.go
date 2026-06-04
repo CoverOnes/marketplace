@@ -133,6 +133,12 @@ func run() error {
 	awardStore := postgres.NewAwardStore(pool)
 	txManager := postgres.NewTxManager(pool)
 
+	// Tender store layer.
+	tenderRoleStore := postgres.NewTenderRoleStore(pool)
+	tenderCollabStore := postgres.NewTenderCollaboratorStore(pool)
+	tenderMilestoneStore := postgres.NewTenderMilestoneStore(pool)
+	tenderTxManager := postgres.NewTenderTxManager(pool)
+
 	// Workspace S2S client (M-2 fix): marketplace calls workspace after AcceptBid
 	// to create the contract with authoritative award values.
 	// When MARKETPLACE_WORKSPACE_BASE_URL is empty, the call is skipped (local dev).
@@ -147,11 +153,13 @@ func run() error {
 	// Service layer.
 	listingSvc := service.NewListingService(listingStore)
 	bidSvc := service.NewBidService(bidStore, listingStore, awardStore, txManager, publisher, workspaceClient)
+	tenderSvc := service.NewTenderService(listingStore, tenderRoleStore, tenderCollabStore, tenderMilestoneStore, tenderTxManager)
 
 	// Router.
 	r := handler.NewRouter(handler.RouterConfig{
 		ListingSvc:        listingSvc,
 		BidSvc:            bidSvc,
+		TenderSvc:         tenderSvc,
 		Pool:              pool,
 		Redis:             redisClient,
 		GatewayHMACSecret: cfg.GatewayHMACSecret,
