@@ -73,6 +73,16 @@ type Config struct {
 	// chmod 0600 the file that provides it; prefer the env var as canonical.
 	// Env: MARKETPLACE_GATEWAY_HMAC_SECRET
 	GatewayHMACSecret string `mapstructure:"gateway_hmac_secret"`
+
+	// UserRateLimitPerMin is the per-authenticated-user request rate limit
+	// (requests per minute). Set to 0 to disable per-user rate limiting entirely.
+	// Default: 120. Env: MARKETPLACE_USER_RATE_LIMIT_PER_MIN
+	UserRateLimitPerMin int `mapstructure:"user_rate_limit_per_min"`
+
+	// UserRateLimitBurst is the token-bucket burst capacity for the per-user
+	// rate limiter. MUST be > 0 when UserRateLimitPerMin > 0.
+	// Default: 20. Env: MARKETPLACE_USER_RATE_LIMIT_BURST
+	UserRateLimitBurst int `mapstructure:"user_rate_limit_burst"`
 }
 
 // Load reads configuration from environment variables (prefix MARKETPLACE_).
@@ -95,6 +105,8 @@ func Load() (*Config, error) {
 		"workspace_base_url":      "MARKETPLACE_WORKSPACE_BASE_URL",
 		"workspace_service_token": "MARKETPLACE_WORKSPACE_SERVICE_TOKEN",
 		"gateway_hmac_secret":     "MARKETPLACE_GATEWAY_HMAC_SECRET",
+		"user_rate_limit_per_min": "MARKETPLACE_USER_RATE_LIMIT_PER_MIN",
+		"user_rate_limit_burst":   "MARKETPLACE_USER_RATE_LIMIT_BURST",
 	}
 
 	for key, envKey := range bindings {
@@ -111,6 +123,8 @@ func Load() (*Config, error) {
 	// gateway-signature verification §24.1. Fail-closed: empty env → boot error.
 	v.SetDefault("db_max_conns", 10)
 	v.SetDefault("db_min_conns", 2)
+	v.SetDefault("user_rate_limit_per_min", 120)
+	v.SetDefault("user_rate_limit_burst", 20)
 
 	var cfg Config
 
@@ -164,6 +178,7 @@ func (c *Config) validate() error {
 
 	errs = append(errs, c.validateWorkspace()...)
 	errs = append(errs, c.validateGatewayHMAC()...)
+	errs = append(errs, c.validateUserRateLimit()...)
 
 	if len(errs) > 0 {
 		return errors.New("config validation failed: " + strings.Join(errs, "; "))
@@ -227,6 +242,26 @@ func (c *Config) validateGatewayHMAC() []string {
 	// Dev: empty is allowed (verification disabled); non-empty must be ≥32.
 	if c.GatewayHMACSecret != "" && len(c.GatewayHMACSecret) < minHMACSecretLen {
 		errs = append(errs, "MARKETPLACE_GATEWAY_HMAC_SECRET, when set, must be at least 32 characters")
+	}
+
+	return errs
+}
+
+// validateUserRateLimit returns validation errors for the per-user rate limit config.
+//
+// Rules:
+//   - UserRateLimitPerMin >= 0 (0 = disabled)
+//   - When UserRateLimitPerMin > 0, UserRateLimitBurst MUST be > 0 (a burst of 0
+//     would make every request immediately rejected by the token bucket).
+func (c *Config) validateUserRateLimit() []string {
+	var errs []string
+
+	if c.UserRateLimitPerMin < 0 {
+		errs = append(errs, "MARKETPLACE_USER_RATE_LIMIT_PER_MIN must be >= 0 (0 = disabled)")
+	}
+
+	if c.UserRateLimitPerMin > 0 && c.UserRateLimitBurst <= 0 {
+		errs = append(errs, "MARKETPLACE_USER_RATE_LIMIT_BURST must be > 0 when MARKETPLACE_USER_RATE_LIMIT_PER_MIN > 0")
 	}
 
 	return errs

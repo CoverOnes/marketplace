@@ -305,6 +305,60 @@ func TestConfig_Load(t *testing.T) {
 			},
 			wantErr: false,
 		},
+		{
+			// validateUserRateLimit: negative perMin is rejected.
+			name: "error: negative user rate limit per-min",
+			envVars: map[string]string{
+				"MARKETPLACE_POSTGRES_DSN":            testDSN,
+				"MARKETPLACE_PORT":                    "8081",
+				"MARKETPLACE_LOG_LEVEL":               "INFO",
+				"MARKETPLACE_ENV":                     "development",
+				"MARKETPLACE_USER_RATE_LIMIT_PER_MIN": "-1",
+				"MARKETPLACE_USER_RATE_LIMIT_BURST":   "10",
+			},
+			wantErr: true,
+		},
+		{
+			// validateUserRateLimit: perMin>0 but burst<=0 is rejected (every request
+			// would be immediately denied by the token bucket).
+			name: "error: positive per-min with zero burst",
+			envVars: map[string]string{
+				"MARKETPLACE_POSTGRES_DSN":            testDSN,
+				"MARKETPLACE_PORT":                    "8081",
+				"MARKETPLACE_LOG_LEVEL":               "INFO",
+				"MARKETPLACE_ENV":                     "development",
+				"MARKETPLACE_USER_RATE_LIMIT_PER_MIN": "60",
+				"MARKETPLACE_USER_RATE_LIMIT_BURST":   "0",
+			},
+			wantErr: true,
+		},
+		{
+			// validateUserRateLimit: perMin=0 disables rate limiting entirely —
+			// burst value is irrelevant and must not be checked.
+			name: "happy path: per-min=0 disables rate limiting (burst ignored)",
+			envVars: map[string]string{
+				"MARKETPLACE_POSTGRES_DSN":            testDSN,
+				"MARKETPLACE_PORT":                    "8081",
+				"MARKETPLACE_LOG_LEVEL":               "INFO",
+				"MARKETPLACE_ENV":                     "development",
+				"MARKETPLACE_USER_RATE_LIMIT_PER_MIN": "0",
+				"MARKETPLACE_USER_RATE_LIMIT_BURST":   "0",
+			},
+			wantErr: false,
+		},
+		{
+			// validateUserRateLimit: valid perMin and burst — happy path for the limiter.
+			name: "happy path: valid user rate limit config",
+			envVars: map[string]string{
+				"MARKETPLACE_POSTGRES_DSN":            testDSN,
+				"MARKETPLACE_PORT":                    "8081",
+				"MARKETPLACE_LOG_LEVEL":               "INFO",
+				"MARKETPLACE_ENV":                     "development",
+				"MARKETPLACE_USER_RATE_LIMIT_PER_MIN": "120",
+				"MARKETPLACE_USER_RATE_LIMIT_BURST":   "20",
+			},
+			wantErr: false,
+		},
 	}
 
 	for _, tc := range tests {
@@ -318,6 +372,7 @@ func TestConfig_Load(t *testing.T) {
 				"MARKETPLACE_DB_MAX_CONNS", "MARKETPLACE_DB_MIN_CONNS",
 				"MARKETPLACE_WORKSPACE_BASE_URL", "MARKETPLACE_WORKSPACE_SERVICE_TOKEN",
 				"MARKETPLACE_GATEWAY_HMAC_SECRET",
+				"MARKETPLACE_USER_RATE_LIMIT_PER_MIN", "MARKETPLACE_USER_RATE_LIMIT_BURST",
 			}
 			for _, k := range allKnownVars {
 				t.Setenv(k, "")
