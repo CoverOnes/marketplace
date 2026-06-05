@@ -1,0 +1,1 @@
+DROP INDEX IF EXISTS tender_collaborators_status_listing_id_idx;

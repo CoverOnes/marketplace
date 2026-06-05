@@ -639,6 +639,91 @@ func TestTenderMilestoneStore_Integration(t *testing.T) {
 	})
 }
 
+// TestTenderAccept_TOCTOU_Executing_Integration proves that the SELECT FOR UPDATE TOCTOU
+// guard remains intact when accepting collaborators on an EXECUTING tender.
+// Concurrent accepts on the same single-cap role: exactly 1 must be APPROVED.
+func TestTenderAccept_TOCTOU_Executing_Integration(t *testing.T) {
+	if testing.Short() {
+		t.Skip("skipping integration test in short mode")
+	}
+
+	ctx := context.Background()
+	dsn := startTestDB(t)
+	runMigrations(t, ctx, dsn)
+
+	pool, err := postgres.NewPool(ctx, dsn, "", postgres.PoolOptions{})
+	require.NoError(t, err)
+
+	defer pool.Close()
+
+	ls := postgres.NewListingStore(pool)
+	rs := postgres.NewTenderRoleStore(pool)
+	cs := postgres.NewTenderCollaboratorStore(pool)
+	txm := postgres.NewTenderTxManager(pool)
+	ownerID := uuid.New()
+
+	// Seed an EXECUTING tender listing.
+	execStatus := domain.TenderStatusExecuting
+	now := time.Now().UTC().Truncate(time.Millisecond)
+	execListing := &domain.Listing{
+		ID:              uuid.New(),
+		OwnerUserID:     ownerID,
+		Title:           "Executing tender TOCTOU test",
+		Currency:        "TWD",
+		Status:          domain.ListingStatusOpen,
+		IsTender:        true,
+		RecruiterMode:   domain.RecruiterModeClosed,
+		TenderStatus:    &execStatus,
+		KYCTierRequired: 2,
+		CreatedAt:       now,
+		UpdatedAt:       now,
+	}
+	require.NoError(t, ls.Create(ctx, execListing))
+
+	// Role capped at 1 to exercise the guard.
+	maxCols := 1
+	role := seedTenderRole(t, ctx, rs, execListing.ID, &maxCols)
+
+	// Two concurrent applicants — only one must end up APPROVED.
+	v1, v2 := uuid.New(), uuid.New()
+	c1 := seedCollaborator(t, ctx, cs, role.ID, execListing.ID, v1)
+	c2 := seedCollaborator(t, ctx, cs, role.ID, execListing.ID, v2)
+
+	var wg sync.WaitGroup
+
+	errs := make([]error, 2)
+
+	for i, collabID := range []uuid.UUID{c1.ID, c2.ID} {
+		wg.Add(1)
+
+		go func(idx int, id uuid.UUID) {
+			defer wg.Done()
+
+			errs[idx] = toctouAcceptTx(ctx, txm, ownerID, role.ID, id)
+		}(i, collabID)
+	}
+
+	wg.Wait()
+
+	approvedCount := 0
+
+	for _, collabID := range []uuid.UUID{c1.ID, c2.ID} {
+		got, getErr := cs.GetByID(ctx, collabID)
+		require.NoError(t, getErr)
+
+		if got.Status == domain.CollaboratorStatusApproved {
+			approvedCount++
+		}
+	}
+
+	assert.Equal(t, 1, approvedCount, "exactly 1 collaborator must be APPROVED on EXECUTING tender")
+
+	// Role must be FILLED.
+	finalRole, err := rs.GetByID(ctx, role.ID)
+	require.NoError(t, err)
+	assert.Equal(t, domain.TenderRoleStatusFilled, finalRole.Status)
+}
+
 // toctouAcceptTx is extracted from TestTenderAccept_TOCTOU_Integration to keep
 // that function under the gocyclo limit. It runs the accept logic in a transaction,
 // mirroring the service-layer AcceptCollaborator behavior.

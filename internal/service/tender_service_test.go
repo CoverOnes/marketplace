@@ -6,7 +6,9 @@ import (
 	"testing"
 	"time"
 
+	"github.com/CoverOnes/marketplace/internal/client"
 	"github.com/CoverOnes/marketplace/internal/domain"
+	"github.com/CoverOnes/marketplace/internal/events"
 	"github.com/CoverOnes/marketplace/internal/service"
 	"github.com/CoverOnes/marketplace/internal/store"
 	"github.com/google/uuid"
@@ -222,6 +224,7 @@ func makeTenderListing(ownerID uuid.UUID, ts domain.TenderStatus) *domain.Listin
 }
 
 // newTenderSvc builds a TenderService wired to the given stub stores.
+// Uses a noop publisher and nil workspace client (adequate for most unit tests).
 func newTenderSvc(
 	ls store.ListingStore,
 	rs store.TenderRoleStore,
@@ -230,7 +233,78 @@ func newTenderSvc(
 ) *service.TenderService {
 	txm := &stubTenderTxManager{listings: ls, roles: rs, collaborators: cs}
 
-	return service.NewTenderService(ls, rs, cs, ms, txm)
+	return service.NewTenderService(ls, rs, cs, ms, txm, nil, events.NewNoopPublisher())
+}
+
+// newTenderSvcWithWorkspace builds a TenderService with a custom workspace client.
+func newTenderSvcWithWorkspace(
+	ls store.ListingStore,
+	rs store.TenderRoleStore,
+	cs store.TenderCollaboratorStore,
+	ms store.TenderMilestoneStore,
+	wc client.WorkspaceClient,
+) *service.TenderService {
+	txm := &stubTenderTxManager{listings: ls, roles: rs, collaborators: cs}
+
+	return service.NewTenderService(ls, rs, cs, ms, txm, wc, events.NewNoopPublisher())
+}
+
+// newTenderSvcWithPublisher builds a TenderService with a custom publisher.
+func newTenderSvcWithPublisher(
+	ls store.ListingStore,
+	rs store.TenderRoleStore,
+	cs store.TenderCollaboratorStore,
+	ms store.TenderMilestoneStore,
+	wc client.WorkspaceClient,
+	pub events.Publisher,
+) *service.TenderService {
+	txm := &stubTenderTxManager{listings: ls, roles: rs, collaborators: cs}
+
+	return service.NewTenderService(ls, rs, cs, ms, txm, wc, pub)
+}
+
+// --- stub workspace client ---
+
+// stubWorkspaceClient is a fake WorkspaceClient that records calls and can be
+// configured to return a specific error for AddPartyToContract.
+type stubWorkspaceClient struct {
+	createContractErr   error
+	addPartyErr         error
+	addPartyCallCount   int
+	createContractCalls int
+}
+
+func (s *stubWorkspaceClient) CreateContract(_ context.Context, _ *domain.Award) error {
+	s.createContractCalls++
+	return s.createContractErr
+}
+
+func (s *stubWorkspaceClient) AddPartyToContract(_ context.Context, _ client.AddPartyInput) error {
+	s.addPartyCallCount++
+	return s.addPartyErr
+}
+
+// --- stub publisher ---
+
+// stubPublisher is a fake Publisher that records calls and can be configured to return errors.
+type stubPublisher struct {
+	bidAcceptedCalls        int
+	collaboratorJoinedCalls int
+	collaboratorJoinedEvts  []*domain.CollaboratorJoinedEvent
+	bidAcceptedErr          error
+	collaboratorJoinedErr   error
+}
+
+func (p *stubPublisher) PublishBidAccepted(_ context.Context, _ *domain.BidAcceptedEvent) error {
+	p.bidAcceptedCalls++
+	return p.bidAcceptedErr
+}
+
+func (p *stubPublisher) PublishCollaboratorJoined(_ context.Context, evt *domain.CollaboratorJoinedEvent) error {
+	p.collaboratorJoinedCalls++
+	p.collaboratorJoinedEvts = append(p.collaboratorJoinedEvts, evt)
+
+	return p.collaboratorJoinedErr
 }
 
 // --- Fix 2: ApplyToRole tender_status gate ---
@@ -260,10 +334,9 @@ func TestApplyToRole_TenderStatusGate(t *testing.T) {
 			wantErr:      false,
 		},
 		{
-			name:         "error: EXECUTING tender rejects applications in Phase 1",
+			name:         "happy: EXECUTING tender accepts applications in Phase 4",
 			tenderStatus: domain.TenderStatusExecuting,
-			wantErr:      true,
-			wantErrIs:    domain.ErrValidation,
+			wantErr:      false,
 		},
 		{
 			name:         "error: CANCELED tender rejects applications",
@@ -540,3 +613,425 @@ func TestRejectCollaborator_AfterConcurrentApprove(t *testing.T) {
 }
 
 // strPtr is declared in listing_service_test.go (same package); used here without re-declaration.
+
+// --- Phase 4 tests ---
+
+// TestApplyToRole_WhileExecuting verifies that a vendor can apply to a role on an
+// EXECUTING tender (Phase 4: join-while-EXECUTING enabled).
+func TestApplyToRole_WhileExecuting(t *testing.T) {
+	t.Parallel()
+
+	ownerID := uuid.New()
+	vendorID := uuid.New()
+
+	listing := makeTenderListing(ownerID, domain.TenderStatusExecuting)
+	listing.RecruiterMode = domain.RecruiterModeClosed
+
+	role := &domain.TenderRole{
+		ID:        uuid.New(),
+		ListingID: listing.ID,
+		Title:     "Dev role",
+		Status:    domain.TenderRoleStatusOpen,
+	}
+
+	ls := newStubListingStore(listing)
+	rs := newStubTenderRoleStore(role)
+	cs := newStubTenderCollaboratorStore()
+	ms := newStubTenderMilestoneStore()
+	svc := newTenderSvc(ls, rs, cs, ms)
+
+	collab, err := svc.ApplyToRole(context.Background(), &service.ApplyToRoleInput{
+		RoleID:       role.ID,
+		VendorUserID: vendorID,
+		KYCTier:      2,
+		JoinMessage:  "Want to join while executing",
+	})
+	require.NoError(t, err, "ApplyToRole must succeed on EXECUTING tender in Phase 4")
+	assert.Equal(t, domain.CollaboratorStatusPending, collab.Status)
+	assert.Equal(t, vendorID, collab.VendorUserID)
+}
+
+// TestApplyToRole_OpenRecruiterMode verifies that OPEN recruiter mode tenders are accepted
+// in Phase 4 (the Phase 1 rejection block has been lifted).
+func TestApplyToRole_OpenRecruiterMode(t *testing.T) {
+	t.Parallel()
+
+	ownerID := uuid.New()
+	vendorID := uuid.New()
+
+	listing := makeTenderListing(ownerID, domain.TenderStatusOpen)
+	listing.RecruiterMode = domain.RecruiterModeOpen
+
+	role := &domain.TenderRole{
+		ID:        uuid.New(),
+		ListingID: listing.ID,
+		Title:     "Open role",
+		Status:    domain.TenderRoleStatusOpen,
+	}
+
+	ls := newStubListingStore(listing)
+	rs := newStubTenderRoleStore(role)
+	cs := newStubTenderCollaboratorStore()
+	ms := newStubTenderMilestoneStore()
+	svc := newTenderSvc(ls, rs, cs, ms)
+
+	collab, err := svc.ApplyToRole(context.Background(), &service.ApplyToRoleInput{
+		RoleID:       role.ID,
+		VendorUserID: vendorID,
+		KYCTier:      2,
+		JoinMessage:  "Open mode apply",
+	})
+	require.NoError(t, err, "ApplyToRole must succeed for OPEN recruiter mode in Phase 4")
+	assert.Equal(t, domain.CollaboratorStatusPending, collab.Status)
+}
+
+// TestApplyToRole_SettlingRejected verifies SETTLING still rejects applications.
+func TestApplyToRole_SettlingRejected(t *testing.T) {
+	t.Parallel()
+
+	ownerID := uuid.New()
+	vendorID := uuid.New()
+
+	listing := makeTenderListing(ownerID, domain.TenderStatusSettling)
+	role := &domain.TenderRole{
+		ID:        uuid.New(),
+		ListingID: listing.ID,
+		Title:     "Dev role",
+		Status:    domain.TenderRoleStatusOpen,
+	}
+
+	ls := newStubListingStore(listing)
+	rs := newStubTenderRoleStore(role)
+	cs := newStubTenderCollaboratorStore()
+	ms := newStubTenderMilestoneStore()
+	svc := newTenderSvc(ls, rs, cs, ms)
+
+	_, err := svc.ApplyToRole(context.Background(), &service.ApplyToRoleInput{
+		RoleID:       role.ID,
+		VendorUserID: vendorID,
+		KYCTier:      2,
+	})
+	require.Error(t, err)
+	assert.True(t, errors.Is(err, domain.ErrValidation), "SETTLING must reject applications, got: %v", err)
+}
+
+// TestIsTenderAcceptingApplications verifies the Phase 4 status gate.
+func TestIsTenderAcceptingApplications(t *testing.T) {
+	t.Parallel()
+
+	// We test via ApplyToRole since isTenderAcceptingApplications is unexported.
+	// This mirrors the acceptance criteria check.
+	ownerID := uuid.New()
+	vendorID := uuid.New()
+
+	tests := []struct {
+		name         string
+		tenderStatus domain.TenderStatus
+		wantAccept   bool
+	}{
+		{"OPEN accepts", domain.TenderStatusOpen, true},
+		{"PARTIALLY_STAFFED accepts", domain.TenderStatusPartiallyStaffed, true},
+		{"EXECUTING accepts", domain.TenderStatusExecuting, true},
+		{"SETTLING rejects", domain.TenderStatusSettling, false},
+		{"COMPLETED rejects", domain.TenderStatusCompleted, false},
+		{"CANCELED rejects", domain.TenderStatusCancelled, false},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+
+			listing := makeTenderListing(ownerID, tc.tenderStatus)
+			role := &domain.TenderRole{
+				ID:        uuid.New(),
+				ListingID: listing.ID,
+				Title:     "Role",
+				Status:    domain.TenderRoleStatusOpen,
+			}
+
+			ls := newStubListingStore(listing)
+			rs := newStubTenderRoleStore(role)
+			cs := newStubTenderCollaboratorStore()
+			ms := newStubTenderMilestoneStore()
+			svc := newTenderSvc(ls, rs, cs, ms)
+
+			_, err := svc.ApplyToRole(context.Background(), &service.ApplyToRoleInput{
+				RoleID:       role.ID,
+				VendorUserID: vendorID,
+				KYCTier:      2,
+			})
+
+			if tc.wantAccept {
+				require.NoError(t, err, "status %s should accept, got: %v", tc.tenderStatus, err)
+			} else {
+				require.Error(t, err, "status %s should reject", tc.tenderStatus)
+				assert.True(t, errors.Is(err, domain.ErrValidation))
+			}
+		})
+	}
+}
+
+// TestAcceptCollaborator_WhileExecuting_WorkspaceSuccess verifies that accepting a
+// collaborator on an EXECUTING tender calls workspace and returns the approved collaborator.
+func TestAcceptCollaborator_WhileExecuting_WorkspaceSuccess(t *testing.T) {
+	t.Parallel()
+
+	ownerID := uuid.New()
+	vendorID := uuid.New()
+
+	listing := makeTenderListing(ownerID, domain.TenderStatusExecuting)
+	role := &domain.TenderRole{
+		ID:        uuid.New(),
+		ListingID: listing.ID,
+		Title:     "Dev role",
+		Status:    domain.TenderRoleStatusOpen,
+	}
+	collab := &domain.TenderCollaborator{
+		ID:           uuid.New(),
+		TenderRoleID: role.ID,
+		ListingID:    listing.ID,
+		VendorUserID: vendorID,
+		Status:       domain.CollaboratorStatusPending,
+		CreatedAt:    time.Now().UTC(),
+		UpdatedAt:    time.Now().UTC(),
+	}
+
+	wc := &stubWorkspaceClient{}
+
+	ls := newStubListingStore(listing)
+	rs := newStubTenderRoleStore(role)
+	cs := newStubTenderCollaboratorStore(collab)
+	ms := newStubTenderMilestoneStore()
+	svc := newTenderSvcWithWorkspace(ls, rs, cs, ms, wc)
+
+	result, err := svc.AcceptCollaborator(context.Background(), &service.AcceptCollaboratorInput{
+		CollaboratorID: collab.ID,
+		CallerID:       ownerID,
+	})
+	require.NoError(t, err)
+	assert.Equal(t, domain.CollaboratorStatusApproved, result.Status)
+	assert.Equal(t, 1, wc.addPartyCallCount, "AddPartyToContract must be called once")
+}
+
+// TestAcceptCollaborator_WhileExecuting_WorkspaceFailure verifies that when the workspace
+// call fails, the service returns a 502-mappable error. The collaborator row stays APPROVED.
+func TestAcceptCollaborator_WhileExecuting_WorkspaceFailure(t *testing.T) {
+	t.Parallel()
+
+	ownerID := uuid.New()
+	vendorID := uuid.New()
+
+	listing := makeTenderListing(ownerID, domain.TenderStatusExecuting)
+	role := &domain.TenderRole{
+		ID:        uuid.New(),
+		ListingID: listing.ID,
+		Title:     "Dev role",
+		Status:    domain.TenderRoleStatusOpen,
+	}
+	collab := &domain.TenderCollaborator{
+		ID:           uuid.New(),
+		TenderRoleID: role.ID,
+		ListingID:    listing.ID,
+		VendorUserID: vendorID,
+		Status:       domain.CollaboratorStatusPending,
+		CreatedAt:    time.Now().UTC(),
+		UpdatedAt:    time.Now().UTC(),
+	}
+
+	wc := &stubWorkspaceClient{addPartyErr: errors.New("workspace 500")}
+
+	ls := newStubListingStore(listing)
+	rs := newStubTenderRoleStore(role)
+	cs := newStubTenderCollaboratorStore(collab)
+	ms := newStubTenderMilestoneStore()
+	svc := newTenderSvcWithWorkspace(ls, rs, cs, ms, wc)
+
+	result, err := svc.AcceptCollaborator(context.Background(), &service.AcceptCollaboratorInput{
+		CollaboratorID: collab.ID,
+		CallerID:       ownerID,
+	})
+
+	require.Error(t, err)
+	assert.True(t, errors.Is(err, domain.ErrUpstreamWorkspace), "must return ErrUpstreamWorkspace, got: %v", err)
+
+	// The collaborator must still be APPROVED in the store (tx already committed).
+	stored, getErr := cs.GetByID(context.Background(), collab.ID)
+	require.NoError(t, getErr)
+	assert.Equal(t, domain.CollaboratorStatusApproved, stored.Status,
+		"collaborator must remain APPROVED even when workspace call fails")
+
+	// The returned result (partial result before error) must reflect APPROVED.
+	require.NotNil(t, result)
+	assert.Equal(t, domain.CollaboratorStatusApproved, result.Status)
+}
+
+// TestAcceptCollaborator_TerminalStates verifies that accepting on COMPLETED or CANCELED
+// returns ErrInvalidTenderTransition (409).
+func TestAcceptCollaborator_TerminalStates(t *testing.T) {
+	t.Parallel()
+
+	ownerID := uuid.New()
+	vendorID := uuid.New()
+
+	tests := []struct {
+		name         string
+		tenderStatus domain.TenderStatus
+	}{
+		{"COMPLETED → 409", domain.TenderStatusCompleted},
+		{"CANCELED → 409", domain.TenderStatusCancelled},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+
+			listing := makeTenderListing(ownerID, tc.tenderStatus)
+			role := &domain.TenderRole{
+				ID:        uuid.New(),
+				ListingID: listing.ID,
+				Title:     "Role",
+				Status:    domain.TenderRoleStatusOpen,
+			}
+			collab := &domain.TenderCollaborator{
+				ID:           uuid.New(),
+				TenderRoleID: role.ID,
+				ListingID:    listing.ID,
+				VendorUserID: vendorID,
+				Status:       domain.CollaboratorStatusPending,
+				CreatedAt:    time.Now().UTC(),
+				UpdatedAt:    time.Now().UTC(),
+			}
+
+			ls := newStubListingStore(listing)
+			rs := newStubTenderRoleStore(role)
+			cs := newStubTenderCollaboratorStore(collab)
+			ms := newStubTenderMilestoneStore()
+			svc := newTenderSvc(ls, rs, cs, ms)
+
+			_, err := svc.AcceptCollaborator(context.Background(), &service.AcceptCollaboratorInput{
+				CollaboratorID: collab.ID,
+				CallerID:       ownerID,
+			})
+			require.Error(t, err)
+			assert.True(t, errors.Is(err, domain.ErrInvalidTenderTransition),
+				"expected ErrInvalidTenderTransition, got: %v", err)
+		})
+	}
+}
+
+// TestAcceptCollaborator_NonExecuting_NoWorkspaceCall verifies workspace is NOT called
+// when tender is in OPEN or PARTIALLY_STAFFED status.
+func TestAcceptCollaborator_NonExecuting_NoWorkspaceCall(t *testing.T) {
+	t.Parallel()
+
+	ownerID := uuid.New()
+	vendorID := uuid.New()
+
+	tests := []struct {
+		name         string
+		tenderStatus domain.TenderStatus
+	}{
+		{"OPEN", domain.TenderStatusOpen},
+		{"PARTIALLY_STAFFED", domain.TenderStatusPartiallyStaffed},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+
+			listing := makeTenderListing(ownerID, tc.tenderStatus)
+			role := &domain.TenderRole{
+				ID:        uuid.New(),
+				ListingID: listing.ID,
+				Title:     "Role",
+				Status:    domain.TenderRoleStatusOpen,
+			}
+			collab := &domain.TenderCollaborator{
+				ID:           uuid.New(),
+				TenderRoleID: role.ID,
+				ListingID:    listing.ID,
+				VendorUserID: vendorID,
+				Status:       domain.CollaboratorStatusPending,
+				CreatedAt:    time.Now().UTC(),
+				UpdatedAt:    time.Now().UTC(),
+			}
+
+			wc := &stubWorkspaceClient{}
+
+			ls := newStubListingStore(listing)
+			rs := newStubTenderRoleStore(role)
+			cs := newStubTenderCollaboratorStore(collab)
+			ms := newStubTenderMilestoneStore()
+			svc := newTenderSvcWithWorkspace(ls, rs, cs, ms, wc)
+
+			_, err := svc.AcceptCollaborator(context.Background(), &service.AcceptCollaboratorInput{
+				CollaboratorID: collab.ID,
+				CallerID:       ownerID,
+			})
+			require.NoError(t, err)
+			assert.Equal(t, 0, wc.addPartyCallCount,
+				"workspace must NOT be called for non-EXECUTING tenders")
+		})
+	}
+}
+
+// TestCollaboratorJoined_EventPublished verifies the collaborator_joined event is
+// published (best-effort, via mock publisher) when accepting on an EXECUTING tender.
+// The goroutine is given a short sleep to allow the async publish to complete in tests.
+func TestCollaboratorJoined_EventPublished(t *testing.T) {
+	t.Parallel()
+
+	ownerID := uuid.New()
+	vendorID := uuid.New()
+
+	listing := makeTenderListing(ownerID, domain.TenderStatusExecuting)
+	role := &domain.TenderRole{
+		ID:        uuid.New(),
+		ListingID: listing.ID,
+		Title:     "Dev role",
+		Status:    domain.TenderRoleStatusOpen,
+	}
+	collab := &domain.TenderCollaborator{
+		ID:           uuid.New(),
+		TenderRoleID: role.ID,
+		ListingID:    listing.ID,
+		VendorUserID: vendorID,
+		Status:       domain.CollaboratorStatusPending,
+		CreatedAt:    time.Now().UTC(),
+		UpdatedAt:    time.Now().UTC(),
+	}
+
+	wc := &stubWorkspaceClient{}
+	pub := &stubPublisher{}
+
+	ls := newStubListingStore(listing)
+	rs := newStubTenderRoleStore(role)
+	cs := newStubTenderCollaboratorStore(collab)
+	ms := newStubTenderMilestoneStore()
+	svc := newTenderSvcWithPublisher(ls, rs, cs, ms, wc, pub)
+
+	_, err := svc.AcceptCollaborator(context.Background(), &service.AcceptCollaboratorInput{
+		CollaboratorID: collab.ID,
+		CallerID:       ownerID,
+	})
+	require.NoError(t, err)
+
+	// Allow the async goroutine to complete.
+	deadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) {
+		if pub.collaboratorJoinedCalls > 0 {
+			break
+		}
+
+		time.Sleep(10 * time.Millisecond)
+	}
+
+	assert.Equal(t, 1, pub.collaboratorJoinedCalls, "collaborator_joined must be published once")
+	require.Len(t, pub.collaboratorJoinedEvts, 1)
+
+	evt := pub.collaboratorJoinedEvts[0]
+	assert.Equal(t, "EXECUTING", evt.Data.TenderStatus)
+	assert.Equal(t, listing.ID, evt.Data.TenderID)
+	assert.Equal(t, collab.ID, evt.Data.CollaboratorID)
+	assert.Equal(t, vendorID, evt.Data.VendorUserID)
+}

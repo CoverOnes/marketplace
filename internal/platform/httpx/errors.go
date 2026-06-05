@@ -139,6 +139,10 @@ func translateTender(err error) (code string, status int, message string, ok boo
 
 	case errors.Is(err, domain.ErrNotTenderListing):
 		return "NOT_TENDER_LISTING", http.StatusConflict, "listing is not a tender", true
+
+	case errors.Is(err, domain.ErrUpstreamWorkspace):
+		return "UPSTREAM_WORKSPACE_ERROR", http.StatusBadGateway,
+			"workspace service error; collaborator is approved but contract update failed", true
 	}
 
 	return "", 0, "", false

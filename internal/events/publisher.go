@@ -14,4 +14,9 @@ type Publisher interface {
 	// Best-effort: callers MUST NOT treat a publish failure as a reason to
 	// roll back the accept transaction. The awards row is the authoritative record.
 	PublishBidAccepted(ctx context.Context, evt *domain.BidAcceptedEvent) error
+
+	// PublishCollaboratorJoined sends the marketplace.collaborator_joined event.
+	// Best-effort: callers MUST NOT treat a publish failure as fatal. The
+	// tender_collaborators row is the authoritative record.
+	PublishCollaboratorJoined(ctx context.Context, evt *domain.CollaboratorJoinedEvent) error
 }
