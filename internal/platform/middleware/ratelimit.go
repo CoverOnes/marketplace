@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"log/slog"
+	"math"
 	"net/http"
 	"strconv"
 	"sync"
@@ -197,12 +198,13 @@ func (l *UserRateLimiter) allow(key string) bool {
 // Warn log — they will still be subject to the IP-level limiter. Denied requests
 // receive a 429 with a Retry-After header.
 func (l *UserRateLimiter) Handler() gin.HandlerFunc {
-	retryAfter := strconv.Itoa(int(60.0 / float64(l.limitPerMin)))
+	retryAfter := strconv.Itoa(max(1, int(math.Ceil(60.0/float64(l.limitPerMin)))))
 
 	return func(c *gin.Context) {
 		identity, ok := IdentityFromCtx(c)
 		if !ok || identity.UserID == uuid.Nil {
-			slog.Warn("user rate limiter: no verified user_id; passing through",
+			slog.Warn(
+				"user rate limiter: no verified user_id; passing through",
 				"path", c.Request.URL.Path,
 			)
 			c.Next()

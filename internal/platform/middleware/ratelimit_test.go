@@ -4,6 +4,7 @@ import (
 	"context"
 	"net/http"
 	"net/http/httptest"
+	"strconv"
 	"testing"
 
 	"github.com/CoverOnes/marketplace/internal/platform/middleware"
@@ -57,19 +58,53 @@ func TestUserRateLimiter_AllowWithinBudget(t *testing.T) {
 func TestUserRateLimiter_DenyOverBudget(t *testing.T) {
 	t.Parallel()
 
-	// burst=2: first 2 requests pass, 3rd must be rejected.
-	// Use 60/min to verify Retry-After is computed from limitPerMin.
-	r := buildUserRLRouter(60, 2)
-	uid := uuid.New().String()
+	tests := []struct {
+		name              string
+		limitPerMin       int
+		burst             int
+		wantRetryAfterMin int // Retry-After must be >= this value
+	}{
+		{
+			// 60 req/min → ceil(60/60) = 1 second Retry-After.
+			name:              "60/min burst=2",
+			limitPerMin:       60,
+			burst:             2,
+			wantRetryAfterMin: 1,
+		},
+		{
+			// 120 req/min → ceil(60/120) = ceil(0.5) = 1; must NOT return "0".
+			name:              "120/min burst=2 (production default)",
+			limitPerMin:       120,
+			burst:             2,
+			wantRetryAfterMin: 1,
+		},
+	}
 
-	// Drain the burst.
-	require.Equal(t, http.StatusOK, doRequest(r, uid).Code)
-	require.Equal(t, http.StatusOK, doRequest(r, uid).Code)
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
 
-	// Third request must hit the limit.
-	w := doRequest(r, uid)
-	assert.Equal(t, http.StatusTooManyRequests, w.Code)
-	assert.NotEmpty(t, w.Header().Get("Retry-After"), "Retry-After header must be set on 429")
+			r := buildUserRLRouter(tc.limitPerMin, tc.burst)
+			uid := uuid.New().String()
+
+			// Drain the burst.
+			for range tc.burst {
+				require.Equal(t, http.StatusOK, doRequest(r, uid).Code)
+			}
+
+			// Next request must hit the limit.
+			w := doRequest(r, uid)
+			assert.Equal(t, http.StatusTooManyRequests, w.Code)
+
+			ra := w.Header().Get("Retry-After")
+			require.NotEmpty(t, ra, "Retry-After header must be set on 429")
+
+			raVal, err := strconv.Atoi(ra)
+			require.NoError(t, err, "Retry-After must be a valid integer, got %q", ra)
+			assert.GreaterOrEqual(t, raVal, tc.wantRetryAfterMin,
+				"Retry-After %q must be >= %d (zero is invalid — client retries immediately)", ra, tc.wantRetryAfterMin)
+		})
+	}
 }
 
 func TestUserRateLimiter_IndependentBuckets(t *testing.T) {
