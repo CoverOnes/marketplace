@@ -27,3 +27,15 @@ func (p *NoopPublisher) PublishBidAccepted(_ context.Context, evt *domain.BidAcc
 
 	return nil
 }
+
+// PublishCollaboratorJoined logs the event and returns nil (best-effort pass-through).
+func (p *NoopPublisher) PublishCollaboratorJoined(_ context.Context, evt *domain.CollaboratorJoinedEvent) error {
+	slog.Warn(
+		"noop publisher: marketplace.collaborator_joined not delivered (Redis not configured)",
+		"event_id", evt.EventID,
+		"tender_id", evt.Data.TenderID,
+		"collaborator_id", evt.Data.CollaboratorID,
+	)
+
+	return nil
+}

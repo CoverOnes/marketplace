@@ -9,7 +9,10 @@ import (
 	"github.com/redis/go-redis/v9"
 )
 
-const channelBidAccepted = "marketplace.bid_accepted"
+const (
+	channelBidAccepted        = "marketplace.bid_accepted"
+	channelCollaboratorJoined = "marketplace.collaborator_joined"
+)
 
 // RedisPublisher publishes events to Redis pub/sub channels.
 type RedisPublisher struct {
@@ -32,6 +35,22 @@ func (p *RedisPublisher) PublishBidAccepted(ctx context.Context, evt *domain.Bid
 
 	if err := p.rdb.Publish(ctx, channelBidAccepted, payload).Err(); err != nil {
 		return fmt.Errorf("redis publish %s: %w", channelBidAccepted, err)
+	}
+
+	return nil
+}
+
+// PublishCollaboratorJoined serializes the event and publishes it to Redis.
+// Transport failures are returned to the caller (caller should log and continue —
+// the tender_collaborators row is the durable source of truth).
+func (p *RedisPublisher) PublishCollaboratorJoined(ctx context.Context, evt *domain.CollaboratorJoinedEvent) error {
+	payload, err := json.Marshal(evt)
+	if err != nil {
+		return fmt.Errorf("marshal collaborator_joined event: %w", err)
+	}
+
+	if err := p.rdb.Publish(ctx, channelCollaboratorJoined, payload).Err(); err != nil {
+		return fmt.Errorf("redis publish %s: %w", channelCollaboratorJoined, err)
 	}
 
 	return nil

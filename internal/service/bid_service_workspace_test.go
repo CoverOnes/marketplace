@@ -58,6 +58,11 @@ func (f *fakeWorkspaceClient) CreateContract(ctx context.Context, award *domain.
 	return f.returnErr
 }
 
+// AddPartyToContract is a no-op stub (BidService tests do not exercise this path).
+func (f *fakeWorkspaceClient) AddPartyToContract(_ context.Context, _ client.AddPartyInput) error {
+	return nil
+}
+
 // await blocks until CreateContract has fired or the timeout elapses; returns false
 // on timeout so the test fails loudly instead of hanging.
 func (f *fakeWorkspaceClient) await(timeout time.Duration) bool {

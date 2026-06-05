@@ -3,10 +3,13 @@ package service
 import (
 	"context"
 	"fmt"
+	"log/slog"
 	"time"
 	"unicode/utf8"
 
+	"github.com/CoverOnes/marketplace/internal/client"
 	"github.com/CoverOnes/marketplace/internal/domain"
+	"github.com/CoverOnes/marketplace/internal/events"
 	"github.com/CoverOnes/marketplace/internal/store"
 	"github.com/google/uuid"
 )
@@ -15,27 +18,35 @@ import (
 // and milestone CRUD. Owner-only governance is enforced here (not at the router layer)
 // so callerID checks are always on the locked listing row.
 type TenderService struct {
-	listings      store.ListingStore
-	roles         store.TenderRoleStore
-	collaborators store.TenderCollaboratorStore
-	milestones    store.TenderMilestoneStore
-	tenderTx      store.TenderTxManager
+	listings        store.ListingStore
+	roles           store.TenderRoleStore
+	collaborators   store.TenderCollaboratorStore
+	milestones      store.TenderMilestoneStore
+	tenderTx        store.TenderTxManager
+	workspaceClient client.WorkspaceClient // nil = workspace call skipped (dev/test)
+	publisher       events.Publisher
 }
 
 // NewTenderService returns a TenderService.
+// workspaceClient may be nil; when nil the add-party call is skipped (local dev).
+// publisher must not be nil; pass events.NewNoopPublisher() when Redis is absent.
 func NewTenderService(
 	listings store.ListingStore,
 	roles store.TenderRoleStore,
 	collaborators store.TenderCollaboratorStore,
 	milestones store.TenderMilestoneStore,
 	tenderTx store.TenderTxManager,
+	workspaceClient client.WorkspaceClient,
+	publisher events.Publisher,
 ) *TenderService {
 	return &TenderService{
-		listings:      listings,
-		roles:         roles,
-		collaborators: collaborators,
-		milestones:    milestones,
-		tenderTx:      tenderTx,
+		listings:        listings,
+		roles:           roles,
+		collaborators:   collaborators,
+		milestones:      milestones,
+		tenderTx:        tenderTx,
+		workspaceClient: workspaceClient,
+		publisher:       publisher,
 	}
 }
 
@@ -166,7 +177,7 @@ type ApplyToRoleInput struct {
 
 // ApplyToRole creates a PENDING collaborator record for a vendor applying to a role.
 // KYC tier must be >= listing.kyc_tier_required.
-// OPEN recruiter mode is API-rejected in Phase 1.
+// Phase 4: OPEN recruiter mode and join-while-EXECUTING are both enabled.
 func (s *TenderService) ApplyToRole(ctx context.Context, in *ApplyToRoleInput) (*domain.TenderCollaborator, error) {
 	if err := sanitizeMessage(in.JoinMessage); err != nil {
 		return nil, fmt.Errorf("%w: join_message: %s", domain.ErrValidation, err)
@@ -190,16 +201,11 @@ func (s *TenderService) ApplyToRole(ctx context.Context, in *ApplyToRoleInput) (
 		return nil, domain.ErrNotTenderListing
 	}
 
-	// Fix 2: reject applications to tenders that are not actively recruiting.
-	// Phase 1 accepts OPEN and PARTIALLY_STAFFED only.
-	// Recruit-while-EXECUTING is Phase 4; SETTLING/COMPLETED/CANCELED never accept new applicants.
+	// Reject applications to tenders that are not actively recruiting.
+	// Phase 4 accepts OPEN, PARTIALLY_STAFFED, and EXECUTING.
+	// SETTLING/COMPLETED/CANCELED never accept new applicants.
 	if !isTenderAcceptingApplications(listing.TenderStatus) {
 		return nil, fmt.Errorf("%w: tender is not accepting applications", domain.ErrValidation)
-	}
-
-	// Phase 1: reject OPEN recruiter mode.
-	if listing.RecruiterMode == domain.RecruiterModeOpen {
-		return nil, domain.ErrOpenRecruiterNotEnabled
 	}
 
 	// KYC tier gate (mirrors RequireTier middleware for the listing-level requirement).
@@ -242,9 +248,14 @@ type AcceptCollaboratorInput struct {
 // to prevent TOCTOU races on max_collaborators.
 // If max_collaborators is reached after this accept, the role is set to FILLED.
 //
+// Phase 4: when the tender is in EXECUTING status, a synchronous S2S call to the
+// workspace service is made after the tx commits to add the new party to the multiparty
+// contract at 0 bps placeholder (Model B). Failure returns 502; the collaborator row
+// stays APPROVED and P5 outbox will reconcile.
+//
 // TODO Phase 2: auto-advance tender_status (OPEN→PARTIALLY_STAFFED when first
 // collaborator is approved; PARTIALLY_STAFFED→EXECUTING when all roles filled).
-// ValidTenderTransition is defined and tested but NOT yet wired here in Phase 1.
+// ValidTenderTransition is defined and tested but NOT yet wired here.
 func (s *TenderService) AcceptCollaborator(ctx context.Context, in *AcceptCollaboratorInput) (*domain.TenderCollaborator, error) {
 	// Pre-flight: non-authoritative read to get IDs before locking.
 	preflight, err := s.collaborators.GetByID(ctx, in.CollaboratorID)
@@ -254,6 +265,9 @@ func (s *TenderService) AcceptCollaborator(ctx context.Context, in *AcceptCollab
 
 	var result *domain.TenderCollaborator
 
+	// tenderStatus is captured from the locked listing INSIDE the transaction via closure.
+	var capturedTenderStatus domain.TenderStatus
+
 	txErr := s.tenderTx.WithTenderTx(ctx, func(
 		txCtx context.Context,
 		txListings store.ListingStore,
@@ -261,7 +275,9 @@ func (s *TenderService) AcceptCollaborator(ctx context.Context, in *AcceptCollab
 		txCollaborators store.TenderCollaboratorStore,
 	) error {
 		var innerErr error
-		result, innerErr = s.acceptCollaboratorTx(txCtx, in, preflight.TenderRoleID, txListings, txRoles, txCollaborators)
+		result, capturedTenderStatus, innerErr = s.acceptCollaboratorTx(
+			txCtx, in, preflight.TenderRoleID, txListings, txRoles, txCollaborators,
+		)
 
 		return innerErr
 	})
@@ -269,11 +285,102 @@ func (s *TenderService) AcceptCollaborator(ctx context.Context, in *AcceptCollab
 		return result, txErr
 	}
 
+	// Post-tx: if tender is EXECUTING, synchronously call workspace to add the party.
+	// Failure is surfaces as 502 — collaborator stays APPROVED; P5 outbox reconciles.
+	if capturedTenderStatus == domain.TenderStatusExecuting {
+		if wsErr := s.addPartyToWorkspace(ctx, result, in.CallerID, capturedTenderStatus); wsErr != nil {
+			return result, wsErr
+		}
+	}
+
 	return result, nil
+}
+
+// addPartyToWorkspace calls workspace AddPartyToContract for a collaborator accepted
+// while the tender is EXECUTING. Returns ErrUpstreamWorkspace on failure.
+func (s *TenderService) addPartyToWorkspace(
+	ctx context.Context,
+	collab *domain.TenderCollaborator,
+	posterUserID uuid.UUID,
+	tenderStatus domain.TenderStatus,
+) error {
+	if s.workspaceClient == nil {
+		slog.Warn(
+			"workspace client not configured; skipping add-party call",
+			"collaborator_id", collab.ID,
+			"tender_id", collab.ListingID,
+			"tender_status", tenderStatus,
+		)
+
+		return nil
+	}
+
+	roleID := collab.TenderRoleID // non-nil; always set on tender collaborators
+
+	if err := s.workspaceClient.AddPartyToContract(ctx, client.AddPartyInput{
+		TenderID:     collab.ListingID,
+		VendorUserID: collab.VendorUserID,
+		RoleID:       &roleID,
+		ShareBps:     0,
+		Currency:     nil,
+		PosterUserID: &posterUserID,
+	}); err != nil {
+		slog.Error(
+			"workspace add-party failed; collaborator is APPROVED but contract not updated — P5 outbox will reconcile",
+			"collaborator_id", collab.ID,
+			"tender_id", collab.ListingID,
+			"err", err,
+		)
+
+		return fmt.Errorf("%w: %s", domain.ErrUpstreamWorkspace, err)
+	}
+
+	// §14 event: best-effort detached goroutine; only when accept happened on EXECUTING.
+	s.publishCollaboratorJoinedAsync(ctx, collab, tenderStatus)
+
+	return nil
+}
+
+// publishCollaboratorJoinedAsync publishes marketplace.collaborator_joined in a detached
+// goroutine after the tx commits and workspace call succeeds. Best-effort: failures are
+// logged but never propagated.
+// The ctx parameter is accepted only for contextcheck call-chain analysis; the detached
+// goroutine deliberately uses context.Background() (backend-security §5).
+func (s *TenderService) publishCollaboratorJoinedAsync(_ context.Context, collab *domain.TenderCollaborator, tenderStatus domain.TenderStatus) {
+	go func() { //nolint:contextcheck,gosec // G118+contextcheck: detached context per backend-security §5; goroutine must not be canceled on client disconnect
+		publishCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+
+		roleID := collab.TenderRoleID
+
+		evt := domain.CollaboratorJoinedEvent{
+			EventID:    uuid.New().String(),
+			OccurredAt: time.Now().UTC(),
+			Version:    1,
+			Data: domain.CollaboratorJoinedData{
+				TenderID:       collab.ListingID,
+				CollaboratorID: collab.ID,
+				VendorUserID:   collab.VendorUserID,
+				RoleID:         &roleID,
+				TenderStatus:   string(tenderStatus),
+			},
+		}
+
+		if pubErr := s.publisher.PublishCollaboratorJoined(publishCtx, &evt); pubErr != nil {
+			slog.Warn(
+				"collaborator_joined publish failed; collaborator row is authoritative",
+				"collaborator_id", collab.ID,
+				"tender_id", collab.ListingID,
+				"err", pubErr,
+			)
+		}
+	}()
 }
 
 // acceptCollaboratorTx is the transactional body of AcceptCollaborator.
 // Extracted to keep AcceptCollaborator under the gocyclo limit (15).
+// Returns the approved collaborator, the locked listing's TenderStatus (for post-tx
+// workspace call), and any error.
 func (s *TenderService) acceptCollaboratorTx(
 	ctx context.Context,
 	in *AcceptCollaboratorInput,
@@ -281,47 +388,63 @@ func (s *TenderService) acceptCollaboratorTx(
 	txListings store.ListingStore,
 	txRoles store.TenderRoleStore,
 	txCollaborators store.TenderCollaboratorStore,
-) (*domain.TenderCollaborator, error) {
+) (*domain.TenderCollaborator, domain.TenderStatus, error) {
 	// 1. Lock the role row first (prevents concurrent accepts on the same role).
 	lockedRole, err := txRoles.GetByIDForUpdate(ctx, roleID)
 	if err != nil {
-		return nil, err
+		return nil, "", err
 	}
 
 	// 2. Lock the listing row to verify caller ownership under the lock.
 	lockedListing, err := txListings.GetByIDForUpdate(ctx, lockedRole.ListingID)
 	if err != nil {
-		return nil, err
+		return nil, "", err
 	}
 
 	if lockedListing.OwnerUserID != in.CallerID {
-		return nil, domain.ErrTenderCollaboratorNotFound // 404 to avoid enumeration
+		return nil, "", domain.ErrTenderCollaboratorNotFound // 404 to avoid enumeration
+	}
+
+	// Capture the tender status from inside the lock (authoritative; avoids TOCTOU
+	// between the pre-tx read and the post-tx workspace call).
+	var lockedTenderStatus domain.TenderStatus
+	if lockedListing.TenderStatus != nil {
+		lockedTenderStatus = *lockedListing.TenderStatus
+	}
+
+	// 2a. Reject accepts on terminal tender states (COMPLETED / CANCELED).
+	if lockedTenderStatus == domain.TenderStatusCompleted || lockedTenderStatus == domain.TenderStatusCancelled {
+		return nil, lockedTenderStatus, domain.ErrInvalidTenderTransition
 	}
 
 	// 3. Lock collaborator row.
 	lockedCollab, err := txCollaborators.GetByIDForUpdate(ctx, in.CollaboratorID)
 	if err != nil {
-		return nil, err
+		return nil, lockedTenderStatus, err
 	}
 
 	if lockedCollab.Status != domain.CollaboratorStatusPending {
-		return nil, fmt.Errorf("%w: collaborator is not pending", domain.ErrValidation)
+		return nil, lockedTenderStatus, fmt.Errorf("%w: collaborator is not pending", domain.ErrValidation)
 	}
 
 	// 4. Check max_collaborators INSIDE the transaction to prevent TOCTOU.
 	if lockedRole.MaxCollaborators != nil {
 		approved, countErr := txCollaborators.CountApprovedByRole(ctx, lockedRole.ID)
 		if countErr != nil {
-			return nil, fmt.Errorf("count approved: %w", countErr)
+			return nil, lockedTenderStatus, fmt.Errorf("count approved: %w", countErr)
 		}
 
 		if approved >= *lockedRole.MaxCollaborators {
-			return s.rejectOverflowCollaborator(ctx, lockedCollab, lockedRole, txCollaborators, txRoles)
+			result, overflowErr := s.rejectOverflowCollaborator(ctx, lockedCollab, lockedRole, txCollaborators, txRoles)
+
+			return result, lockedTenderStatus, overflowErr
 		}
 	}
 
 	// 5. Approve the collaborator.
-	return s.doApproveCollaborator(ctx, in.CallerID, lockedCollab, lockedRole, txCollaborators, txRoles)
+	result, approveErr := s.doApproveCollaborator(ctx, in.CallerID, lockedCollab, lockedRole, txCollaborators, txRoles)
+
+	return result, lockedTenderStatus, approveErr
 }
 
 // rejectOverflowCollaborator rejects a collaborator because the role is at capacity,
@@ -625,8 +748,9 @@ const (
 )
 
 // isTenderAcceptingApplications returns true when a tender's current status
-// permits new PENDING collaborator applications (Phase 1: OPEN or PARTIALLY_STAFFED only).
-// EXECUTING is reserved for Phase 4 (recruit-while-executing).
+// permits new PENDING collaborator applications.
+// Phase 4: OPEN, PARTIALLY_STAFFED, and EXECUTING all accept new applicants.
+// SETTLING, COMPLETED, and CANCELED never accept new applicants.
 // nil tender_status means the listing is CLASSIC (not a tender) — return false.
 func isTenderAcceptingApplications(ts *domain.TenderStatus) bool {
 	if ts == nil {
@@ -634,7 +758,7 @@ func isTenderAcceptingApplications(ts *domain.TenderStatus) bool {
 	}
 
 	switch *ts {
-	case domain.TenderStatusOpen, domain.TenderStatusPartiallyStaffed:
+	case domain.TenderStatusOpen, domain.TenderStatusPartiallyStaffed, domain.TenderStatusExecuting:
 		return true
 	}
 

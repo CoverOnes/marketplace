@@ -30,4 +30,8 @@ var (
 	ErrOpenRecruiterNotEnabled    = errors.New("open recruitment mode is not enabled until a later phase")
 	ErrNotTenderListing           = errors.New("listing is not a tender")
 	ErrTenderListingIsOpen        = errors.New("listing is a tender; use tender collaborator API")
+	// ErrUpstreamWorkspace is returned when the synchronous S2S call to the workspace
+	// service fails. The collaborator row is already APPROVED (tx committed); P5 outbox
+	// will reconcile. Callers map this to HTTP 502.
+	ErrUpstreamWorkspace = errors.New("upstream workspace service error")
 )

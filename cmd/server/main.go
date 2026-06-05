@@ -153,7 +153,15 @@ func run() error {
 	// Service layer.
 	listingSvc := service.NewListingService(listingStore)
 	bidSvc := service.NewBidService(bidStore, listingStore, awardStore, txManager, publisher, workspaceClient)
-	tenderSvc := service.NewTenderService(listingStore, tenderRoleStore, tenderCollabStore, tenderMilestoneStore, tenderTxManager)
+	tenderSvc := service.NewTenderService(
+		listingStore,
+		tenderRoleStore,
+		tenderCollabStore,
+		tenderMilestoneStore,
+		tenderTxManager,
+		workspaceClient,
+		publisher,
+	)
 
 	// Router.
 	r := handler.NewRouter(handler.RouterConfig{
