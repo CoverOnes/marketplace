@@ -165,12 +165,14 @@ func run() error {
 
 	// Router.
 	r := handler.NewRouter(handler.RouterConfig{
-		ListingSvc:        listingSvc,
-		BidSvc:            bidSvc,
-		TenderSvc:         tenderSvc,
-		Pool:              pool,
-		Redis:             redisClient,
-		GatewayHMACSecret: cfg.GatewayHMACSecret,
+		ListingSvc:          listingSvc,
+		BidSvc:              bidSvc,
+		TenderSvc:           tenderSvc,
+		Pool:                pool,
+		Redis:               redisClient,
+		GatewayHMACSecret:   cfg.GatewayHMACSecret,
+		UserRateLimitPerMin: cfg.UserRateLimitPerMin,
+		UserRateLimitBurst:  cfg.UserRateLimitBurst,
 	})
 
 	srv := &http.Server{

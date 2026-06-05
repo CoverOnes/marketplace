@@ -24,6 +24,14 @@ type RouterConfig struct {
 	// gateway-origin identity signature. Empty == dev posture (verification
 	// disabled); config validation guarantees it is non-empty in non-dev.
 	GatewayHMACSecret string
+
+	// UserRateLimitPerMin is the per-authenticated-user rate limit (req/min).
+	// Set to 0 to disable per-user rate limiting (e.g. local dev without Redis).
+	UserRateLimitPerMin int
+
+	// UserRateLimitBurst is the token-bucket burst for per-user limiting.
+	// MUST be > 0 when UserRateLimitPerMin > 0.
+	UserRateLimitBurst int
 }
 
 // NewRouter builds and returns the configured Gin engine.
@@ -68,6 +76,18 @@ func NewRouter(cfg RouterConfig) *gin.Engine {
 	// passthrough, matching the gateway's dev signing-skip.
 	api.Use(middleware.VerifyGatewaySignature(cfg.GatewayHMACSecret))
 	api.Use(middleware.RequireValidIdentity())
+
+	// Per-user token-bucket limiter — mounted AFTER VerifyGatewaySignature +
+	// RequireValidIdentity so the key is always a gateway-verified UUID, never
+	// attacker-controlled. Only enabled when UserRateLimitPerMin > 0.
+	if cfg.UserRateLimitPerMin > 0 {
+		userRL := middleware.NewUserRateLimiter(cfg.UserRateLimitPerMin, cfg.UserRateLimitBurst)
+		api.Use(userRL.Handler())
+		slog.Info("per-user rate limiter enabled",
+			"limit_per_min", cfg.UserRateLimitPerMin,
+			"burst", cfg.UserRateLimitBurst,
+		)
+	}
 
 	// Listings — Tier>=1 for browse, Tier>=2 for create/update.
 	// /listings/search is registered before /listings/:id so the static segment

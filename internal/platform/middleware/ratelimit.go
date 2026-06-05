@@ -5,11 +5,13 @@ import (
 	"fmt"
 	"log/slog"
 	"net/http"
+	"strconv"
 	"sync"
 	"time"
 
 	"github.com/CoverOnes/marketplace/internal/platform/httpx"
 	"github.com/gin-gonic/gin"
+	"github.com/google/uuid"
 	lru "github.com/hashicorp/golang-lru/v2"
 	"github.com/redis/go-redis/v9"
 	"golang.org/x/time/rate"
@@ -140,4 +142,83 @@ func (rl *RateLimiter) increment(ctx context.Context, key string) (int, error) {
 	}
 
 	return int(incr.Val()), nil
+}
+
+// userFallbackLRUCap bounds the per-user LRU to prevent memory-exhaustion DoS
+// under account-rotation attacks (many distinct user IDs).
+const userFallbackLRUCap = 100_000
+
+// UserRateLimiter is a per-authenticated-user token-bucket limiter backed by a
+// bounded LRU cache. It is keyed on "marketplace:rl:user:<user_id>" and MUST be
+// mounted AFTER VerifyGatewaySignature + RequireValidIdentity so the key is
+// always a gateway-verified UUID, never attacker-controlled.
+type UserRateLimiter struct {
+	mu          sync.Mutex
+	buckets     *lru.Cache[string, *rate.Limiter]
+	r           rate.Limit
+	burst       int
+	limitPerMin int
+}
+
+// NewUserRateLimiter creates a UserRateLimiter with the given per-minute rate
+// and burst capacity. The underlying LRU is bounded to userFallbackLRUCap entries.
+func NewUserRateLimiter(limitPerMin, burst int) *UserRateLimiter {
+	r := rate.Limit(float64(limitPerMin) / 60.0)
+
+	cache, err := lru.New[string, *rate.Limiter](userFallbackLRUCap)
+	if err != nil {
+		// lru.New only errors when cap <= 0, which cannot happen with the const above.
+		panic(fmt.Sprintf("UserRateLimiter: unexpected lru.New error: %v", err))
+	}
+
+	return &UserRateLimiter{
+		buckets:     cache,
+		r:           r,
+		burst:       burst,
+		limitPerMin: limitPerMin,
+	}
+}
+
+func (l *UserRateLimiter) allow(key string) bool {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+
+	lim, ok := l.buckets.Get(key)
+	if !ok {
+		lim = rate.NewLimiter(l.r, l.burst)
+		l.buckets.Add(key, lim)
+	}
+
+	return lim.Allow()
+}
+
+// Handler returns the Gin middleware for per-user rate limiting.
+// Requests without a verified identity (uuid.Nil) are passed through with a
+// Warn log — they will still be subject to the IP-level limiter. Denied requests
+// receive a 429 with a Retry-After header.
+func (l *UserRateLimiter) Handler() gin.HandlerFunc {
+	retryAfter := strconv.Itoa(int(60.0 / float64(l.limitPerMin)))
+
+	return func(c *gin.Context) {
+		identity, ok := IdentityFromCtx(c)
+		if !ok || identity.UserID == uuid.Nil {
+			slog.Warn("user rate limiter: no verified user_id; passing through",
+				"path", c.Request.URL.Path,
+			)
+			c.Next()
+
+			return
+		}
+
+		key := "marketplace:rl:user:" + identity.UserID.String()
+		if !l.allow(key) {
+			c.Header("Retry-After", retryAfter)
+			c.Abort()
+			httpx.ErrCode(c, http.StatusTooManyRequests, "RATE_LIMITED", "too many requests, please try again later")
+
+			return
+		}
+
+		c.Next()
+	}
 }
