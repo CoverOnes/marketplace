@@ -2,10 +2,6 @@ package service_test
 
 import (
 	"context"
-	"fmt"
-	"io/fs"
-	"sort"
-	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -14,77 +10,11 @@ import (
 	"github.com/CoverOnes/marketplace/internal/events"
 	"github.com/CoverOnes/marketplace/internal/service"
 	"github.com/CoverOnes/marketplace/internal/store/postgres"
-	migrations "github.com/CoverOnes/marketplace/migrations"
 	"github.com/google/uuid"
 	"github.com/shopspring/decimal"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
-	tcpostgres "github.com/testcontainers/testcontainers-go/modules/postgres"
 )
-
-// startServiceTestDB spins up a real Postgres container and returns a DSN.
-func startServiceTestDB(t *testing.T) string {
-	t.Helper()
-
-	ctx := context.Background()
-
-	ctr, err := tcpostgres.Run(
-		ctx,
-		"postgres:17-alpine",
-		tcpostgres.WithDatabase("testdb"),
-		tcpostgres.WithUsername("testuser"),
-		tcpostgres.WithPassword("testpass"),
-		tcpostgres.BasicWaitStrategies(),
-	)
-	require.NoError(t, err)
-
-	t.Cleanup(func() {
-		if termErr := ctr.Terminate(ctx); termErr != nil {
-			t.Logf("terminate container: %v", termErr)
-		}
-	})
-
-	dsn, err := ctr.ConnectionString(ctx, "sslmode=disable")
-	require.NoError(t, err)
-
-	return dsn
-}
-
-// runServiceMigrations applies embedded *.up.sql files against the test DB.
-func runServiceMigrations(t *testing.T, ctx context.Context, dsn string) {
-	t.Helper()
-
-	pool, err := postgres.NewPool(ctx, dsn, "", postgres.PoolOptions{})
-	require.NoError(t, err)
-
-	defer pool.Close()
-
-	var upFiles []string
-
-	err = fs.WalkDir(migrations.FS, ".", func(path string, d fs.DirEntry, walkErr error) error {
-		if walkErr != nil {
-			return walkErr
-		}
-
-		if !d.IsDir() && strings.HasSuffix(path, ".up.sql") {
-			upFiles = append(upFiles, path)
-		}
-
-		return nil
-	})
-	require.NoError(t, err, "walk embedded migrations FS")
-	require.NotEmpty(t, upFiles, "no *.up.sql files found")
-
-	sort.Strings(upFiles)
-
-	for _, file := range upFiles {
-		data, readErr := migrations.FS.ReadFile(file)
-		require.NoError(t, readErr, "read migration file %s", file)
-
-		_, execErr := pool.Exec(ctx, string(data))
-		require.NoError(t, execErr, fmt.Sprintf("apply migration %s", file))
-	}
-}
 
 // buildTestService creates a real BidService backed by a testcontainers PG instance.
 // The returned cleanup function closes the underlying pool.
@@ -191,8 +121,7 @@ func TestBidConcurrency_Integration(t *testing.T) {
 	}
 
 	ctx := context.Background()
-	dsn := startServiceTestDB(t)
-	runServiceMigrations(t, ctx, dsn)
+	dsn := sharedServiceDSN
 
 	ownerID := uuid.New()
 	bidderID := uuid.New()
@@ -329,8 +258,7 @@ func TestBidAuthz_Integration(t *testing.T) {
 	}
 
 	ctx := context.Background()
-	dsn := startServiceTestDB(t)
-	runServiceMigrations(t, ctx, dsn)
+	dsn := sharedServiceDSN
 
 	ownerID := uuid.New()
 	bidderID := uuid.New()

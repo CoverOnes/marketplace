@@ -47,17 +47,17 @@ tasks:
   test:
     desc: "Run all tests (integration tests require Docker)"
     cmds:
-      - go test -timeout 120s ./...
+      - go test -race -timeout 180s ./...
 
   test-unit:
     desc: "Run unit tests only (no Docker required)"
     cmds:
-      - go test -short -timeout 60s ./...
+      - go test -race -short -timeout 60s ./...
 
   test-integration:
     desc: "Run integration tests (requires Docker)"
     cmds:
-      - go test -run Integration -timeout 120s ./...
+      - go test -race -run Integration -timeout 180s ./...
 
   build:
     desc: "Build the server binary"

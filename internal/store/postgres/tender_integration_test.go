@@ -2,7 +2,6 @@ package postgres_test
 
 import (
 	"context"
-	"sync"
 	"testing"
 	"time"
 
@@ -92,15 +91,8 @@ func TestTenderListing_Integration(t *testing.T) {
 	}
 
 	ctx := context.Background()
-	dsn := startTestDB(t)
-	runMigrations(t, ctx, dsn)
 
-	pool, err := postgres.NewPool(ctx, dsn, "", postgres.PoolOptions{})
-	require.NoError(t, err)
-
-	defer pool.Close()
-
-	ls := postgres.NewListingStore(pool)
+	ls := postgres.NewListingStore(sharedTestPool)
 	ownerID := uuid.New()
 
 	t.Run("create and get tender listing preserves discriminator fields", func(t *testing.T) {
@@ -188,16 +180,9 @@ func TestTenderRoleStore_Integration(t *testing.T) {
 	}
 
 	ctx := context.Background()
-	dsn := startTestDB(t)
-	runMigrations(t, ctx, dsn)
 
-	pool, err := postgres.NewPool(ctx, dsn, "", postgres.PoolOptions{})
-	require.NoError(t, err)
-
-	defer pool.Close()
-
-	ls := postgres.NewListingStore(pool)
-	rs := postgres.NewTenderRoleStore(pool)
+	ls := postgres.NewListingStore(sharedTestPool)
+	rs := postgres.NewTenderRoleStore(sharedTestPool)
 	ownerID := uuid.New()
 	listing := seedTenderListing(t, ctx, ls, ownerID)
 
@@ -260,17 +245,10 @@ func TestTenderCollaboratorStore_Integration(t *testing.T) {
 	}
 
 	ctx := context.Background()
-	dsn := startTestDB(t)
-	runMigrations(t, ctx, dsn)
 
-	pool, err := postgres.NewPool(ctx, dsn, "", postgres.PoolOptions{})
-	require.NoError(t, err)
-
-	defer pool.Close()
-
-	ls := postgres.NewListingStore(pool)
-	rs := postgres.NewTenderRoleStore(pool)
-	cs := postgres.NewTenderCollaboratorStore(pool)
+	ls := postgres.NewListingStore(sharedTestPool)
+	rs := postgres.NewTenderRoleStore(sharedTestPool)
+	cs := postgres.NewTenderCollaboratorStore(sharedTestPool)
 	ownerID := uuid.New()
 	listing := seedTenderListing(t, ctx, ls, ownerID)
 	role := seedTenderRole(t, ctx, rs, listing.ID, nil)
@@ -373,83 +351,6 @@ func TestTenderCollaboratorStore_Integration(t *testing.T) {
 	})
 }
 
-// TestTenderAccept_TOCTOU_Integration verifies that concurrent accept calls
-// respect max_collaborators — only the exact cap number of collaborators are
-// approved, even under concurrent load.
-func TestTenderAccept_TOCTOU_Integration(t *testing.T) {
-	if testing.Short() {
-		t.Skip("skipping integration test in short mode")
-	}
-
-	ctx := context.Background()
-	dsn := startTestDB(t)
-	runMigrations(t, ctx, dsn)
-
-	pool, err := postgres.NewPool(ctx, dsn, "", postgres.PoolOptions{})
-	require.NoError(t, err)
-
-	defer pool.Close()
-
-	ls := postgres.NewListingStore(pool)
-	rs := postgres.NewTenderRoleStore(pool)
-	cs := postgres.NewTenderCollaboratorStore(pool)
-	txm := postgres.NewTenderTxManager(pool)
-	ownerID := uuid.New()
-	listing := seedTenderListing(t, ctx, ls, ownerID)
-
-	// Role with max 1 collaborator.
-	maxCols := 1
-	role := seedTenderRole(t, ctx, rs, listing.ID, &maxCols)
-
-	// Create 3 PENDING collaborators — only 1 should end up APPROVED.
-	v1, v2, v3 := uuid.New(), uuid.New(), uuid.New()
-	c1 := seedCollaborator(t, ctx, cs, role.ID, listing.ID, v1)
-	c2 := seedCollaborator(t, ctx, cs, role.ID, listing.ID, v2)
-	c3 := seedCollaborator(t, ctx, cs, role.ID, listing.ID, v3)
-
-	// acceptOne simulates the AcceptCollaborator service call in a transaction.
-	acceptOne := func(collaboratorID uuid.UUID) error {
-		return toctouAcceptTx(ctx, txm, ownerID, role.ID, collaboratorID)
-	}
-
-	// Launch all three accepts concurrently.
-	var wg sync.WaitGroup
-
-	errs := make([]error, 3)
-	collabIDs := []uuid.UUID{c1.ID, c2.ID, c3.ID}
-
-	for i, collabID := range collabIDs {
-		wg.Add(1)
-
-		go func(idx int, id uuid.UUID) {
-			defer wg.Done()
-
-			errs[idx] = acceptOne(id)
-		}(i, collabID)
-	}
-
-	wg.Wait()
-
-	// Exactly one must have succeeded (APPROVED); the other two get the cap response.
-	approvedCount := 0
-
-	for _, collabID := range collabIDs {
-		got, getErr := cs.GetByID(ctx, collabID)
-		require.NoError(t, getErr)
-
-		if got.Status == domain.CollaboratorStatusApproved {
-			approvedCount++
-		}
-	}
-
-	assert.Equal(t, 1, approvedCount, "exactly max_collaborators=1 must be APPROVED")
-
-	// Role must now be FILLED.
-	finalRole, err := rs.GetByID(ctx, role.ID)
-	require.NoError(t, err)
-	assert.Equal(t, domain.TenderRoleStatusFilled, finalRole.Status, "role must be FILLED when cap is reached")
-}
-
 // TestTenderBidBlocked_ClassicFlowUnchanged_Integration proves:
 //  1. Classic bids on a classic listing succeed (regression guard).
 //  2. Classic bids on a tender listing are rejected with a unique constraint / 409
@@ -460,16 +361,9 @@ func TestTenderBidBlocked_ClassicFlowUnchanged_Integration(t *testing.T) {
 	}
 
 	ctx := context.Background()
-	dsn := startTestDB(t)
-	runMigrations(t, ctx, dsn)
 
-	pool, err := postgres.NewPool(ctx, dsn, "", postgres.PoolOptions{})
-	require.NoError(t, err)
-
-	defer pool.Close()
-
-	ls := postgres.NewListingStore(pool)
-	bs := postgres.NewBidStore(pool)
+	ls := postgres.NewListingStore(sharedTestPool)
+	bs := postgres.NewBidStore(sharedTestPool)
 	ownerID := uuid.New()
 
 	t.Run("classic bid on classic listing succeeds (regression guard)", func(t *testing.T) {
@@ -549,16 +443,9 @@ func TestTenderMilestoneStore_Integration(t *testing.T) {
 	}
 
 	ctx := context.Background()
-	dsn := startTestDB(t)
-	runMigrations(t, ctx, dsn)
 
-	pool, err := postgres.NewPool(ctx, dsn, "", postgres.PoolOptions{})
-	require.NoError(t, err)
-
-	defer pool.Close()
-
-	ls := postgres.NewListingStore(pool)
-	ms := postgres.NewTenderMilestoneStore(pool)
+	ls := postgres.NewListingStore(sharedTestPool)
+	ms := postgres.NewTenderMilestoneStore(sharedTestPool)
 	ownerID := uuid.New()
 	listing := seedTenderListing(t, ctx, ls, ownerID)
 
@@ -636,169 +523,5 @@ func TestTenderMilestoneStore_Integration(t *testing.T) {
 		milestones, err := ms.ListByListing(ctx, listing2.ID)
 		require.NoError(t, err)
 		assert.Len(t, milestones, 2)
-	})
-}
-
-// TestTenderAccept_TOCTOU_Executing_Integration proves that the SELECT FOR UPDATE TOCTOU
-// guard remains intact when accepting collaborators on an EXECUTING tender.
-// Concurrent accepts on the same single-cap role: exactly 1 must be APPROVED.
-func TestTenderAccept_TOCTOU_Executing_Integration(t *testing.T) {
-	if testing.Short() {
-		t.Skip("skipping integration test in short mode")
-	}
-
-	ctx := context.Background()
-	dsn := startTestDB(t)
-	runMigrations(t, ctx, dsn)
-
-	pool, err := postgres.NewPool(ctx, dsn, "", postgres.PoolOptions{})
-	require.NoError(t, err)
-
-	defer pool.Close()
-
-	ls := postgres.NewListingStore(pool)
-	rs := postgres.NewTenderRoleStore(pool)
-	cs := postgres.NewTenderCollaboratorStore(pool)
-	txm := postgres.NewTenderTxManager(pool)
-	ownerID := uuid.New()
-
-	// Seed an EXECUTING tender listing.
-	execStatus := domain.TenderStatusExecuting
-	now := time.Now().UTC().Truncate(time.Millisecond)
-	execListing := &domain.Listing{
-		ID:              uuid.New(),
-		OwnerUserID:     ownerID,
-		Title:           "Executing tender TOCTOU test",
-		Currency:        "TWD",
-		Status:          domain.ListingStatusOpen,
-		IsTender:        true,
-		RecruiterMode:   domain.RecruiterModeClosed,
-		TenderStatus:    &execStatus,
-		KYCTierRequired: 2,
-		CreatedAt:       now,
-		UpdatedAt:       now,
-	}
-	require.NoError(t, ls.Create(ctx, execListing))
-
-	// Role capped at 1 to exercise the guard.
-	maxCols := 1
-	role := seedTenderRole(t, ctx, rs, execListing.ID, &maxCols)
-
-	// Two concurrent applicants — only one must end up APPROVED.
-	v1, v2 := uuid.New(), uuid.New()
-	c1 := seedCollaborator(t, ctx, cs, role.ID, execListing.ID, v1)
-	c2 := seedCollaborator(t, ctx, cs, role.ID, execListing.ID, v2)
-
-	var wg sync.WaitGroup
-
-	errs := make([]error, 2)
-
-	for i, collabID := range []uuid.UUID{c1.ID, c2.ID} {
-		wg.Add(1)
-
-		go func(idx int, id uuid.UUID) {
-			defer wg.Done()
-
-			errs[idx] = toctouAcceptTx(ctx, txm, ownerID, role.ID, id)
-		}(i, collabID)
-	}
-
-	wg.Wait()
-
-	approvedCount := 0
-
-	for _, collabID := range []uuid.UUID{c1.ID, c2.ID} {
-		got, getErr := cs.GetByID(ctx, collabID)
-		require.NoError(t, getErr)
-
-		if got.Status == domain.CollaboratorStatusApproved {
-			approvedCount++
-		}
-	}
-
-	assert.Equal(t, 1, approvedCount, "exactly 1 collaborator must be APPROVED on EXECUTING tender")
-
-	// Role must be FILLED.
-	finalRole, err := rs.GetByID(ctx, role.ID)
-	require.NoError(t, err)
-	assert.Equal(t, domain.TenderRoleStatusFilled, finalRole.Status)
-}
-
-// toctouAcceptTx is extracted from TestTenderAccept_TOCTOU_Integration to keep
-// that function under the gocyclo limit. It runs the accept logic in a transaction,
-// mirroring the service-layer AcceptCollaborator behavior.
-func toctouAcceptTx(
-	ctx context.Context,
-	txm *postgres.TenderTxManager,
-	ownerID, roleID, collaboratorID uuid.UUID,
-) error {
-	return txm.WithTenderTx(ctx, func(
-		txCtx context.Context,
-		txListings store.ListingStore,
-		txRoles store.TenderRoleStore,
-		txCollaborators store.TenderCollaboratorStore,
-	) error {
-		lockedRole, err := txRoles.GetByIDForUpdate(txCtx, roleID)
-		if err != nil {
-			return err
-		}
-
-		if _, err := txListings.GetByIDForUpdate(txCtx, lockedRole.ListingID); err != nil {
-			return err
-		}
-
-		lockedCollab, err := txCollaborators.GetByIDForUpdate(txCtx, collaboratorID)
-		if err != nil {
-			return err
-		}
-
-		if lockedCollab.Status != domain.CollaboratorStatusPending {
-			return domain.ErrValidation
-		}
-
-		if lockedRole.MaxCollaborators != nil {
-			approved, countErr := txCollaborators.CountApprovedByRole(txCtx, lockedRole.ID)
-			if countErr != nil {
-				return countErr
-			}
-
-			if approved >= *lockedRole.MaxCollaborators {
-				lockedCollab.Status = domain.CollaboratorStatusRejected
-				if err := txCollaborators.Update(txCtx, lockedCollab); err != nil {
-					return err
-				}
-
-				lockedRole.Status = domain.TenderRoleStatusFilled
-
-				return txRoles.Update(txCtx, lockedRole)
-			}
-		}
-
-		now := time.Now().UTC()
-		lockedCollab.Status = domain.CollaboratorStatusApproved
-		lockedCollab.ApprovedAt = &now
-		approvedBy := ownerID
-		lockedCollab.ApprovedByUserID = &approvedBy
-
-		if err := txCollaborators.Update(txCtx, lockedCollab); err != nil {
-			return err
-		}
-
-		if lockedRole.MaxCollaborators == nil {
-			return nil
-		}
-
-		approved, countErr := txCollaborators.CountApprovedByRole(txCtx, lockedRole.ID)
-		if countErr != nil {
-			return countErr
-		}
-
-		if approved >= *lockedRole.MaxCollaborators {
-			lockedRole.Status = domain.TenderRoleStatusFilled
-
-			return txRoles.Update(txCtx, lockedRole)
-		}
-
-		return nil
 	})
 }

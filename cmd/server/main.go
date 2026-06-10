@@ -17,6 +17,7 @@ import (
 	"github.com/CoverOnes/marketplace/internal/config"
 	"github.com/CoverOnes/marketplace/internal/events"
 	"github.com/CoverOnes/marketplace/internal/handler"
+	"github.com/CoverOnes/marketplace/internal/migrate"
 	"github.com/CoverOnes/marketplace/internal/platform/logger"
 	"github.com/CoverOnes/marketplace/internal/service"
 	"github.com/CoverOnes/marketplace/internal/store/postgres"
@@ -96,6 +97,12 @@ func run() error {
 	defer pool.Close()
 
 	slog.Info("postgres connected")
+
+	// Run embedded migrations before serving (CONVENTIONS §11 + audit fix 1).
+	// This is idempotent: re-running on an already-migrated DB is a no-op.
+	if migrErr := migrate.Run(cfg.PostgresDSN); migrErr != nil {
+		return fmt.Errorf("run migrations: %w", migrErr)
+	}
 
 	// Redis client (optional — nil means noop publisher + in-process rate limiter).
 	var redisClient *redis.Client

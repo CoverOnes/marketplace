@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
+	"sync"
 	"testing"
 	"time"
 
@@ -102,6 +103,7 @@ func (s *stubBidStoreH) RejectSiblingBids(_ context.Context, listingID, accepted
 }
 
 type stubAwardStoreH struct {
+	mu     sync.Mutex
 	awards map[uuid.UUID]*domain.Award
 }
 
@@ -110,11 +112,22 @@ func newStubAwardStoreH() *stubAwardStoreH {
 }
 
 func (s *stubAwardStoreH) Create(_ context.Context, a *domain.Award) error {
-	s.awards[a.ID] = a
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	// Store a copy so that MarkEventPublished does not race with the caller
+	// JSON-marshaling the pointer that AcceptBid returned. The service holds a
+	// reference to the original *domain.Award; the stub keeps its own copy.
+	cp := *a
+	s.awards[a.ID] = &cp
+
 	return nil
 }
 
 func (s *stubAwardStoreH) GetByID(_ context.Context, id uuid.UUID) (*domain.Award, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
 	a, ok := s.awards[id]
 	if !ok {
 		return nil, domain.ErrAwardNotFound
@@ -124,6 +137,9 @@ func (s *stubAwardStoreH) GetByID(_ context.Context, id uuid.UUID) (*domain.Awar
 }
 
 func (s *stubAwardStoreH) MarkEventPublished(_ context.Context, awardID uuid.UUID) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
 	a, ok := s.awards[awardID]
 	if !ok {
 		return domain.ErrAwardNotFound
