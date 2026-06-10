@@ -15,6 +15,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/alicebob/miniredis/v2"
 	"github.com/gin-gonic/gin"
 	"github.com/redis/go-redis/v9"
 	"github.com/stretchr/testify/assert"
@@ -294,21 +295,25 @@ func TestVerifyGatewaySignature(t *testing.T) {
 }
 
 // TestVerifyGatewaySignature_NonceReplay tests the Redis-backed nonce replay prevention.
-// It uses a real Redis client connected to a miniredis server so no external Redis
-// is needed — this matches the testcontainers-free unit test philosophy.
+// It uses miniredis (in-process Redis) so no external Redis is needed.
 func TestVerifyGatewaySignature_NonceReplay(t *testing.T) {
-	// Use miniredis for an in-process Redis; import via go-redis/v9 SetNX semantics.
-	// Since miniredis is not in go.mod, we test via a mock Redis client approach:
-	// create two requests with identical requestIds and verify second is rejected.
-	//
-	// NOTE: miniredis is not a dependency of this project. Instead we use a real
-	// Redis client pointing to a test Redis via environment or verify the storeNonce
-	// function logic directly through unit testing of the helper function.
+	t.Run("storeNonce returns true on first call and false on second (same sig+ts nonce)", func(t *testing.T) {
+		// Spin up an in-process miniredis server; no external Redis required.
+		mr := miniredis.RunT(t)
 
-	t.Run("storeNonce returns true on first call and false on second (same nonce)", func(t *testing.T) {
-		// This tests the Redis SET NX EX semantics via integration with real Redis.
-		// When MARKETPLACE_REDIS_URL is not set, skip this sub-test.
-		t.Skip("nonce Redis integration test requires real Redis; covered by manual integration test + storeNonce unit logic")
+		rdb := redis.NewClient(&redis.Options{Addr: mr.Addr()})
+		defer rdb.Close() //nolint:errcheck // test teardown
+
+		ctx := context.Background()
+		nonce := "test-sig-ts-nonce-abc123"
+
+		// First call: key does not exist → SET NX succeeds → return true (fresh).
+		first := storeNonce(ctx, rdb, nonce)
+		require.True(t, first, "first storeNonce call must return true (key newly set)")
+
+		// Second call: key already exists → SET NX is a no-op → return false (replay).
+		second := storeNonce(ctx, rdb, nonce)
+		assert.False(t, second, "second storeNonce call with same nonce must return false (replay detected)")
 	})
 
 	t.Run("nil redis client skips nonce check", func(t *testing.T) {

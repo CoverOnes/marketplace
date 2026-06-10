@@ -393,6 +393,91 @@ func TestTenderAcceptCollaborator_NonOwner_Integration(t *testing.T) {
 		"collaborator must remain PENDING after unauthorized accept")
 }
 
+// TestTenderExitCollaborator_TOCTOU_Integration verifies that a concurrent
+// AcceptCollaborator + ExitCollaborator pair on the same collaborator row
+// yields a consistent final state. Without the transaction + FOR UPDATE fix
+// on ExitCollaborator, a PENDING→APPROVED accept and a PENDING→WITHDRAWN exit
+// could interleave and silently downgrade an accepted collaborator.
+//
+// The test runs both operations concurrently and asserts that the final status
+// is one of the two valid terminal states (APPROVED or WITHDRAWN/EXITED), never
+// a combination that represents a lost write.
+func TestTenderExitCollaborator_TOCTOU_Integration(t *testing.T) {
+	if testing.Short() {
+		t.Skip("skipping integration test in short mode")
+	}
+
+	ctx := context.Background()
+	dsn := sharedServiceDSN
+
+	ownerID := uuid.New()
+	vendorID := uuid.New()
+
+	t.Run("concurrent accept+exit yields consistent final state", func(t *testing.T) {
+		listing := seedTenderListingForService(t, ctx, dsn, ownerID, domain.TenderStatusOpen)
+		role := seedRoleForService(t, ctx, dsn, listing.ID, nil)
+		collab := seedCollaboratorForService(t, ctx, dsn, role.ID, listing.ID, vendorID)
+
+		svc, cleanup := buildTenderTestService(t, ctx, dsn, nil)
+		defer cleanup()
+
+		// Start both goroutines simultaneously to maximize TOCTOU window.
+		var (
+			wg        sync.WaitGroup
+			acceptErr error
+			exitErr   error
+		)
+
+		wg.Add(2)
+
+		go func() {
+			defer wg.Done()
+			_, acceptErr = svc.AcceptCollaborator(ctx, &service.AcceptCollaboratorInput{
+				CollaboratorID: collab.ID,
+				CallerID:       ownerID,
+			})
+		}()
+
+		go func() {
+			defer wg.Done()
+			_, exitErr = svc.ExitCollaborator(ctx, &service.ExitCollaboratorInput{
+				CollaboratorID: collab.ID,
+				CallerID:       vendorID,
+				Reason:         "changed my mind",
+			})
+		}()
+
+		wg.Wait()
+
+		finalStatus := readCollabStatus(t, ctx, dsn, collab.ID)
+
+		// Exactly one operation must succeed; the other may fail or produce a conflict.
+		// The final status must be one of the two valid outcomes — never a "ghost" state
+		// where the row was written twice in an inconsistent order.
+		//
+		// Valid outcome A: accept wins → APPROVED (exit sees APPROVED, returns conflict/validation error).
+		// Valid outcome B: exit wins → WITHDRAWN (accept sees WITHDRAWN/non-pending, returns error).
+		validOutcomes := map[domain.CollaboratorStatus]bool{
+			domain.CollaboratorStatusApproved:  true,
+			domain.CollaboratorStatusWithdrawn: true,
+			domain.CollaboratorStatusExited:    true, // if exit ran after accept promoted to APPROVED
+		}
+
+		assert.True(t, validOutcomes[finalStatus],
+			"final status must be one of APPROVED/WITHDRAWN/EXITED, got %s", finalStatus)
+
+		// Both cannot succeed while producing WITHDRAWN — that would mean an approved
+		// collaborator was silently downgraded (the pre-fix TOCTOU bug).
+		if acceptErr == nil {
+			assert.NotEqual(t, domain.CollaboratorStatusWithdrawn, finalStatus,
+				"if accept succeeded, final status must not be WITHDRAWN (lost-write bug)")
+		}
+
+		// At most one error expected; it's valid for one to succeed and one to conflict.
+		t.Logf("accept err=%v exit err=%v finalStatus=%s", acceptErr, exitErr, finalStatus)
+	})
+}
+
 // TestTenderAcceptCollaborator_TerminalState_Integration verifies that accepts on
 // CANCELED/COMPLETED tenders are rejected with ErrInvalidTenderTransition.
 func TestTenderAcceptCollaborator_TerminalState_Integration(t *testing.T) {

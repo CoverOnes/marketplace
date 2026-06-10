@@ -597,6 +597,12 @@ type ExitCollaboratorInput struct {
 // ExitCollaborator allows a vendor to exit a role.
 // PENDING → WITHDRAWN; APPROVED → EXITED.
 //
+// Fix (TOCTOU): all reads and the update run inside a single transaction with
+// SELECT ... FOR UPDATE locks on the collaborator row (and the role row for
+// lock-ordering consistency with AcceptCollaborator). This prevents a race
+// where a concurrent AcceptCollaborator promotes PENDING→APPROVED between our
+// read and update, causing the accept to be silently overwritten with WITHDRAWN.
+//
 // TODO Phase 2: after an APPROVED vendor exits, check if the role should
 // revert from FILLED→OPEN, and whether tender_status should step back
 // (e.g. EXECUTING→PARTIALLY_STAFFED). ValidTenderTransition covers these
@@ -606,38 +612,68 @@ func (s *TenderService) ExitCollaborator(ctx context.Context, in *ExitCollaborat
 		return nil, fmt.Errorf("%w: reason: %s", domain.ErrValidation, err)
 	}
 
-	collab, err := s.collaborators.GetByID(ctx, in.CollaboratorID)
+	// Pre-flight: non-authoritative read to get role_id for lock-ordering.
+	preflight, err := s.collaborators.GetByID(ctx, in.CollaboratorID)
 	if err != nil {
 		return nil, err
 	}
 
-	// IDOR: only the vendor themselves can exit.
-	if collab.VendorUserID != in.CallerID {
-		return nil, domain.ErrTenderCollaboratorNotFound // 404 to avoid enumeration
+	var result *domain.TenderCollaborator
+
+	txErr := s.tenderTx.WithTenderTx(ctx, func(
+		txCtx context.Context,
+		_ store.ListingStore, // listing lock not needed for vendor-initiated exit
+		txRoles store.TenderRoleStore,
+		txCollaborators store.TenderCollaboratorStore,
+	) error {
+		// 1. Lock the role row first (maintains lock-ordering with AcceptCollaborator /
+		//    RejectCollaborator: role → listing → collaborator, preventing deadlocks).
+		_, lockRoleErr := txRoles.GetByIDForUpdate(txCtx, preflight.TenderRoleID)
+		if lockRoleErr != nil {
+			return lockRoleErr
+		}
+
+		// 2. Lock the collaborator row and re-read status under the lock.
+		lockedCollab, lockCollabErr := txCollaborators.GetByIDForUpdate(txCtx, in.CollaboratorID)
+		if lockCollabErr != nil {
+			return lockCollabErr
+		}
+
+		// IDOR: only the vendor themselves can exit (checked on the locked row).
+		if lockedCollab.VendorUserID != in.CallerID {
+			return domain.ErrTenderCollaboratorNotFound // 404 to avoid enumeration
+		}
+
+		now := time.Now().UTC()
+
+		switch lockedCollab.Status {
+		case domain.CollaboratorStatusPending:
+			lockedCollab.Status = domain.CollaboratorStatusWithdrawn
+			lockedCollab.ExitReason = in.Reason
+			lockedCollab.ExitedAt = &now
+
+		case domain.CollaboratorStatusApproved:
+			lockedCollab.Status = domain.CollaboratorStatusExited
+			lockedCollab.ExitReason = in.Reason
+			lockedCollab.ExitedAt = &now
+
+		default:
+			return fmt.Errorf("%w: collaborator is not in an active state", domain.ErrValidation)
+		}
+
+		if updateErr := txCollaborators.Update(txCtx, lockedCollab); updateErr != nil {
+			return fmt.Errorf("exit collaborator: %w", updateErr)
+		}
+
+		result = lockedCollab
+
+		return nil
+	})
+	if txErr != nil {
+		return result, txErr
 	}
 
-	now := time.Now().UTC()
-
-	switch collab.Status {
-	case domain.CollaboratorStatusPending:
-		collab.Status = domain.CollaboratorStatusWithdrawn
-		collab.ExitReason = in.Reason
-		collab.ExitedAt = &now
-
-	case domain.CollaboratorStatusApproved:
-		collab.Status = domain.CollaboratorStatusExited
-		collab.ExitReason = in.Reason
-		collab.ExitedAt = &now
-
-	default:
-		return nil, fmt.Errorf("%w: collaborator is not in an active state", domain.ErrValidation)
-	}
-
-	if err := s.collaborators.Update(ctx, collab); err != nil {
-		return nil, fmt.Errorf("exit collaborator: %w", err)
-	}
-
-	return collab, nil
+	return result, nil
 }
 
 // ListCollaborators returns all collaborators for a tender listing (owner-only).

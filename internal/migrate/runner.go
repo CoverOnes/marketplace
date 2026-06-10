@@ -51,11 +51,35 @@ func Run(dsn string) error {
 		}
 	}()
 
-	if err := m.Up(); err != nil && !errors.Is(err, migrate.ErrNoChange) {
+	if err := m.Up(); err != nil {
+		if errors.Is(err, migrate.ErrNoChange) {
+			// Already up-to-date — not an error.
+			slog.Info("migrations applied (or already up-to-date)")
+
+			return nil
+		}
+
+		var dirtyErr migrate.ErrDirty
+		if errors.As(err, &dirtyErr) {
+			// A previous migration run failed mid-file and left the schema in a
+			// dirty state. The database is locked at version dirtyErr.Version until
+			// an operator manually inspects the state and runs:
+			//
+			//   migrate -database <DSN> -path <migrations> force <version>
+			//
+			// Auto-forcing is intentionally NOT done here — the schema may be
+			// partially applied and auto-force could leave it permanently inconsistent.
+			return fmt.Errorf(
+				"database is dirty at migration version %d: manually inspect the schema "+
+					"then run `migrate force %d` to mark it clean before restarting",
+				dirtyErr.Version, dirtyErr.Version,
+			)
+		}
+
 		return fmt.Errorf("run migrations: %w", err)
 	}
 
-	slog.Info("migrations applied (or already up-to-date)")
+	slog.Info("migrations applied")
 
 	return nil
 }
