@@ -3,6 +3,7 @@ package service_test
 import (
 	"context"
 	"errors"
+	"sync"
 	"testing"
 	"time"
 
@@ -287,7 +288,10 @@ func (s *stubWorkspaceClient) AddPartyToContract(_ context.Context, _ client.Add
 // --- stub publisher ---
 
 // stubPublisher is a fake Publisher that records calls and can be configured to return errors.
+// mu guards collaboratorJoinedCalls/Evts because publishCollaboratorJoinedAsync writes them
+// from a detached goroutine while test code polls/reads from the test goroutine — data race.
 type stubPublisher struct {
+	mu                      sync.Mutex
 	bidAcceptedCalls        int
 	collaboratorJoinedCalls int
 	collaboratorJoinedEvts  []*domain.CollaboratorJoinedEvent
@@ -296,15 +300,42 @@ type stubPublisher struct {
 }
 
 func (p *stubPublisher) PublishBidAccepted(_ context.Context, _ *domain.BidAcceptedEvent) error {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+
 	p.bidAcceptedCalls++
+
 	return p.bidAcceptedErr
 }
 
 func (p *stubPublisher) PublishCollaboratorJoined(_ context.Context, evt *domain.CollaboratorJoinedEvent) error {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+
 	p.collaboratorJoinedCalls++
 	p.collaboratorJoinedEvts = append(p.collaboratorJoinedEvts, evt)
 
 	return p.collaboratorJoinedErr
+}
+
+// collaboratorJoinedCount returns the current call count under the mutex.
+// Used by tests polling the async-publish goroutine result.
+func (p *stubPublisher) collaboratorJoinedCount() int {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+
+	return p.collaboratorJoinedCalls
+}
+
+// collaboratorJoinedEvents returns a snapshot of recorded events under the mutex.
+func (p *stubPublisher) collaboratorJoinedEvents() []*domain.CollaboratorJoinedEvent {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+
+	out := make([]*domain.CollaboratorJoinedEvent, len(p.collaboratorJoinedEvts))
+	copy(out, p.collaboratorJoinedEvts)
+
+	return out
 }
 
 // --- Fix 2: ApplyToRole tender_status gate ---
@@ -1016,20 +1047,21 @@ func TestCollaboratorJoined_EventPublished(t *testing.T) {
 	})
 	require.NoError(t, err)
 
-	// Allow the async goroutine to complete.
+	// Allow the async goroutine to complete; poll via the mutex-guarded accessor.
 	deadline := time.Now().Add(2 * time.Second)
 	for time.Now().Before(deadline) {
-		if pub.collaboratorJoinedCalls > 0 {
+		if pub.collaboratorJoinedCount() > 0 {
 			break
 		}
 
 		time.Sleep(10 * time.Millisecond)
 	}
 
-	assert.Equal(t, 1, pub.collaboratorJoinedCalls, "collaborator_joined must be published once")
-	require.Len(t, pub.collaboratorJoinedEvts, 1)
+	assert.Equal(t, 1, pub.collaboratorJoinedCount(), "collaborator_joined must be published once")
+	evts := pub.collaboratorJoinedEvents()
+	require.Len(t, evts, 1)
 
-	evt := pub.collaboratorJoinedEvts[0]
+	evt := evts[0]
 	assert.Equal(t, "EXECUTING", evt.Data.TenderStatus)
 	assert.Equal(t, listing.ID, evt.Data.TenderID)
 	assert.Equal(t, collab.ID, evt.Data.CollaboratorID)

@@ -3,6 +3,7 @@ build/
 *.exe
 *.test
 *.out
+/server
 
 # Environment files (never commit secrets)
 .env

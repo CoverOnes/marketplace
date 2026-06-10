@@ -74,7 +74,7 @@ func NewRouter(cfg RouterConfig) *gin.Engine {
 	// RequireValidIdentity trusts any X-User-Id / X-Kyc-Tier / X-Account-Type /
 	// X-Email-Verified header. When the secret is empty (dev) this is a no-op
 	// passthrough, matching the gateway's dev signing-skip.
-	api.Use(middleware.VerifyGatewaySignature(cfg.GatewayHMACSecret))
+	api.Use(middleware.VerifyGatewaySignature(cfg.GatewayHMACSecret, cfg.Redis))
 	api.Use(middleware.RequireValidIdentity())
 
 	// Per-user token-bucket limiter — mounted AFTER VerifyGatewaySignature +
@@ -83,7 +83,8 @@ func NewRouter(cfg RouterConfig) *gin.Engine {
 	if cfg.UserRateLimitPerMin > 0 {
 		userRL := middleware.NewUserRateLimiter(cfg.UserRateLimitPerMin, cfg.UserRateLimitBurst)
 		api.Use(userRL.Handler())
-		slog.Info("per-user rate limiter enabled",
+		slog.Info(
+			"per-user rate limiter enabled",
 			"limit_per_min", cfg.UserRateLimitPerMin,
 			"burst", cfg.UserRateLimitBurst,
 		)

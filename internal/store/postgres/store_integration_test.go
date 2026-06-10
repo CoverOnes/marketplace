@@ -2,87 +2,17 @@ package postgres_test
 
 import (
 	"context"
-	"fmt"
-	"io/fs"
-	"sort"
-	"strings"
 	"testing"
 	"time"
 
 	"github.com/CoverOnes/marketplace/internal/domain"
 	"github.com/CoverOnes/marketplace/internal/store"
 	"github.com/CoverOnes/marketplace/internal/store/postgres"
-	migrations "github.com/CoverOnes/marketplace/migrations"
 	"github.com/google/uuid"
 	"github.com/shopspring/decimal"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
-	tcpostgres "github.com/testcontainers/testcontainers-go/modules/postgres"
 )
-
-// startTestDB spins up a real Postgres container via testcontainers.
-func startTestDB(t *testing.T) string {
-	t.Helper()
-
-	ctx := context.Background()
-
-	ctr, err := tcpostgres.Run(
-		ctx,
-		"postgres:17-alpine",
-		tcpostgres.WithDatabase("testdb"),
-		tcpostgres.WithUsername("testuser"),
-		tcpostgres.WithPassword("testpass"),
-		tcpostgres.BasicWaitStrategies(),
-	)
-	require.NoError(t, err)
-
-	t.Cleanup(func() {
-		if termErr := ctr.Terminate(ctx); termErr != nil {
-			t.Logf("terminate container: %v", termErr)
-		}
-	})
-
-	dsn, err := ctr.ConnectionString(ctx, "sslmode=disable")
-	require.NoError(t, err)
-
-	return dsn
-}
-
-// runMigrations applies embedded *.up.sql files against the test DB.
-func runMigrations(t *testing.T, ctx context.Context, dsn string) {
-	t.Helper()
-
-	pool, err := postgres.NewPool(ctx, dsn, "", postgres.PoolOptions{}) // empty schema = public (test default)
-	require.NoError(t, err)
-
-	defer pool.Close()
-
-	var upFiles []string
-
-	err = fs.WalkDir(migrations.FS, ".", func(path string, d fs.DirEntry, walkErr error) error {
-		if walkErr != nil {
-			return walkErr
-		}
-
-		if !d.IsDir() && strings.HasSuffix(path, ".up.sql") {
-			upFiles = append(upFiles, path)
-		}
-
-		return nil
-	})
-	require.NoError(t, err, "walk embedded migrations FS")
-	require.NotEmpty(t, upFiles, "no *.up.sql files found")
-
-	sort.Strings(upFiles)
-
-	for _, file := range upFiles {
-		data, readErr := migrations.FS.ReadFile(file)
-		require.NoError(t, readErr, "read migration file %s", file)
-
-		_, execErr := pool.Exec(ctx, string(data))
-		require.NoError(t, execErr, fmt.Sprintf("apply migration %s", file))
-	}
-}
 
 // TestSchemaIsolation_Integration verifies that NewPool with a non-empty schema
 // creates the schema and isolates migrations within it. It builds a pool with
@@ -97,7 +27,7 @@ func TestSchemaIsolation_Integration(t *testing.T) {
 	const testSchema = "dev_test_schema"
 
 	ctx := context.Background()
-	dsn := startTestDB(t)
+	dsn := freshTestDB(t) // dedicated container: schema isolation test must be independent
 
 	// Build pool with non-empty schema — this should CREATE SCHEMA IF NOT EXISTS
 	// and SET search_path on every connection.
@@ -107,31 +37,7 @@ func TestSchemaIsolation_Integration(t *testing.T) {
 	defer pool.Close()
 
 	// Run migrations through the schema-aware pool so all tables land in testSchema.
-	var upFiles []string
-
-	err = fs.WalkDir(migrations.FS, ".", func(path string, d fs.DirEntry, walkErr error) error {
-		if walkErr != nil {
-			return walkErr
-		}
-
-		if !d.IsDir() && strings.HasSuffix(path, ".up.sql") {
-			upFiles = append(upFiles, path)
-		}
-
-		return nil
-	})
-	require.NoError(t, err, "walk embedded migrations FS")
-	require.NotEmpty(t, upFiles, "no *.up.sql files found")
-
-	sort.Strings(upFiles)
-
-	for _, file := range upFiles {
-		data, readErr := migrations.FS.ReadFile(file)
-		require.NoError(t, readErr, "read migration file %s", file)
-
-		_, execErr := pool.Exec(ctx, string(data))
-		require.NoError(t, execErr, "apply migration %s in schema %s", file, testSchema)
-	}
+	require.NoError(t, applyMigrations(ctx, pool), "apply migrations in schema %q", testSchema)
 
 	t.Run("listings table exists in dev_test_schema", func(t *testing.T) {
 		var count int
@@ -171,7 +77,7 @@ func TestReservedWordSchema_Integration(t *testing.T) {
 	const reservedSchema = "user"
 
 	ctx := context.Background()
-	dsn := startTestDB(t)
+	dsn := freshTestDB(t) // dedicated container for reserved-word schema test
 
 	// NewPool must CREATE SCHEMA IF NOT EXISTS "user" and SET search_path = "user", public
 	// without hitting syntax error 42601.
@@ -181,31 +87,7 @@ func TestReservedWordSchema_Integration(t *testing.T) {
 	defer pool.Close()
 
 	// Run migrations through the reserved-word schema pool so all tables land in "user".
-	var upFiles []string
-
-	err = fs.WalkDir(migrations.FS, ".", func(path string, d fs.DirEntry, walkErr error) error {
-		if walkErr != nil {
-			return walkErr
-		}
-
-		if !d.IsDir() && strings.HasSuffix(path, ".up.sql") {
-			upFiles = append(upFiles, path)
-		}
-
-		return nil
-	})
-	require.NoError(t, err, "walk embedded migrations FS")
-	require.NotEmpty(t, upFiles, "no *.up.sql files found")
-
-	sort.Strings(upFiles)
-
-	for _, file := range upFiles {
-		data, readErr := migrations.FS.ReadFile(file)
-		require.NoError(t, readErr, "read migration file %s", file)
-
-		_, execErr := pool.Exec(ctx, string(data))
-		require.NoError(t, execErr, "apply migration %s in schema %q", file, reservedSchema)
-	}
+	require.NoError(t, applyMigrations(ctx, pool), "apply migrations in schema %q", reservedSchema)
 
 	t.Run("listings table exists in user schema", func(t *testing.T) {
 		var count int
@@ -238,15 +120,8 @@ func TestListingStore_Integration(t *testing.T) {
 	}
 
 	ctx := context.Background()
-	dsn := startTestDB(t)
-	runMigrations(t, ctx, dsn)
 
-	pool, err := postgres.NewPool(ctx, dsn, "", postgres.PoolOptions{}) // empty schema = public (test default)
-	require.NoError(t, err)
-
-	defer pool.Close()
-
-	listingStore := postgres.NewListingStore(pool)
+	listingStore := postgres.NewListingStore(sharedTestPool)
 
 	ownerID := uuid.New()
 
@@ -432,15 +307,8 @@ func TestListingStore_Search_Integration(t *testing.T) {
 	}
 
 	ctx := context.Background()
-	dsn := startTestDB(t)
-	runMigrations(t, ctx, dsn)
 
-	pool, err := postgres.NewPool(ctx, dsn, "", postgres.PoolOptions{})
-	require.NoError(t, err)
-
-	defer pool.Close()
-
-	ls := postgres.NewListingStore(pool)
+	ls := postgres.NewListingStore(sharedTestPool)
 	owner := uuid.New()
 	stranger := uuid.New()
 	base := time.Now().UTC().Truncate(time.Millisecond)
@@ -543,7 +411,7 @@ func TestListingStore_Search_Integration(t *testing.T) {
 		del := seedSearchListing(t, ctx, ls, owner, "Go developer to be deleted", "temp",
 			"OPEN", base.Add(-10*time.Second), nil, nil)
 		// Soft delete via direct update of deleted_at (no FK, no special API needed).
-		_, err := pool.Exec(ctx, "UPDATE listings SET deleted_at = now() WHERE id = $1", del.ID)
+		_, err := sharedTestPool.Exec(ctx, "UPDATE listings SET deleted_at = now() WHERE id = $1", del.ID)
 		require.NoError(t, err)
 
 		got, err := ls.Search(ctx, store.SearchFilter{Query: "go developer", VisibleToUserID: owner, Limit: 50})
@@ -578,16 +446,9 @@ func TestBidStore_Integration(t *testing.T) {
 	}
 
 	ctx := context.Background()
-	dsn := startTestDB(t)
-	runMigrations(t, ctx, dsn)
 
-	pool, err := postgres.NewPool(ctx, dsn, "", postgres.PoolOptions{}) // empty schema = public (test default)
-	require.NoError(t, err)
-
-	defer pool.Close()
-
-	bidStore := postgres.NewBidStore(pool)
-	listingStore := postgres.NewListingStore(pool)
+	bidStore := postgres.NewBidStore(sharedTestPool)
+	listingStore := postgres.NewListingStore(sharedTestPool)
 
 	ownerID := uuid.New()
 	bidderID := uuid.New()
@@ -728,15 +589,8 @@ func TestAwardStore_Integration(t *testing.T) {
 	}
 
 	ctx := context.Background()
-	dsn := startTestDB(t)
-	runMigrations(t, ctx, dsn)
 
-	pool, err := postgres.NewPool(ctx, dsn, "", postgres.PoolOptions{}) // empty schema = public (test default)
-	require.NoError(t, err)
-
-	defer pool.Close()
-
-	awardStore := postgres.NewAwardStore(pool)
+	awardStore := postgres.NewAwardStore(sharedTestPool)
 
 	ownerID := uuid.New()
 	bidderID := uuid.New()
