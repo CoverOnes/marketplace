@@ -2,6 +2,7 @@ package service_test
 
 import (
 	"context"
+	"fmt"
 	"sync"
 	"testing"
 	"time"
@@ -245,6 +246,142 @@ func TestBidConcurrency_Integration(t *testing.T) {
 			} else {
 				assert.Equal(t, sc.bStatus, finalStatus,
 					"opB won but final status does not match expected")
+			}
+		})
+	}
+}
+
+// TestCreateBid_NoGhostOnAwarded_Integration proves that a concurrent CreateBid and
+// AcceptBid on the same listing never leaves a ghost PENDING bid on an AWARDED listing.
+//
+// Without the CreateBid transaction fix, the race window was:
+//   - CreateBid reads listing (OPEN), then AcceptBid awards it, then CreateBid inserts
+//     the bid — resulting in a PENDING bid on an AWARDED listing.
+//
+// With the fix, CreateBid holds a FOR UPDATE lock on the listing row during its tx,
+// so AcceptBid either wins first (CreateBid sees AWARDED → ErrListingNotOpen) or
+// CreateBid wins first (AcceptBid sees a committed PENDING bid, listing still OPEN → awards it normally).
+func TestCreateBid_NoGhostOnAwarded_Integration(t *testing.T) {
+	if testing.Short() {
+		t.Skip("skipping ghost-bid integration test in short mode")
+	}
+
+	ctx := context.Background()
+	dsn := sharedServiceDSN
+
+	ownerID := uuid.New()
+	bidderA := uuid.New() // the bidder that will try CreateBid
+	bidderB := uuid.New() // the bidder whose bid will be accepted
+	now := time.Now().UTC().Truncate(time.Millisecond)
+
+	// Seed a listing and an existing PENDING bid by bidderB (which AcceptBid will accept).
+	listing := &domain.Listing{
+		ID:          uuid.New(),
+		OwnerUserID: ownerID,
+		Title:       "Ghost bid race listing",
+		Currency:    "TWD",
+		Status:      domain.ListingStatusOpen,
+		CreatedAt:   now,
+		UpdatedAt:   now,
+	}
+	insertTestListing(t, ctx, dsn, listing)
+
+	existingBid := &domain.Bid{
+		ID:           uuid.New(),
+		ListingID:    listing.ID,
+		BidderUserID: bidderB,
+		Amount:       decimal.NewFromInt(500),
+		Currency:     "TWD",
+		Message:      "existing bid",
+		Status:       domain.BidStatusPending,
+		CreatedAt:    now,
+		UpdatedAt:    now,
+	}
+	insertTestBid(t, ctx, dsn, existingBid)
+
+	svc, cleanup := buildTestService(t, ctx, dsn)
+	defer cleanup()
+
+	const iterations = 10 // run multiple times to flush out the race
+
+	for i := range iterations {
+		t.Run(fmt.Sprintf("iteration_%d", i), func(t *testing.T) {
+			// Each iteration needs a fresh listing + bid to avoid cross-contamination.
+			l := &domain.Listing{
+				ID:          uuid.New(),
+				OwnerUserID: ownerID,
+				Title:       fmt.Sprintf("Race listing %d", i),
+				Currency:    "TWD",
+				Status:      domain.ListingStatusOpen,
+				CreatedAt:   now,
+				UpdatedAt:   now,
+			}
+			insertTestListing(t, ctx, dsn, l)
+
+			eb := &domain.Bid{
+				ID:           uuid.New(),
+				ListingID:    l.ID,
+				BidderUserID: bidderB,
+				Amount:       decimal.NewFromInt(500),
+				Currency:     "TWD",
+				Message:      "race bid",
+				Status:       domain.BidStatusPending,
+				CreatedAt:    now,
+				UpdatedAt:    now,
+			}
+			insertTestBid(t, ctx, dsn, eb)
+
+			// Run CreateBid (bidderA) and AcceptBid (owner accepts bidderB) concurrently.
+			errA, errB := runConcurrentOps(
+				func() error {
+					_, err := svc.CreateBid(ctx, &service.CreateBidInput{
+						ListingID:    l.ID,
+						BidderUserID: bidderA,
+						Amount:       decimal.NewFromInt(300),
+						Currency:     "TWD",
+						Message:      "racing bid",
+					})
+
+					return err
+				},
+				func() error {
+					_, err := svc.AcceptBid(ctx, eb.ID, ownerID)
+					return err
+				},
+			)
+
+			// One of four outcomes is valid:
+			// A) CreateBid won first (inserted): listing stays OPEN, bidderA bid is PENDING;
+			//    then AcceptBid runs normally — listing AWARDED, bidderB ACCEPTED, bidderA REJECTED.
+			// B) AcceptBid won first: listing is AWARDED; CreateBid sees AWARDED → ErrListingNotOpen.
+			// C) Both succeed: possible only in case A above.
+			// D) CreateBid fails for any reason + AcceptBid succeeds.
+			//
+			// The invariant to assert: if listing is AWARDED, no PENDING bid must exist from bidderA.
+
+			// Fetch final bids for this listing.
+			pool, poolErr := postgres.NewPool(ctx, dsn, "", postgres.PoolOptions{})
+			require.NoError(t, poolErr)
+			defer pool.Close()
+
+			bidStore := postgres.NewBidStore(pool)
+			allBids, listErr := bidStore.ListByListing(ctx, l.ID)
+			require.NoError(t, listErr)
+
+			listingStore := postgres.NewListingStore(pool)
+			finalListing, lErr := listingStore.GetByID(ctx, l.ID)
+			require.NoError(t, lErr)
+
+			_ = errA // either nil (bid created) or ErrListingNotOpen (race lost)
+			_ = errB // either nil (accepted) or error
+
+			if finalListing.Status == domain.ListingStatusAwarded {
+				for _, b := range allBids {
+					if b.BidderUserID == bidderA {
+						assert.NotEqual(t, domain.BidStatusPending, b.Status,
+							"ghost PENDING bid from bidderA must not exist on AWARDED listing (iter %d)", i)
+					}
+				}
 			}
 		})
 	}

@@ -4,9 +4,11 @@ package config
 import (
 	"errors"
 	"fmt"
+	"net/url"
 	"regexp"
 	"strings"
 
+	"github.com/joho/godotenv"
 	"github.com/spf13/viper"
 )
 
@@ -86,7 +88,23 @@ type Config struct {
 }
 
 // Load reads configuration from environment variables (prefix MARKETPLACE_).
+// At startup, optional dot-env files are loaded in priority order so that
+// local-dev overrides can live outside source control:
+//
+//   - .env.local — highest priority; local developer overrides (gitignored)
+//   - .env       — shared defaults checked into the project (gitignored here;
+//     .env.example is the committed template)
+//
+// godotenv.Load never overwrites a variable that is already set in the process
+// environment, so a real deployment that exports MARKETPLACE_* vars is
+// completely unaffected. Errors (missing files) are intentionally ignored.
 func Load() (*Config, error) {
+	// Load optional dot-env files before viper reads the environment.
+	// Both calls silently no-op if the file does not exist; the blank
+	// identifier suppresses the "file not found" error explicitly.
+	_ = godotenv.Load(".env.local")
+	_ = godotenv.Load(".env")
+
 	v := viper.New()
 
 	v.SetEnvPrefix("MARKETPLACE")
@@ -196,6 +214,10 @@ const minServiceTokenLen = 32
 // configured. Without this, an unset base URL leaves workspaceClient == nil and
 // AcceptBid silently fails open — the bid is accepted but no workspace contract is
 // ever created. Fail loudly at startup instead.
+//
+// Security guard: in non-dev, WorkspaceBaseURL MUST use https:// to prevent the
+// S2S service token from being sent in cleartext. http://localhost is the only
+// permitted http:// form (useful for integration tests and local dev).
 func (c *Config) validateWorkspace() []string {
 	var errs []string
 
@@ -213,6 +235,27 @@ func (c *Config) validateWorkspace() []string {
 	// even in dev — a configured base URL without a valid token is always a misconfig.
 	if c.WorkspaceBaseURL != "" && len(c.WorkspaceServiceToken) < minServiceTokenLen {
 		errs = append(errs, "MARKETPLACE_WORKSPACE_SERVICE_TOKEN must be at least 32 characters when MARKETPLACE_WORKSPACE_BASE_URL is set")
+	}
+
+	// In non-dev, enforce https:// to prevent the S2S token from being sent in
+	// cleartext. http://localhost (exact hostname, no suffix) is permitted in all
+	// envs for integration tests and local dev.
+	//
+	// Security note: a simple strings.HasPrefix(…, "http://localhost") check is
+	// INSUFFICIENT — it passes "http://localhostevil.com", "http://localhost.attacker.com",
+	// etc. We must parse the URL and require Hostname() == "localhost" exactly.
+	if !c.IsDev() && c.WorkspaceBaseURL != "" {
+		const httpsMsg = "MARKETPLACE_WORKSPACE_BASE_URL must use https:// in non-dev" +
+			" (only http://localhost:<port> is permitted for integration tests)"
+		lower := strings.ToLower(c.WorkspaceBaseURL)
+		if strings.HasPrefix(lower, "http://") {
+			parsed, perr := url.Parse(c.WorkspaceBaseURL)
+			if perr != nil || strings.ToLower(parsed.Hostname()) != "localhost" {
+				errs = append(errs, httpsMsg)
+			}
+		} else if !strings.HasPrefix(lower, "https://") {
+			errs = append(errs, httpsMsg)
+		}
 	}
 
 	return errs

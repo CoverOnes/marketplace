@@ -195,7 +195,21 @@ func TestConfig_Load(t *testing.T) {
 			wantErr: true,
 		},
 		{
-			name: "happy path: production with workspace fully configured",
+			name: "happy path: production with workspace fully configured (https)",
+			envVars: map[string]string{
+				"MARKETPLACE_POSTGRES_DSN":            testDSN,
+				"MARKETPLACE_PORT":                    "8081",
+				"MARKETPLACE_LOG_LEVEL":               "INFO",
+				"MARKETPLACE_ENV":                     "production",
+				"MARKETPLACE_WORKSPACE_BASE_URL":      "https://workspace:8082",
+				"MARKETPLACE_WORKSPACE_SERVICE_TOKEN": testServiceToken,
+				"MARKETPLACE_GATEWAY_HMAC_SECRET":     testHMACSecret,
+			},
+			wantErr: false,
+		},
+		{
+			// Security guard: non-dev with plain http:// (not localhost) must be rejected.
+			name: "error: production with http:// workspace URL (token would be cleartext)",
 			envVars: map[string]string{
 				"MARKETPLACE_POSTGRES_DSN":            testDSN,
 				"MARKETPLACE_PORT":                    "8081",
@@ -205,7 +219,23 @@ func TestConfig_Load(t *testing.T) {
 				"MARKETPLACE_WORKSPACE_SERVICE_TOKEN": testServiceToken,
 				"MARKETPLACE_GATEWAY_HMAC_SECRET":     testHMACSecret,
 			},
-			wantErr: false,
+			wantErr: true,
+		},
+		{
+			// C-1 security fix: "http://localhostevil.com" must NOT pass the localhost
+			// exception — a prefix check would accept it, but the url.Parse hostname
+			// check correctly rejects it (hostname is "localhostevil.com", not "localhost").
+			name: "error: staging with http://localhostevil.com rejected (localhost prefix bypass)",
+			envVars: map[string]string{
+				"MARKETPLACE_POSTGRES_DSN":            testDSN,
+				"MARKETPLACE_PORT":                    "8081",
+				"MARKETPLACE_LOG_LEVEL":               "INFO",
+				"MARKETPLACE_ENV":                     "staging",
+				"MARKETPLACE_WORKSPACE_BASE_URL":      "http://localhostevil.com:8082",
+				"MARKETPLACE_WORKSPACE_SERVICE_TOKEN": testServiceToken,
+				"MARKETPLACE_GATEWAY_HMAC_SECRET":     testHMACSecret,
+			},
+			wantErr: true,
 		},
 		{
 			// Fail-closed env posture: an unset MARKETPLACE_ENV must be a boot
@@ -236,7 +266,7 @@ func TestConfig_Load(t *testing.T) {
 				"MARKETPLACE_PORT":                    "8081",
 				"MARKETPLACE_LOG_LEVEL":               "INFO",
 				"MARKETPLACE_ENV":                     "staging",
-				"MARKETPLACE_WORKSPACE_BASE_URL":      "http://workspace:8082",
+				"MARKETPLACE_WORKSPACE_BASE_URL":      "https://workspace:8082",
 				"MARKETPLACE_WORKSPACE_SERVICE_TOKEN": testServiceToken,
 				"MARKETPLACE_GATEWAY_HMAC_SECRET":     testHMACSecret,
 			},
@@ -302,6 +332,19 @@ func TestConfig_Load(t *testing.T) {
 				"MARKETPLACE_PORT":         "8081",
 				"MARKETPLACE_LOG_LEVEL":    "INFO",
 				"MARKETPLACE_ENV":          "development",
+			},
+			wantErr: false,
+		},
+		{
+			// Development allows http://localhost for integration-test convenience.
+			name: "happy path: development with http://localhost workspace URL",
+			envVars: map[string]string{
+				"MARKETPLACE_POSTGRES_DSN":            testDSN,
+				"MARKETPLACE_PORT":                    "8081",
+				"MARKETPLACE_LOG_LEVEL":               "INFO",
+				"MARKETPLACE_ENV":                     "development",
+				"MARKETPLACE_WORKSPACE_BASE_URL":      "http://localhost:8082",
+				"MARKETPLACE_WORKSPACE_SERVICE_TOKEN": testServiceToken,
 			},
 			wantErr: false,
 		},

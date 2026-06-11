@@ -133,10 +133,6 @@ func translateTender(err error) (code string, status int, message string, ok boo
 	case errors.Is(err, domain.ErrInvalidTenderTransition):
 		return "INVALID_TENDER_TRANSITION", http.StatusConflict, "invalid tender status transition", true
 
-	case errors.Is(err, domain.ErrOpenRecruiterNotEnabled):
-		return "OPEN_RECRUITER_NOT_ENABLED", http.StatusBadRequest,
-			"open recruitment mode is not enabled until a later phase", true
-
 	case errors.Is(err, domain.ErrNotTenderListing):
 		return "NOT_TENDER_LISTING", http.StatusConflict, "listing is not a tender", true
 

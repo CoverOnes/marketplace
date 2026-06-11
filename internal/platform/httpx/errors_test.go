@@ -103,12 +103,6 @@ func TestTranslate_AllTenderErrors(t *testing.T) {
 			wantCode:   "INVALID_TENDER_TRANSITION",
 		},
 		{
-			name:       "ErrOpenRecruiterNotEnabled → 400",
-			err:        domain.ErrOpenRecruiterNotEnabled,
-			wantStatus: http.StatusBadRequest,
-			wantCode:   "OPEN_RECRUITER_NOT_ENABLED",
-		},
-		{
 			name:       "ErrUpstreamWorkspace → 502",
 			err:        domain.ErrUpstreamWorkspace,
 			wantStatus: http.StatusBadGateway,

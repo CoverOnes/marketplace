@@ -57,6 +57,12 @@ type CreateBidInput struct {
 // CreateBid places a bid on a listing.
 // Guards: listing must exist and be OPEN; bidder must not be the listing owner;
 // no existing PENDING bid for this (listing, bidder) pair.
+//
+// TOCTOU protection: the listing status check and bid insert run inside a
+// single transaction, with SELECT ... FOR UPDATE locking the listing row.
+// This prevents a race where AcceptBid flips the listing to AWARDED between
+// the status read and the bid insert, which would create a ghost PENDING bid
+// on an AWARDED listing.
 func (s *BidService) CreateBid(ctx context.Context, in *CreateBidInput) (*domain.Bid, error) {
 	// Validate amount > 0.
 	if in.Amount.LessThanOrEqual(decimal.Zero) {
@@ -76,42 +82,48 @@ func (s *BidService) CreateBid(ctx context.Context, in *CreateBidInput) (*domain
 		return nil, fmt.Errorf("%w: message: %s", domain.ErrValidation, err)
 	}
 
-	// Load listing to validate it exists and is OPEN.
-	listing, err := s.listings.GetByID(ctx, in.ListingID)
-	if err != nil {
-		return nil, err
-	}
+	var b *domain.Bid
 
-	// CLASSIC bids are forbidden on tender listings (discriminator guard).
-	// Tender vendors must use the tender collaborator API instead.
-	if listing.IsTender {
-		return nil, domain.ErrTenderBidNotAllowed
-	}
+	txErr := s.txManager.WithTx(ctx, func(txCtx context.Context, txListings store.ListingStore, txBids store.BidStore, _ store.AwardStore) error {
+		// Lock the listing row to prevent concurrent AcceptBid from flipping it
+		// to AWARDED between our status check and the bid insert (TOCTOU fix).
+		listing, err := txListings.GetByIDForUpdate(txCtx, in.ListingID)
+		if err != nil {
+			return err
+		}
 
-	if listing.Status != domain.ListingStatusOpen {
-		return nil, domain.ErrListingNotOpen
-	}
+		// CLASSIC bids are forbidden on tender listings (discriminator guard).
+		// Tender vendors must use the tender collaborator API instead.
+		if listing.IsTender {
+			return domain.ErrTenderBidNotAllowed
+		}
 
-	// Reject bidding on own listing.
-	if listing.OwnerUserID == in.BidderUserID {
-		return nil, domain.ErrBidOnOwnListing
-	}
+		if listing.Status != domain.ListingStatusOpen {
+			return domain.ErrListingNotOpen
+		}
 
-	now := time.Now().UTC()
-	b := &domain.Bid{
-		ID:           uuid.New(),
-		ListingID:    in.ListingID,
-		BidderUserID: in.BidderUserID,
-		Amount:       in.Amount,
-		Currency:     in.Currency,
-		Message:      in.Message,
-		Status:       domain.BidStatusPending,
-		CreatedAt:    now,
-		UpdatedAt:    now,
-	}
+		// Reject bidding on own listing.
+		if listing.OwnerUserID == in.BidderUserID {
+			return domain.ErrBidOnOwnListing
+		}
 
-	if err := s.bids.Create(ctx, b); err != nil {
-		return nil, err
+		now := time.Now().UTC()
+		b = &domain.Bid{
+			ID:           uuid.New(),
+			ListingID:    in.ListingID,
+			BidderUserID: in.BidderUserID,
+			Amount:       in.Amount,
+			Currency:     in.Currency,
+			Message:      in.Message,
+			Status:       domain.BidStatusPending,
+			CreatedAt:    now,
+			UpdatedAt:    now,
+		}
+
+		return txBids.Create(txCtx, b)
+	})
+	if txErr != nil {
+		return nil, txErr
 	}
 
 	return b, nil
