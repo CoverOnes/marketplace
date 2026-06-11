@@ -1328,8 +1328,10 @@ func TestAcceptCollaborator_WhileExecuting_WorkspaceFailure(t *testing.T) {
 	assert.Equal(t, domain.CollaboratorStatusApproved, result.Status)
 }
 
-// TestAcceptCollaborator_TerminalStates verifies that accepting on COMPLETED or CANCELED
-// returns ErrInvalidTenderTransition (409).
+// TestAcceptCollaborator_TerminalStates verifies that accepting on SETTLING, COMPLETED,
+// or CANCELED returns ErrInvalidTenderTransition (409).
+// M-1 fix: SETTLING was previously missing from the guard, allowing an owner to approve
+// a collaborator on a winding-down tender and producing inconsistent DB state.
 func TestAcceptCollaborator_TerminalStates(t *testing.T) {
 	t.Parallel()
 
@@ -1340,6 +1342,7 @@ func TestAcceptCollaborator_TerminalStates(t *testing.T) {
 		name         string
 		tenderStatus domain.TenderStatus
 	}{
+		{"SETTLING → 409", domain.TenderStatusSettling},
 		{"COMPLETED → 409", domain.TenderStatusCompleted},
 		{"CANCELED → 409", domain.TenderStatusCancelled},
 	}

@@ -422,8 +422,13 @@ func (s *TenderService) acceptCollaboratorTx(
 		lockedTenderStatus = *lockedListing.TenderStatus
 	}
 
-	// 2a. Reject accepts on terminal tender states (COMPLETED / CANCELED).
-	if lockedTenderStatus == domain.TenderStatusCompleted || lockedTenderStatus == domain.TenderStatusCancelled {
+	// 2a. Reject accepts on terminal tender states (SETTLING / COMPLETED / CANCELED).
+	// SETTLING is terminal: the tender is winding down and no new collaborators should
+	// be accepted. Omitting it lets an owner approve on a SETTLING tender, producing
+	// inconsistent DB state (an APPROVED collaborator on a closing tender).
+	if lockedTenderStatus == domain.TenderStatusSettling ||
+		lockedTenderStatus == domain.TenderStatusCompleted ||
+		lockedTenderStatus == domain.TenderStatusCancelled {
 		return nil, lockedTenderStatus, domain.ErrInvalidTenderTransition
 	}
 

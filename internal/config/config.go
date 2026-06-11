@@ -4,6 +4,7 @@ package config
 import (
 	"errors"
 	"fmt"
+	"net/url"
 	"regexp"
 	"strings"
 
@@ -237,11 +238,23 @@ func (c *Config) validateWorkspace() []string {
 	}
 
 	// In non-dev, enforce https:// to prevent the S2S token from being sent in
-	// cleartext. http://localhost is permitted in all envs (integration tests, local dev).
+	// cleartext. http://localhost (exact hostname, no suffix) is permitted in all
+	// envs for integration tests and local dev.
+	//
+	// Security note: a simple strings.HasPrefix(…, "http://localhost") check is
+	// INSUFFICIENT — it passes "http://localhostevil.com", "http://localhost.attacker.com",
+	// etc. We must parse the URL and require Hostname() == "localhost" exactly.
 	if !c.IsDev() && c.WorkspaceBaseURL != "" {
+		const httpsMsg = "MARKETPLACE_WORKSPACE_BASE_URL must use https:// in non-dev" +
+			" (only http://localhost:<port> is permitted for integration tests)"
 		lower := strings.ToLower(c.WorkspaceBaseURL)
-		if !strings.HasPrefix(lower, "https://") && !strings.HasPrefix(lower, "http://localhost") {
-			errs = append(errs, "MARKETPLACE_WORKSPACE_BASE_URL must use https:// in non-dev environments (http://localhost is the only permitted http:// exception)")
+		if strings.HasPrefix(lower, "http://") {
+			parsed, perr := url.Parse(c.WorkspaceBaseURL)
+			if perr != nil || strings.ToLower(parsed.Hostname()) != "localhost" {
+				errs = append(errs, httpsMsg)
+			}
+		} else if !strings.HasPrefix(lower, "https://") {
+			errs = append(errs, httpsMsg)
 		}
 	}
 

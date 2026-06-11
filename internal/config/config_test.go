@@ -222,6 +222,22 @@ func TestConfig_Load(t *testing.T) {
 			wantErr: true,
 		},
 		{
+			// C-1 security fix: "http://localhostevil.com" must NOT pass the localhost
+			// exception — a prefix check would accept it, but the url.Parse hostname
+			// check correctly rejects it (hostname is "localhostevil.com", not "localhost").
+			name: "error: staging with http://localhostevil.com rejected (localhost prefix bypass)",
+			envVars: map[string]string{
+				"MARKETPLACE_POSTGRES_DSN":            testDSN,
+				"MARKETPLACE_PORT":                    "8081",
+				"MARKETPLACE_LOG_LEVEL":               "INFO",
+				"MARKETPLACE_ENV":                     "staging",
+				"MARKETPLACE_WORKSPACE_BASE_URL":      "http://localhostevil.com:8082",
+				"MARKETPLACE_WORKSPACE_SERVICE_TOKEN": testServiceToken,
+				"MARKETPLACE_GATEWAY_HMAC_SECRET":     testHMACSecret,
+			},
+			wantErr: true,
+		},
+		{
 			// Fail-closed env posture: an unset MARKETPLACE_ENV must be a boot
 			// error, never a silent default to production/development.
 			name: "error: empty env is rejected (no silent default)",
