@@ -7,6 +7,7 @@ import (
 	"regexp"
 	"strings"
 
+	"github.com/joho/godotenv"
 	"github.com/spf13/viper"
 )
 
@@ -86,7 +87,23 @@ type Config struct {
 }
 
 // Load reads configuration from environment variables (prefix MARKETPLACE_).
+// At startup, optional dot-env files are loaded in priority order so that
+// local-dev overrides can live outside source control:
+//
+//   - .env.local — highest priority; local developer overrides (gitignored)
+//   - .env       — shared defaults checked into the project (gitignored here;
+//     .env.example is the committed template)
+//
+// godotenv.Load never overwrites a variable that is already set in the process
+// environment, so a real deployment that exports MARKETPLACE_* vars is
+// completely unaffected. Errors (missing files) are intentionally ignored.
 func Load() (*Config, error) {
+	// Load optional dot-env files before viper reads the environment.
+	// Both calls silently no-op if the file does not exist; the blank
+	// identifier suppresses the "file not found" error explicitly.
+	_ = godotenv.Load(".env.local")
+	_ = godotenv.Load(".env")
+
 	v := viper.New()
 
 	v.SetEnvPrefix("MARKETPLACE")
