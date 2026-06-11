@@ -66,6 +66,7 @@ type CreateRoleInput struct {
 
 // CreateRole creates a new role under a tender listing.
 // Owner-only. Listing must be a tender with tender_status = OPEN or PARTIALLY_STAFFED.
+// Terminal tenders (SETTLING, COMPLETED, CANCELED) reject new roles.
 func (s *TenderService) CreateRole(ctx context.Context, in *CreateRoleInput) (*domain.TenderRole, error) {
 	if err := validateRoleInput(in.Title, in.Description, in.MaxCollaborators, in.ProfitShareBPS); err != nil {
 		return nil, err
@@ -82,6 +83,10 @@ func (s *TenderService) CreateRole(ctx context.Context, in *CreateRoleInput) (*d
 
 	if listing.OwnerUserID != in.CallerID {
 		return nil, domain.ErrListingNotFound // 404 to avoid enumeration
+	}
+
+	if !isTenderAcceptingStructuralChanges(listing.TenderStatus) {
+		return nil, fmt.Errorf("%w: tender is not accepting structural changes in its current state", domain.ErrInvalidTenderTransition)
 	}
 
 	now := time.Now().UTC()
@@ -132,6 +137,7 @@ type CloseRoleInput struct {
 }
 
 // CloseRole sets a tender role to CLOSED (owner-only).
+// Terminal tenders (SETTLING, COMPLETED, CANCELED) reject role changes.
 func (s *TenderService) CloseRole(ctx context.Context, in *CloseRoleInput) (*domain.TenderRole, error) {
 	role, err := s.roles.GetByID(ctx, in.RoleID)
 	if err != nil {
@@ -150,6 +156,10 @@ func (s *TenderService) CloseRole(ctx context.Context, in *CloseRoleInput) (*dom
 
 	if listing.OwnerUserID != in.CallerID {
 		return nil, domain.ErrTenderRoleNotFound // 404 to avoid enumeration
+	}
+
+	if !isTenderAcceptingStructuralChanges(listing.TenderStatus) {
+		return nil, fmt.Errorf("%w: tender is not accepting structural changes in its current state", domain.ErrInvalidTenderTransition)
 	}
 
 	if role.Status == domain.TenderRoleStatusClosed {
@@ -423,6 +433,14 @@ func (s *TenderService) acceptCollaboratorTx(
 		return nil, lockedTenderStatus, err
 	}
 
+	// Idempotency: if the collaborator is already APPROVED (e.g. a previous call
+	// succeeded but the workspace S2S call failed and the client retried), return
+	// the current row as success. This lets the caller re-trigger the workspace
+	// add-party call without hitting ErrValidation/400 on the re-try.
+	if lockedCollab.Status == domain.CollaboratorStatusApproved {
+		return lockedCollab, lockedTenderStatus, nil
+	}
+
 	if lockedCollab.Status != domain.CollaboratorStatusPending {
 		return nil, lockedTenderStatus, fmt.Errorf("%w: collaborator is not pending", domain.ErrValidation)
 	}
@@ -622,15 +640,24 @@ func (s *TenderService) ExitCollaborator(ctx context.Context, in *ExitCollaborat
 
 	txErr := s.tenderTx.WithTenderTx(ctx, func(
 		txCtx context.Context,
-		_ store.ListingStore, // listing lock not needed for vendor-initiated exit
+		txListings store.ListingStore,
 		txRoles store.TenderRoleStore,
 		txCollaborators store.TenderCollaboratorStore,
 	) error {
 		// 1. Lock the role row first (maintains lock-ordering with AcceptCollaborator /
 		//    RejectCollaborator: role → listing → collaborator, preventing deadlocks).
-		_, lockRoleErr := txRoles.GetByIDForUpdate(txCtx, preflight.TenderRoleID)
+		lockedRole, lockRoleErr := txRoles.GetByIDForUpdate(txCtx, preflight.TenderRoleID)
 		if lockRoleErr != nil {
 			return lockRoleErr
+		}
+
+		// 2. Lock the listing row to maintain the role→listing→collaborator lock-ordering
+		// invariant that AcceptCollaborator and RejectCollaborator both hold.
+		// Without this lock, ExitCollaborator skips the listing step, breaking the ordering
+		// guarantee and risking deadlocks when paired with concurrent accept/reject paths.
+		// The result is intentionally discarded — this lock is acquired for ordering only.
+		if _, lockListingErr := txListings.GetByIDForUpdate(txCtx, lockedRole.ListingID); lockListingErr != nil {
+			return lockListingErr
 		}
 
 		// 2. Lock the collaborator row and re-read status under the lock.
@@ -707,6 +734,7 @@ type CreateMilestoneInput struct {
 }
 
 // CreateMilestone creates a new milestone for a tender listing (owner-only).
+// Terminal tenders (SETTLING, COMPLETED, CANCELED) reject new milestones.
 func (s *TenderService) CreateMilestone(ctx context.Context, in *CreateMilestoneInput) (*domain.TenderMilestone, error) {
 	if err := validateMilestoneInput(in.Title, in.Amount, in.Currency); err != nil {
 		return nil, err
@@ -723,6 +751,10 @@ func (s *TenderService) CreateMilestone(ctx context.Context, in *CreateMilestone
 
 	if listing.OwnerUserID != in.CallerID {
 		return nil, domain.ErrListingNotFound // 404 to avoid enumeration
+	}
+
+	if !isTenderAcceptingStructuralChanges(listing.TenderStatus) {
+		return nil, fmt.Errorf("%w: tender is not accepting structural changes in its current state", domain.ErrInvalidTenderTransition)
 	}
 
 	now := time.Now().UTC()
@@ -782,6 +814,25 @@ const (
 	maxMilestoneTitleRunes  = 200
 	maxBPS                  = 10000
 )
+
+// isTenderAcceptingStructuralChanges returns true when a tender's current status
+// permits owner-driven structural mutations: adding/closing roles, adding milestones.
+// OPEN and PARTIALLY_STAFFED allow structural changes.
+// SETTLING, COMPLETED, and CANCELED are terminal — reject mutations.
+// EXECUTING is intentionally excluded: the tender is live and its structure is frozen.
+// nil tender_status means the listing is CLASSIC (not a tender) — return false.
+func isTenderAcceptingStructuralChanges(ts *domain.TenderStatus) bool {
+	if ts == nil {
+		return false
+	}
+
+	switch *ts {
+	case domain.TenderStatusOpen, domain.TenderStatusPartiallyStaffed:
+		return true
+	}
+
+	return false
+}
 
 // isTenderAcceptingApplications returns true when a tender's current status
 // permits new PENDING collaborator applications.

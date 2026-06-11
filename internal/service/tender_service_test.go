@@ -643,6 +643,438 @@ func TestRejectCollaborator_AfterConcurrentApprove(t *testing.T) {
 	}
 }
 
+// --- Finding #2: terminal-state guards for CreateRole / CloseRole / CreateMilestone ---
+
+// TestCreateRole_TerminalStateGuard verifies that CreateRole rejects mutations on
+// tenders in SETTLING, COMPLETED, or CANCELED terminal states (Finding #2 fix).
+func TestCreateRole_TerminalStateGuard(t *testing.T) {
+	t.Parallel()
+
+	ownerID := uuid.New()
+
+	tests := []struct {
+		name         string
+		tenderStatus domain.TenderStatus
+		wantErr      bool
+		wantErrIs    error
+	}{
+		{
+			name:         "happy: OPEN tender accepts new roles",
+			tenderStatus: domain.TenderStatusOpen,
+			wantErr:      false,
+		},
+		{
+			name:         "happy: PARTIALLY_STAFFED tender accepts new roles",
+			tenderStatus: domain.TenderStatusPartiallyStaffed,
+			wantErr:      false,
+		},
+		{
+			name:         "error: EXECUTING tender rejects new roles (structure frozen)",
+			tenderStatus: domain.TenderStatusExecuting,
+			wantErr:      true,
+			wantErrIs:    domain.ErrInvalidTenderTransition,
+		},
+		{
+			name:         "error: SETTLING tender rejects new roles",
+			tenderStatus: domain.TenderStatusSettling,
+			wantErr:      true,
+			wantErrIs:    domain.ErrInvalidTenderTransition,
+		},
+		{
+			name:         "error: COMPLETED tender rejects new roles",
+			tenderStatus: domain.TenderStatusCompleted,
+			wantErr:      true,
+			wantErrIs:    domain.ErrInvalidTenderTransition,
+		},
+		{
+			name:         "error: CANCELED tender rejects new roles",
+			tenderStatus: domain.TenderStatusCancelled,
+			wantErr:      true,
+			wantErrIs:    domain.ErrInvalidTenderTransition,
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+
+			listing := makeTenderListing(ownerID, tc.tenderStatus)
+			ls := newStubListingStore(listing)
+			rs := newStubTenderRoleStore()
+			cs := newStubTenderCollaboratorStore()
+			ms := newStubTenderMilestoneStore()
+			svc := newTenderSvc(ls, rs, cs, ms)
+
+			_, err := svc.CreateRole(context.Background(), &service.CreateRoleInput{
+				ListingID:   listing.ID,
+				CallerID:    ownerID,
+				Title:       "New role",
+				Description: "desc",
+			})
+
+			if tc.wantErr {
+				require.Error(t, err)
+				assert.True(t, errors.Is(err, tc.wantErrIs),
+					"expected %v, got %v", tc.wantErrIs, err)
+			} else {
+				require.NoError(t, err)
+			}
+		})
+	}
+}
+
+// TestCloseRole_TerminalStateGuard verifies that CloseRole rejects mutations on
+// tenders in SETTLING, COMPLETED, or CANCELED terminal states (Finding #2 fix).
+func TestCloseRole_TerminalStateGuard(t *testing.T) {
+	t.Parallel()
+
+	ownerID := uuid.New()
+
+	tests := []struct {
+		name         string
+		tenderStatus domain.TenderStatus
+		wantErr      bool
+		wantErrIs    error
+	}{
+		{
+			name:         "happy: OPEN tender allows closing a role",
+			tenderStatus: domain.TenderStatusOpen,
+			wantErr:      false,
+		},
+		{
+			name:         "happy: PARTIALLY_STAFFED tender allows closing a role",
+			tenderStatus: domain.TenderStatusPartiallyStaffed,
+			wantErr:      false,
+		},
+		{
+			name:         "error: EXECUTING tender rejects CloseRole",
+			tenderStatus: domain.TenderStatusExecuting,
+			wantErr:      true,
+			wantErrIs:    domain.ErrInvalidTenderTransition,
+		},
+		{
+			name:         "error: SETTLING tender rejects CloseRole",
+			tenderStatus: domain.TenderStatusSettling,
+			wantErr:      true,
+			wantErrIs:    domain.ErrInvalidTenderTransition,
+		},
+		{
+			name:         "error: COMPLETED tender rejects CloseRole",
+			tenderStatus: domain.TenderStatusCompleted,
+			wantErr:      true,
+			wantErrIs:    domain.ErrInvalidTenderTransition,
+		},
+		{
+			name:         "error: CANCELED tender rejects CloseRole",
+			tenderStatus: domain.TenderStatusCancelled,
+			wantErr:      true,
+			wantErrIs:    domain.ErrInvalidTenderTransition,
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+
+			listing := makeTenderListing(ownerID, tc.tenderStatus)
+			role := &domain.TenderRole{
+				ID:        uuid.New(),
+				ListingID: listing.ID,
+				Title:     "Role to close",
+				Status:    domain.TenderRoleStatusOpen,
+			}
+			ls := newStubListingStore(listing)
+			rs := newStubTenderRoleStore(role)
+			cs := newStubTenderCollaboratorStore()
+			ms := newStubTenderMilestoneStore()
+			svc := newTenderSvc(ls, rs, cs, ms)
+
+			_, err := svc.CloseRole(context.Background(), &service.CloseRoleInput{
+				RoleID:   role.ID,
+				CallerID: ownerID,
+			})
+
+			if tc.wantErr {
+				require.Error(t, err)
+				assert.True(t, errors.Is(err, tc.wantErrIs),
+					"expected %v, got %v", tc.wantErrIs, err)
+			} else {
+				require.NoError(t, err)
+			}
+		})
+	}
+}
+
+// TestCreateMilestone_TerminalStateGuard verifies that CreateMilestone rejects mutations on
+// tenders in SETTLING, COMPLETED, or CANCELED terminal states (Finding #2 fix).
+func TestCreateMilestone_TerminalStateGuard(t *testing.T) {
+	t.Parallel()
+
+	ownerID := uuid.New()
+
+	tests := []struct {
+		name         string
+		tenderStatus domain.TenderStatus
+		wantErr      bool
+		wantErrIs    error
+	}{
+		{
+			name:         "happy: OPEN tender accepts new milestones",
+			tenderStatus: domain.TenderStatusOpen,
+			wantErr:      false,
+		},
+		{
+			name:         "happy: PARTIALLY_STAFFED tender accepts new milestones",
+			tenderStatus: domain.TenderStatusPartiallyStaffed,
+			wantErr:      false,
+		},
+		{
+			name:         "error: EXECUTING tender rejects new milestones",
+			tenderStatus: domain.TenderStatusExecuting,
+			wantErr:      true,
+			wantErrIs:    domain.ErrInvalidTenderTransition,
+		},
+		{
+			name:         "error: SETTLING tender rejects new milestones",
+			tenderStatus: domain.TenderStatusSettling,
+			wantErr:      true,
+			wantErrIs:    domain.ErrInvalidTenderTransition,
+		},
+		{
+			name:         "error: COMPLETED tender rejects new milestones",
+			tenderStatus: domain.TenderStatusCompleted,
+			wantErr:      true,
+			wantErrIs:    domain.ErrInvalidTenderTransition,
+		},
+		{
+			name:         "error: CANCELED tender rejects new milestones",
+			tenderStatus: domain.TenderStatusCancelled,
+			wantErr:      true,
+			wantErrIs:    domain.ErrInvalidTenderTransition,
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+
+			listing := makeTenderListing(ownerID, tc.tenderStatus)
+			ls := newStubListingStore(listing)
+			rs := newStubTenderRoleStore()
+			cs := newStubTenderCollaboratorStore()
+			ms := newStubTenderMilestoneStore()
+			svc := newTenderSvc(ls, rs, cs, ms)
+
+			_, err := svc.CreateMilestone(context.Background(), &service.CreateMilestoneInput{
+				ListingID: listing.ID,
+				CallerID:  ownerID,
+				Title:     "Milestone 1",
+			})
+
+			if tc.wantErr {
+				require.Error(t, err)
+				assert.True(t, errors.Is(err, tc.wantErrIs),
+					"expected %v, got %v", tc.wantErrIs, err)
+			} else {
+				require.NoError(t, err)
+			}
+		})
+	}
+}
+
+// --- Finding #5: AcceptCollaborator idempotency when already APPROVED ---
+
+// TestAcceptCollaborator_AlreadyApproved_Idempotent verifies that calling
+// AcceptCollaborator on an already-APPROVED collaborator returns success (200)
+// instead of ErrValidation/400 (Finding #5 fix).
+func TestAcceptCollaborator_AlreadyApproved_Idempotent(t *testing.T) {
+	t.Parallel()
+
+	ownerID := uuid.New()
+	vendorID := uuid.New()
+	approvedAt := time.Now().UTC()
+	approvedBy := ownerID
+
+	tests := []struct {
+		name         string
+		tenderStatus domain.TenderStatus
+		// callWS controls whether a workspace client is provided (EXECUTING path).
+		callWS bool
+	}{
+		{
+			name:         "OPEN tender: already-APPROVED is idempotent",
+			tenderStatus: domain.TenderStatusOpen,
+			callWS:       false,
+		},
+		{
+			name:         "EXECUTING tender: already-APPROVED is idempotent (workspace not re-called on tx path)",
+			tenderStatus: domain.TenderStatusExecuting,
+			callWS:       true,
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+
+			listing := makeTenderListing(ownerID, tc.tenderStatus)
+			role := &domain.TenderRole{
+				ID:        uuid.New(),
+				ListingID: listing.ID,
+				Title:     "Dev role",
+				Status:    domain.TenderRoleStatusOpen,
+			}
+			collab := &domain.TenderCollaborator{
+				ID:               uuid.New(),
+				TenderRoleID:     role.ID,
+				ListingID:        listing.ID,
+				VendorUserID:     vendorID,
+				Status:           domain.CollaboratorStatusApproved, // already approved
+				ApprovedAt:       &approvedAt,
+				ApprovedByUserID: &approvedBy,
+				CreatedAt:        time.Now().UTC(),
+				UpdatedAt:        time.Now().UTC(),
+			}
+
+			ls := newStubListingStore(listing)
+			rs := newStubTenderRoleStore(role)
+			cs := newStubTenderCollaboratorStore(collab)
+			ms := newStubTenderMilestoneStore()
+
+			wc := &stubWorkspaceClient{}
+			svc := newTenderSvcWithWorkspace(ls, rs, cs, ms, wc)
+
+			result, err := svc.AcceptCollaborator(context.Background(), &service.AcceptCollaboratorInput{
+				CollaboratorID: collab.ID,
+				CallerID:       ownerID,
+			})
+
+			// Must succeed (idempotent) rather than returning ErrValidation/400.
+			require.NoError(t, err, "already-APPROVED accept must be idempotent, got: %v", err)
+			require.NotNil(t, result)
+			assert.Equal(t, domain.CollaboratorStatusApproved, result.Status)
+		})
+	}
+}
+
+// --- Finding #7: ExitCollaborator APPROVED→EXITED deterministic unit test ---
+
+// TestExitCollaborator_ApprovedToExited verifies the deterministic path
+// APPROVED→EXITED in ExitCollaborator (Finding #7 test requirement).
+func TestExitCollaborator_ApprovedToExited(t *testing.T) {
+	t.Parallel()
+
+	ownerID := uuid.New()
+	vendorID := uuid.New()
+	approvedAt := time.Now().UTC()
+	approvedBy := ownerID
+
+	listing := makeTenderListing(ownerID, domain.TenderStatusExecuting)
+	role := &domain.TenderRole{
+		ID:        uuid.New(),
+		ListingID: listing.ID,
+		Title:     "Dev role",
+		Status:    domain.TenderRoleStatusOpen,
+	}
+
+	tests := []struct {
+		name            string
+		initialStatus   domain.CollaboratorStatus
+		wantErr         bool
+		wantErrIs       error
+		wantStatusAfter domain.CollaboratorStatus
+	}{
+		{
+			name:            "APPROVED → EXITED (deterministic)",
+			initialStatus:   domain.CollaboratorStatusApproved,
+			wantErr:         false,
+			wantStatusAfter: domain.CollaboratorStatusExited,
+		},
+		{
+			name:            "PENDING → WITHDRAWN",
+			initialStatus:   domain.CollaboratorStatusPending,
+			wantErr:         false,
+			wantStatusAfter: domain.CollaboratorStatusWithdrawn,
+		},
+		{
+			name:          "EXITED → error (not active state)",
+			initialStatus: domain.CollaboratorStatusExited,
+			wantErr:       true,
+			wantErrIs:     domain.ErrValidation,
+		},
+		{
+			name:          "WITHDRAWN → error (not active state)",
+			initialStatus: domain.CollaboratorStatusWithdrawn,
+			wantErr:       true,
+			wantErrIs:     domain.ErrValidation,
+		},
+		{
+			name:          "REJECTED → error (not active state)",
+			initialStatus: domain.CollaboratorStatusRejected,
+			wantErr:       true,
+			wantErrIs:     domain.ErrValidation,
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+
+			collab := &domain.TenderCollaborator{
+				ID:           uuid.New(),
+				TenderRoleID: role.ID,
+				ListingID:    listing.ID,
+				VendorUserID: vendorID,
+				Status:       tc.initialStatus,
+				ApprovedAt: func() *time.Time {
+					if tc.initialStatus == domain.CollaboratorStatusApproved {
+						return &approvedAt
+					}
+					return nil
+				}(),
+				ApprovedByUserID: func() *uuid.UUID {
+					if tc.initialStatus == domain.CollaboratorStatusApproved {
+						return &approvedBy
+					}
+					return nil
+				}(),
+				CreatedAt: time.Now().UTC(),
+				UpdatedAt: time.Now().UTC(),
+			}
+
+			ls := newStubListingStore(listing)
+			rs := newStubTenderRoleStore(role)
+			cs := newStubTenderCollaboratorStore(collab)
+			ms := newStubTenderMilestoneStore()
+			svc := newTenderSvc(ls, rs, cs, ms)
+
+			result, err := svc.ExitCollaborator(context.Background(), &service.ExitCollaboratorInput{
+				CollaboratorID: collab.ID,
+				CallerID:       vendorID,
+				Reason:         "leaving project",
+			})
+
+			if tc.wantErr {
+				require.Error(t, err)
+				assert.True(t, errors.Is(err, tc.wantErrIs),
+					"expected error wrapping %v, got %v", tc.wantErrIs, err)
+			} else {
+				require.NoError(t, err)
+				require.NotNil(t, result)
+				assert.Equal(t, tc.wantStatusAfter, result.Status)
+
+				// Verify the DB store was updated correctly.
+				stored, getErr := cs.GetByID(context.Background(), collab.ID)
+				require.NoError(t, getErr)
+				assert.Equal(t, tc.wantStatusAfter, stored.Status,
+					"store must show %s after exit, got %s", tc.wantStatusAfter, stored.Status)
+				assert.NotNil(t, stored.ExitedAt, "exited_at must be set after exit")
+				assert.Equal(t, "leaving project", stored.ExitReason)
+			}
+		})
+	}
+}
+
 // strPtr is declared in listing_service_test.go (same package); used here without re-declaration.
 
 // --- Phase 4 tests ---
