@@ -17,7 +17,6 @@ import (
 	"github.com/CoverOnes/marketplace/internal/config"
 	"github.com/CoverOnes/marketplace/internal/events"
 	"github.com/CoverOnes/marketplace/internal/handler"
-	"github.com/CoverOnes/marketplace/internal/migrate"
 	"github.com/CoverOnes/marketplace/internal/platform/logger"
 	"github.com/CoverOnes/marketplace/internal/service"
 	"github.com/CoverOnes/marketplace/internal/store/postgres"
@@ -98,11 +97,12 @@ func run() error {
 
 	slog.Info("postgres connected")
 
-	// Run embedded migrations before serving (CONVENTIONS §11 + audit fix 1).
-	// This is idempotent: re-running on an already-migrated DB is a no-op.
-	if migrErr := migrate.Run(cfg.PostgresDSN); migrErr != nil {
-		return fmt.Errorf("run migrations: %w", migrErr)
-	}
+	// Migrations are applied by `task migrate` in dev-stack (or the equivalent
+	// operator step in production) — NOT on boot. Running golang-migrate at boot
+	// without the search_path=marketplace,public parameter would attempt to write
+	// schema_migrations into the public schema, which svc_marketplace has no
+	// privileges on (SQLSTATE 42501). The Taskfile migrate step runs as svc_marketplace
+	// with search_path set, so schema_migrations lands in the marketplace schema.
 
 	// Redis client (optional — nil means noop publisher + in-process rate limiter).
 	var redisClient *redis.Client
