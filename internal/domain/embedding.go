@@ -16,6 +16,18 @@ const (
 	EmbeddingEntityTypeVendor EmbeddingEntityType = "vendor"
 )
 
+// IsValid reports whether e is a recognized entity type.
+// Callers MUST check this before any DB operation to prevent raw pgx
+// check_violation errors from surfacing (backend-security §5.2).
+func (e EmbeddingEntityType) IsValid() bool {
+	switch e {
+	case EmbeddingEntityTypeTender, EmbeddingEntityTypeVendor:
+		return true
+	default:
+		return false
+	}
+}
+
 // Embedding holds a 1536-dimension vector embedding for a marketplace entity.
 // entity_id is a soft reference (no FK) — integrity enforced in the service layer.
 type Embedding struct {

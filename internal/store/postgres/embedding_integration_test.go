@@ -243,6 +243,38 @@ func TestEmbeddingStore_Integration(t *testing.T) {
 		_, err := es.NearestNeighbors(ctx, shortVec, domain.EmbeddingEntityTypeTender, 5)
 		require.ErrorIs(t, err, domain.ErrInvalidEmbeddingDimension)
 	})
+
+	// M-2 regression: invalid entity_type rejected before DB call.
+	t.Run("Upsert invalid entity_type returns ErrInvalidEntityType without DB write", func(t *testing.T) {
+		vec := makeVec(1.0, 0.0)
+		entityID := uuid.New()
+		err := es.Upsert(ctx, domain.EmbeddingEntityType("contract"), entityID, vec, "v1")
+		require.ErrorIs(t, err, domain.ErrInvalidEntityType, "must wrap ErrInvalidEntityType")
+
+		// Confirm no row was written.
+		var count int
+		require.NoError(t, pool.QueryRow(ctx,
+			"SELECT COUNT(*) FROM embeddings WHERE entity_id = $1", entityID,
+		).Scan(&count))
+		assert.Equal(t, 0, count, "no row must be written on invalid entity_type")
+	})
+
+	t.Run("NearestNeighbors invalid entity_type returns ErrInvalidEntityType", func(t *testing.T) {
+		vec := makeVec(1.0, 0.0)
+		_, err := es.NearestNeighbors(ctx, vec, domain.EmbeddingEntityType(""), 5)
+		require.ErrorIs(t, err, domain.ErrInvalidEntityType, "empty entity_type must wrap ErrInvalidEntityType")
+	})
+
+	// M-3 regression: model_version > 100 runes rejected before DB call.
+	t.Run("Upsert model_version over 100 runes returns domain error", func(t *testing.T) {
+		vec := makeVec(1.0, 0.0)
+		overlong := string(make([]rune, 101)) // 101 NUL runes; any 101-rune string works
+		err := es.Upsert(ctx, domain.EmbeddingEntityTypeTender, uuid.New(), vec, overlong)
+		require.Error(t, err, "must return error for model_version > 100 runes")
+		// Must NOT be a raw pgx error — message should mention the limit.
+		assert.Contains(t, err.Error(), "model_version", "error must mention model_version")
+		assert.Contains(t, err.Error(), "100", "error must mention the limit")
+	})
 }
 
 // TestEmbeddingStore_PgvectorImage_Integration is a standalone confirmation that

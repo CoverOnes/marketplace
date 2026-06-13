@@ -85,6 +85,12 @@ func run() error {
 	// to isolate this service within a shared Aiven database.
 	// cfg.DBMaxConns / cfg.DBMinConns default to 10 / 2; lower them when sharing a
 	// small Aiven plan across multiple services (MARKETPLACE_DB_MAX_CONNS / _MIN_CONNS).
+	// IMPORTANT (M-1): This pool does NOT register the pgvector codec.
+	// Any handler or service that calls EmbeddingStore MUST use postgres.NewEmbeddingPool
+	// instead — it registers the pgvector codec via an AfterConnect hook. Using this plain
+	// pool with EmbeddingStore will produce "unknown type" scan errors at runtime.
+	// TODO: when wiring an EmbeddingStore consumer, replace or supplement this pool with
+	// postgres.NewEmbeddingPool(ctx, cfg.PostgresDSN, cfg.PostgresSchema, ...).
 	pool, err := postgres.NewPool(ctx, cfg.PostgresDSN, cfg.PostgresSchema, postgres.PoolOptions{
 		MaxConns: int32(cfg.DBMaxConns),
 		MinConns: int32(cfg.DBMinConns),

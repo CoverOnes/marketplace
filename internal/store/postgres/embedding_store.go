@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"time"
+	"unicode/utf8"
 
 	"github.com/CoverOnes/marketplace/internal/domain"
 	"github.com/CoverOnes/marketplace/internal/store"
@@ -61,6 +62,11 @@ func (s *EmbeddingStore) NearestNeighbors(
 // It matches the vector(1536) column definition in migration 000010.
 const embeddingDimensions = 1536
 
+// maxModelVersionLen is the maximum rune count for model_version.
+// It MUST match the CHECK (char_length(model_version) <= 100) constraint in
+// migration 000010. Go-level validation prevents raw pgx check_violation (§5.2).
+const maxModelVersionLen = 100
+
 func upsertEmbedding(
 	ctx context.Context,
 	q querier,
@@ -69,6 +75,17 @@ func upsertEmbedding(
 	embedding []float32,
 	modelVersion string,
 ) error {
+	// M-2: validate entity_type before any DB call.
+	if !entityType.IsValid() {
+		return fmt.Errorf("upsert embedding: %w %q", domain.ErrInvalidEntityType, entityType)
+	}
+
+	// M-3: validate model_version length before DB round-trip.
+	if utf8.RuneCountInString(modelVersion) > maxModelVersionLen {
+		return fmt.Errorf("upsert embedding: model_version exceeds %d rune limit (got %d)",
+			maxModelVersionLen, utf8.RuneCountInString(modelVersion))
+	}
+
 	if len(embedding) != embeddingDimensions {
 		return fmt.Errorf("upsert embedding: %w (got %d)", domain.ErrInvalidEmbeddingDimension, len(embedding))
 	}
@@ -103,6 +120,11 @@ func nearestNeighborEmbeddings(
 	entityType domain.EmbeddingEntityType,
 	topK int,
 ) ([]*domain.Embedding, error) {
+	// M-2: validate entity_type before any DB call.
+	if !entityType.IsValid() {
+		return nil, fmt.Errorf("nearest neighbors: %w %q", domain.ErrInvalidEntityType, entityType)
+	}
+
 	if len(queryVec) != embeddingDimensions {
 		return nil, fmt.Errorf("nearest neighbors: %w (got %d)", domain.ErrInvalidEmbeddingDimension, len(queryVec))
 	}
