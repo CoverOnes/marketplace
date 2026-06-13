@@ -57,6 +57,10 @@ func (s *EmbeddingStore) NearestNeighbors(
 
 // --- helpers ---
 
+// embeddingDimensions is the expected vector length for all embeddings.
+// It matches the vector(1536) column definition in migration 000010.
+const embeddingDimensions = 1536
+
 func upsertEmbedding(
 	ctx context.Context,
 	q querier,
@@ -65,6 +69,10 @@ func upsertEmbedding(
 	embedding []float32,
 	modelVersion string,
 ) error {
+	if len(embedding) != embeddingDimensions {
+		return fmt.Errorf("upsert embedding: %w (got %d)", domain.ErrInvalidEmbeddingDimension, len(embedding))
+	}
+
 	const query = `
 INSERT INTO embeddings (entity_type, entity_id, embedding, model_version, created_at)
 VALUES ($1, $2, $3, $4, $5)
@@ -95,8 +103,18 @@ func nearestNeighborEmbeddings(
 	entityType domain.EmbeddingEntityType,
 	topK int,
 ) ([]*domain.Embedding, error) {
+	if len(queryVec) != embeddingDimensions {
+		return nil, fmt.Errorf("nearest neighbors: %w (got %d)", domain.ErrInvalidEmbeddingDimension, len(queryVec))
+	}
+
+	const maxTopK = 200
+
 	if topK <= 0 {
 		topK = 10
+	}
+
+	if topK > maxTopK {
+		topK = maxTopK
 	}
 
 	const query = `
@@ -148,7 +166,7 @@ func scanEmbedding(row rowScanner) (*domain.Embedding, error) {
 	}
 
 	e.EntityType = domain.EmbeddingEntityType(et)
-	e.Embedding = vec.Slice()
+	e.Vector = vec.Slice()
 
 	return &e, nil
 }

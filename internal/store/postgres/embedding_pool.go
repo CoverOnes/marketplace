@@ -3,6 +3,7 @@ package postgres
 import (
 	"context"
 	"fmt"
+	"time"
 
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
@@ -40,6 +41,9 @@ func NewEmbeddingPool(ctx context.Context, dsn, schema string, opts PoolOptions)
 
 	cfg.MaxConns = maxConns
 	cfg.MinConns = minConns
+	cfg.MaxConnLifetime = 30 * time.Minute
+	cfg.MaxConnIdleTime = 5 * time.Minute
+	cfg.HealthCheckPeriod = 1 * time.Minute
 
 	var quotedSchema string
 	if schema != "" {

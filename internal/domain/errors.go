@@ -28,6 +28,10 @@ var (
 	ErrTenderCollaboratorConflict = errors.New("a live application already exists for this role and vendor")
 	ErrInvalidTenderTransition    = errors.New("invalid tender status transition")
 	ErrNotTenderListing           = errors.New("listing is not a tender")
+	// ErrInvalidEmbeddingDimension is returned when the caller passes an embedding
+	// vector whose length is not the expected 1536 dimensions.
+	ErrInvalidEmbeddingDimension = errors.New("embedding must be 1536 dimensions")
+
 	// ErrUpstreamWorkspace is returned when the synchronous S2S call to the workspace
 	// service fails. The collaborator row is already APPROVED (tx committed); P5 outbox
 	// will reconcile. Callers map this to HTTP 502.

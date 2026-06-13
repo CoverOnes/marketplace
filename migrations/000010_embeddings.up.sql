@@ -11,7 +11,7 @@ CREATE TABLE embeddings (
     entity_type   text         NOT NULL CHECK (entity_type IN ('tender', 'vendor')),
     entity_id     uuid         NOT NULL,
     embedding     vector(1536) NOT NULL,
-    model_version text         NOT NULL,
+    model_version text         NOT NULL CHECK (char_length(model_version) <= 100),
     created_at    timestamptz  NOT NULL DEFAULT now()
 );
 

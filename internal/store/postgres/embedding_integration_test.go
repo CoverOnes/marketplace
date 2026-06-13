@@ -222,6 +222,27 @@ func TestEmbeddingStore_Integration(t *testing.T) {
 		require.NoError(t, err)
 		assert.NotNil(t, results)
 	})
+
+	t.Run("topK>200 is clamped to 200 without error", func(t *testing.T) {
+		vec := makeVec(1.0, 0.0)
+		// Passing an oversized topK must succeed (clamped), not OOM or error.
+		results, err := es.NearestNeighbors(ctx, vec, domain.EmbeddingEntityTypeTender, 10_000_000)
+		require.NoError(t, err)
+		assert.NotNil(t, results)
+	})
+
+	t.Run("Upsert wrong dimension returns ErrInvalidEmbeddingDimension", func(t *testing.T) {
+		// A 3-dim vector must be rejected before hitting the DB.
+		shortVec := []float32{0.1, 0.2, 0.3}
+		err := es.Upsert(ctx, domain.EmbeddingEntityTypeTender, uuid.New(), shortVec, "v1")
+		require.ErrorIs(t, err, domain.ErrInvalidEmbeddingDimension)
+	})
+
+	t.Run("NearestNeighbors wrong dimension returns ErrInvalidEmbeddingDimension", func(t *testing.T) {
+		shortVec := []float32{0.1, 0.2, 0.3}
+		_, err := es.NearestNeighbors(ctx, shortVec, domain.EmbeddingEntityTypeTender, 5)
+		require.ErrorIs(t, err, domain.ErrInvalidEmbeddingDimension)
+	})
 }
 
 // TestEmbeddingStore_PgvectorImage_Integration is a standalone confirmation that

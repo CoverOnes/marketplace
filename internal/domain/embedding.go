@@ -22,7 +22,7 @@ type Embedding struct {
 	ID           uuid.UUID
 	EntityType   EmbeddingEntityType
 	EntityID     uuid.UUID
-	Embedding    []float32
+	Vector       []float32
 	ModelVersion string
 	CreatedAt    time.Time
 }

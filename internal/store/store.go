@@ -150,5 +150,7 @@ type EmbeddingStore interface {
 	// NearestNeighbors returns up to topK embeddings whose entity_type matches
 	// the supplied filter, ordered by ascending cosine distance (most similar first).
 	// Uses the HNSW index via the <=> operator.
+	// topK is clamped to [1, 200] by the implementation: values ≤ 0 default to 10,
+	// values > 200 are reduced to 200 to prevent full-index OOM scans.
 	NearestNeighbors(ctx context.Context, queryVec []float32, entityType domain.EmbeddingEntityType, topK int) ([]*domain.Embedding, error)
 }
