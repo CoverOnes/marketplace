@@ -866,7 +866,7 @@ func validateRoleInput(title, description string, maxCollaborators, profitShareB
 		return fmt.Errorf("%w: title must be 1-%d characters", domain.ErrValidation, maxRoleTitleRunes)
 	}
 
-	if err := sanitizeText(description); err != nil {
+	if err := sanitizeMultilineText(description); err != nil {
 		return fmt.Errorf("%w: description: %s", domain.ErrValidation, err)
 	}
 

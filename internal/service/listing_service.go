@@ -304,7 +304,7 @@ func validateListingInput(title, description string, budgetMin, budgetMax *decim
 		return fmt.Errorf("%w: title must be 1-200 characters", domain.ErrValidation)
 	}
 
-	if err := sanitizeText(description); err != nil {
+	if err := sanitizeMultilineText(description); err != nil {
 		return fmt.Errorf("%w: description: %s", domain.ErrValidation, err)
 	}
 
@@ -372,6 +372,25 @@ func sanitizeText(s string) error {
 		}
 
 		if r < 0x20 && r != '\t' {
+			return fmt.Errorf("contains ASCII control characters")
+		}
+	}
+
+	return nil
+}
+
+// sanitizeMultilineText validates multi-line free-text fields (e.g. listing /
+// tender description, which come from a textarea). Unlike sanitizeText it PERMITS
+// newlines and tabs (CR/LF/HT) so legitimate multi-line content is accepted, but
+// still rejects null bytes and all other ASCII control characters (e.g. ESC) to
+// keep the terminal-escape / log-injection surface closed (backend-security §5.4).
+func sanitizeMultilineText(s string) error {
+	for _, r := range s {
+		if r == '\x00' {
+			return fmt.Errorf("contains null byte")
+		}
+
+		if r < 0x20 && r != '\t' && r != '\n' && r != '\r' {
 			return fmt.Errorf("contains ASCII control characters")
 		}
 	}
