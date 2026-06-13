@@ -37,7 +37,7 @@ func TestMain(m *testing.M) {
 
 	ctr, err := tcpostgres.Run(
 		ctx,
-		"postgres:17-alpine",
+		"pgvector/pgvector:pg17",
 		tcpostgres.WithDatabase("testdb"),
 		tcpostgres.WithUsername("testuser"),
 		tcpostgres.WithPassword("testpass"),
@@ -131,7 +131,7 @@ func freshTestDB(t *testing.T) string {
 
 	ctr, err := tcpostgres.Run(
 		ctx,
-		"postgres:17-alpine",
+		"pgvector/pgvector:pg17",
 		tcpostgres.WithDatabase("testdb"),
 		tcpostgres.WithUsername("testuser"),
 		tcpostgres.WithPassword("testpass"),

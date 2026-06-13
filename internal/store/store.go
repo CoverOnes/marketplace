@@ -139,3 +139,16 @@ type TenderTxManager interface {
 		collaborators TenderCollaboratorStore,
 	) error) error
 }
+
+// EmbeddingStore defines persistence operations for vector embeddings.
+type EmbeddingStore interface {
+	// Upsert inserts or updates the embedding for (entityType, entityID).
+	// On conflict on (entity_type, entity_id) the embedding and model_version
+	// are updated in place; created_at is preserved from the original row.
+	Upsert(ctx context.Context, entityType domain.EmbeddingEntityType, entityID uuid.UUID, embedding []float32, modelVersion string) error
+
+	// NearestNeighbors returns up to topK embeddings whose entity_type matches
+	// the supplied filter, ordered by ascending cosine distance (most similar first).
+	// Uses the HNSW index via the <=> operator.
+	NearestNeighbors(ctx context.Context, queryVec []float32, entityType domain.EmbeddingEntityType, topK int) ([]*domain.Embedding, error)
+}
