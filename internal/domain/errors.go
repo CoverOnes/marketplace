@@ -28,6 +28,14 @@ var (
 	ErrTenderCollaboratorConflict = errors.New("a live application already exists for this role and vendor")
 	ErrInvalidTenderTransition    = errors.New("invalid tender status transition")
 	ErrNotTenderListing           = errors.New("listing is not a tender")
+	// ErrInvalidEmbeddingDimension is returned when the caller passes an embedding
+	// vector whose length is not the expected 1536 dimensions.
+	ErrInvalidEmbeddingDimension = errors.New("embedding must be 1536 dimensions")
+	// ErrInvalidEntityType is returned when the caller passes an entity_type value
+	// that is not in the domain allowlist (tender, vendor).
+	// Go-level validation prevents the raw pgx check_violation from surfacing (§5.2).
+	ErrInvalidEntityType = errors.New("embedding: unknown entity_type")
+
 	// ErrUpstreamWorkspace is returned when the synchronous S2S call to the workspace
 	// service fails. The collaborator row is already APPROVED (tx committed); P5 outbox
 	// will reconcile. Callers map this to HTTP 502.
