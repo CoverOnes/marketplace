@@ -40,4 +40,8 @@ var (
 	// service fails. The collaborator row is already APPROVED (tx committed); P5 outbox
 	// will reconcile. Callers map this to HTTP 502.
 	ErrUpstreamWorkspace = errors.New("upstream workspace service error")
+
+	// ErrAttachmentNotFound is returned when a listing attachment cannot be found
+	// or has already been detached.
+	ErrAttachmentNotFound = errors.New("attachment not found")
 )

@@ -140,6 +140,31 @@ type TenderTxManager interface {
 	) error) error
 }
 
+// ListingAttachmentStore defines persistence operations for listing attachments.
+// Attachments are soft-references to file_objects in the file service.
+// Referential integrity (file exists, STORED status, owner-match, MIME allowlist)
+// is enforced in the service layer on attach; the DB stores what was validated.
+type ListingAttachmentStore interface {
+	// Create inserts a new listing attachment record.
+	// Does NOT check file-service state — callers MUST validate before calling.
+	Create(ctx context.Context, a *domain.ListingAttachment) error
+
+	// GetByID returns the attachment with the given id, or ErrAttachmentNotFound.
+	GetByID(ctx context.Context, id uuid.UUID) (*domain.ListingAttachment, error)
+
+	// ListByListing returns all non-detached attachments for a listing,
+	// ordered by created_at ascending.
+	ListByListing(ctx context.Context, listingID uuid.UUID) ([]*domain.ListingAttachment, error)
+
+	// CountActiveByListing returns the number of non-detached attachments for a listing.
+	// Used by the service layer to enforce the 10-attachment cap atomically.
+	CountActiveByListing(ctx context.Context, listingID uuid.UUID) (int, error)
+
+	// Detach soft-deletes an attachment by setting detached_at and detached_by.
+	// Returns ErrAttachmentNotFound if the attachment does not exist or is already detached.
+	Detach(ctx context.Context, id, detachedBy uuid.UUID) error
+}
+
 // EmbeddingStore defines persistence operations for vector embeddings.
 type EmbeddingStore interface {
 	// Upsert inserts or updates the embedding for (entityType, entityID).
