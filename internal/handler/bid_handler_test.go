@@ -161,14 +161,43 @@ func (m *stubTxManagerH) WithTx(ctx context.Context, fn func(context.Context, st
 	return fn(ctx, m.listings, m.bids, m.awards)
 }
 
+// stubBidOutboxTxManagerH is a no-op BidOutboxTxManager for handler tests.
+// The outbox store passed to fn is a noopOutboxStoreH that discards all enqueued events.
+type stubBidOutboxTxManagerH struct {
+	listings store.ListingStore
+	bids     store.BidStore
+	awards   store.AwardStore
+}
+
+func (m *stubBidOutboxTxManagerH) WithBidOutboxTx(
+	ctx context.Context,
+	fn func(context.Context, store.ListingStore, store.BidStore, store.AwardStore, store.OutboxStore) error,
+) error {
+	return fn(ctx, m.listings, m.bids, m.awards, &noopOutboxStoreH{})
+}
+
+// noopOutboxStoreH discards all outbox operations in handler tests.
+type noopOutboxStoreH struct{}
+
+func (*noopOutboxStoreH) Enqueue(_ context.Context, _ *domain.OutboxEvent) error { return nil }
+func (*noopOutboxStoreH) PollReady(_ context.Context, _ int) ([]*domain.OutboxEvent, error) {
+	return nil, nil
+}
+func (*noopOutboxStoreH) MarkPublished(_ context.Context, _ uuid.UUID) error        { return nil }
+func (*noopOutboxStoreH) MarkFailed(_ context.Context, _ uuid.UUID, _ string) error { return nil }
+func (*noopOutboxStoreH) DeletePublishedBefore(_ context.Context, _ time.Time) (int64, error) {
+	return 0, nil
+}
+
 // buildBidRouter builds a test router with BidHandler wired.
 func buildBidRouter(listingStore store.ListingStore, bidStore store.BidStore, awardStore store.AwardStore) *gin.Engine {
 	gin.SetMode(gin.TestMode)
 
 	txMgr := &stubTxManagerH{listings: listingStore, bids: bidStore, awards: awardStore}
+	bidOutboxTxMgr := &stubBidOutboxTxManagerH{listings: listingStore, bids: bidStore, awards: awardStore}
 	publisher := events.NewNoopPublisher()
 
-	bidSvc := service.NewBidService(bidStore, listingStore, awardStore, txMgr, publisher, nil)
+	bidSvc := service.NewBidService(bidStore, listingStore, awardStore, txMgr, bidOutboxTxMgr, publisher, nil)
 	bidH := handler.NewBidHandler(bidSvc)
 
 	r := gin.New()

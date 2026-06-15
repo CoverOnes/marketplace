@@ -86,3 +86,71 @@ func (m *TenderTxManager) WithTenderTx(
 		return fn(ctx, txListings, txRoles, txCollaborators)
 	})
 }
+
+// OutboxTxManager implements store.OutboxTxManager using pgxpool.Pool.
+// It runs the business operation and outbox Enqueue in a single transaction so
+// events are never lost on server restart between commit and publish.
+type OutboxTxManager struct {
+	pool *pgxpool.Pool
+}
+
+// NewOutboxTxManager returns an OutboxTxManager backed by the given pool.
+func NewOutboxTxManager(pool *pgxpool.Pool) *OutboxTxManager {
+	return &OutboxTxManager{pool: pool}
+}
+
+// WithOutboxTx runs fn inside a single Postgres transaction with tender stores and
+// a transaction-scoped OutboxStore. If fn returns an error the transaction is rolled back.
+func (m *OutboxTxManager) WithOutboxTx(
+	ctx context.Context,
+	fn func(
+		ctx context.Context,
+		listings store.ListingStore,
+		roles store.TenderRoleStore,
+		collaborators store.TenderCollaboratorStore,
+		outbox store.OutboxStore,
+	) error,
+) error {
+	return runTx(ctx, m.pool, func(tx pgx.Tx) error {
+		txListings := &txListingStore{tx: tx}
+		txRoles := &txTenderRoleStore{tx: tx}
+		txCollaborators := &txTenderCollaboratorStore{tx: tx}
+		txOutbox := &txOutboxStore{tx: tx}
+
+		return fn(ctx, txListings, txRoles, txCollaborators, txOutbox)
+	})
+}
+
+// BidOutboxTxManager implements store.BidOutboxTxManager using pgxpool.Pool.
+// It runs the bid accept operation and outbox Enqueue in a single transaction
+// to standardize the ad-hoc bid_service MarkEventPublished flag onto the outbox.
+type BidOutboxTxManager struct {
+	pool *pgxpool.Pool
+}
+
+// NewBidOutboxTxManager returns a BidOutboxTxManager backed by the given pool.
+func NewBidOutboxTxManager(pool *pgxpool.Pool) *BidOutboxTxManager {
+	return &BidOutboxTxManager{pool: pool}
+}
+
+// WithBidOutboxTx runs fn inside a single Postgres transaction with bid stores
+// and a transaction-scoped OutboxStore. If fn returns an error the transaction is rolled back.
+func (m *BidOutboxTxManager) WithBidOutboxTx(
+	ctx context.Context,
+	fn func(
+		ctx context.Context,
+		listings store.ListingStore,
+		bids store.BidStore,
+		awards store.AwardStore,
+		outbox store.OutboxStore,
+	) error,
+) error {
+	return runTx(ctx, m.pool, func(tx pgx.Tx) error {
+		txListings := &txListingStore{tx: tx}
+		txBids := &txBidStore{tx: tx}
+		txAwards := &txAwardStore{tx: tx}
+		txOutbox := &txOutboxStore{tx: tx}
+
+		return fn(ctx, txListings, txBids, txAwards, txOutbox)
+	})
+}

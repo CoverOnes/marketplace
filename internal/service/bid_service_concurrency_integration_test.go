@@ -33,9 +33,10 @@ func buildTestService( //nolint:gocritic // unnamedResult: return types are self
 	listingStore := postgres.NewListingStore(pool)
 	awardStore := postgres.NewAwardStore(pool)
 	txMgr := postgres.NewTxManager(pool)
+	bidOutboxTxMgr := postgres.NewBidOutboxTxManager(pool)
 	publisher := events.NewNoopPublisher()
 
-	return service.NewBidService(bidStore, listingStore, awardStore, txMgr, publisher, nil), pool.Close
+	return service.NewBidService(bidStore, listingStore, awardStore, txMgr, bidOutboxTxMgr, publisher, nil), pool.Close
 }
 
 // insertTestListing inserts a listing directly via the store.

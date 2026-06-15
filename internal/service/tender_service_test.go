@@ -207,6 +207,82 @@ func (m *stubTenderTxManager) WithTenderTx(
 	return fn(ctx, m.listings, m.roles, m.collaborators)
 }
 
+// stubOutboxTxManager wraps OutboxTxManager with in-memory stores and a configurable outbox
+// so unit tests do not need a real DB for the same-tx enqueue path.
+type stubOutboxTxManager struct {
+	listings      store.ListingStore
+	roles         store.TenderRoleStore
+	collaborators store.TenderCollaboratorStore
+	// outboxStore overrides the outbox used inside the transaction.
+	// If nil, a noopTenderOutboxStore is used.
+	outboxStore store.OutboxStore
+}
+
+func (m *stubOutboxTxManager) WithOutboxTx(
+	ctx context.Context,
+	fn func(context.Context, store.ListingStore, store.TenderRoleStore, store.TenderCollaboratorStore, store.OutboxStore) error,
+) error {
+	ob := m.outboxStore
+	if ob == nil {
+		ob = &noopTenderOutboxStore{}
+	}
+
+	return fn(ctx, m.listings, m.roles, m.collaborators, ob)
+}
+
+// noopTenderOutboxStore satisfies store.OutboxStore for tender unit tests.
+type noopTenderOutboxStore struct{}
+
+func (*noopTenderOutboxStore) Enqueue(_ context.Context, _ *domain.OutboxEvent) error { return nil }
+func (*noopTenderOutboxStore) PollReady(_ context.Context, _ int) ([]*domain.OutboxEvent, error) {
+	return nil, nil
+}
+func (*noopTenderOutboxStore) MarkPublished(_ context.Context, _ uuid.UUID) error { return nil }
+func (*noopTenderOutboxStore) MarkFailed(_ context.Context, _ uuid.UUID, _ string) error {
+	return nil
+}
+
+func (*noopTenderOutboxStore) DeletePublishedBefore(_ context.Context, _ time.Time) (int64, error) {
+	return 0, nil
+}
+
+// recordingOutboxStore captures Enqueue calls for assertions in unit tests.
+type recordingOutboxStore struct {
+	mu       sync.Mutex
+	enqueued []*domain.OutboxEvent
+}
+
+func (r *recordingOutboxStore) Enqueue(_ context.Context, e *domain.OutboxEvent) error {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.enqueued = append(r.enqueued, e)
+
+	return nil
+}
+
+func (*recordingOutboxStore) PollReady(_ context.Context, _ int) ([]*domain.OutboxEvent, error) {
+	return nil, nil
+}
+
+func (*recordingOutboxStore) MarkPublished(_ context.Context, _ uuid.UUID) error { return nil }
+func (*recordingOutboxStore) MarkFailed(_ context.Context, _ uuid.UUID, _ string) error {
+	return nil
+}
+
+func (*recordingOutboxStore) DeletePublishedBefore(_ context.Context, _ time.Time) (int64, error) {
+	return 0, nil
+}
+
+func (r *recordingOutboxStore) enqueuedEvents() []*domain.OutboxEvent {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+
+	out := make([]*domain.OutboxEvent, len(r.enqueued))
+	copy(out, r.enqueued)
+
+	return out
+}
+
 // makeTenderListing creates a test tender listing with the given tender_status.
 func makeTenderListing(ownerID uuid.UUID, ts domain.TenderStatus) *domain.Listing {
 	return &domain.Listing{
@@ -233,8 +309,9 @@ func newTenderSvc(
 	ms store.TenderMilestoneStore,
 ) *service.TenderService {
 	txm := &stubTenderTxManager{listings: ls, roles: rs, collaborators: cs}
+	outboxTxm := &stubOutboxTxManager{listings: ls, roles: rs, collaborators: cs}
 
-	return service.NewTenderService(ls, rs, cs, ms, txm, nil, events.NewNoopPublisher())
+	return service.NewTenderService(ls, rs, cs, ms, txm, outboxTxm, nil, events.NewNoopPublisher())
 }
 
 // newTenderSvcWithWorkspace builds a TenderService with a custom workspace client.
@@ -246,22 +323,9 @@ func newTenderSvcWithWorkspace(
 	wc client.WorkspaceClient,
 ) *service.TenderService {
 	txm := &stubTenderTxManager{listings: ls, roles: rs, collaborators: cs}
+	outboxTxm := &stubOutboxTxManager{listings: ls, roles: rs, collaborators: cs}
 
-	return service.NewTenderService(ls, rs, cs, ms, txm, wc, events.NewNoopPublisher())
-}
-
-// newTenderSvcWithPublisher builds a TenderService with a custom publisher.
-func newTenderSvcWithPublisher(
-	ls store.ListingStore,
-	rs store.TenderRoleStore,
-	cs store.TenderCollaboratorStore,
-	ms store.TenderMilestoneStore,
-	wc client.WorkspaceClient,
-	pub events.Publisher,
-) *service.TenderService {
-	txm := &stubTenderTxManager{listings: ls, roles: rs, collaborators: cs}
-
-	return service.NewTenderService(ls, rs, cs, ms, txm, wc, pub)
+	return service.NewTenderService(ls, rs, cs, ms, txm, outboxTxm, wc, events.NewNoopPublisher())
 }
 
 // --- stub workspace client ---
@@ -283,59 +347,6 @@ func (s *stubWorkspaceClient) CreateContract(_ context.Context, _ *domain.Award)
 func (s *stubWorkspaceClient) AddPartyToContract(_ context.Context, _ client.AddPartyInput) error {
 	s.addPartyCallCount++
 	return s.addPartyErr
-}
-
-// --- stub publisher ---
-
-// stubPublisher is a fake Publisher that records calls and can be configured to return errors.
-// mu guards collaboratorJoinedCalls/Evts because publishCollaboratorJoinedAsync writes them
-// from a detached goroutine while test code polls/reads from the test goroutine — data race.
-type stubPublisher struct {
-	mu                      sync.Mutex
-	bidAcceptedCalls        int
-	collaboratorJoinedCalls int
-	collaboratorJoinedEvts  []*domain.CollaboratorJoinedEvent
-	bidAcceptedErr          error
-	collaboratorJoinedErr   error
-}
-
-func (p *stubPublisher) PublishBidAccepted(_ context.Context, _ *domain.BidAcceptedEvent) error {
-	p.mu.Lock()
-	defer p.mu.Unlock()
-
-	p.bidAcceptedCalls++
-
-	return p.bidAcceptedErr
-}
-
-func (p *stubPublisher) PublishCollaboratorJoined(_ context.Context, evt *domain.CollaboratorJoinedEvent) error {
-	p.mu.Lock()
-	defer p.mu.Unlock()
-
-	p.collaboratorJoinedCalls++
-	p.collaboratorJoinedEvts = append(p.collaboratorJoinedEvts, evt)
-
-	return p.collaboratorJoinedErr
-}
-
-// collaboratorJoinedCount returns the current call count under the mutex.
-// Used by tests polling the async-publish goroutine result.
-func (p *stubPublisher) collaboratorJoinedCount() int {
-	p.mu.Lock()
-	defer p.mu.Unlock()
-
-	return p.collaboratorJoinedCalls
-}
-
-// collaboratorJoinedEvents returns a snapshot of recorded events under the mutex.
-func (p *stubPublisher) collaboratorJoinedEvents() []*domain.CollaboratorJoinedEvent {
-	p.mu.Lock()
-	defer p.mu.Unlock()
-
-	out := make([]*domain.CollaboratorJoinedEvent, len(p.collaboratorJoinedEvts))
-	copy(out, p.collaboratorJoinedEvts)
-
-	return out
 }
 
 // --- Fix 2: ApplyToRole tender_status gate ---
@@ -1441,10 +1452,10 @@ func TestAcceptCollaborator_NonExecuting_NoWorkspaceCall(t *testing.T) {
 	}
 }
 
-// TestCollaboratorJoined_EventPublished verifies the collaborator_joined event is
-// published (best-effort, via mock publisher) when accepting on an EXECUTING tender.
-// The goroutine is given a short sleep to allow the async publish to complete in tests.
-func TestCollaboratorJoined_EventPublished(t *testing.T) {
+// TestCollaboratorJoined_EnqueuedToOutbox verifies that AcceptCollaborator enqueues
+// a collaborator_joined event into the outbox store (same-tx outbox pattern).
+// Event delivery to Redis is handled by the outbox poller; this test covers the enqueue side.
+func TestCollaboratorJoined_EnqueuedToOutbox(t *testing.T) {
 	t.Parallel()
 
 	ownerID := uuid.New()
@@ -1468,13 +1479,17 @@ func TestCollaboratorJoined_EventPublished(t *testing.T) {
 	}
 
 	wc := &stubWorkspaceClient{}
-	pub := &stubPublisher{}
+	recOutbox := &recordingOutboxStore{}
 
 	ls := newStubListingStore(listing)
 	rs := newStubTenderRoleStore(role)
 	cs := newStubTenderCollaboratorStore(collab)
 	ms := newStubTenderMilestoneStore()
-	svc := newTenderSvcWithPublisher(ls, rs, cs, ms, wc, pub)
+
+	// Wire the recording outbox store into the outbox tx manager.
+	txm := &stubTenderTxManager{listings: ls, roles: rs, collaborators: cs}
+	outboxTxm := &stubOutboxTxManager{listings: ls, roles: rs, collaborators: cs, outboxStore: recOutbox}
+	svc := service.NewTenderService(ls, rs, cs, ms, txm, outboxTxm, wc, events.NewNoopPublisher())
 
 	_, err := svc.AcceptCollaborator(context.Background(), &service.AcceptCollaboratorInput{
 		CollaboratorID: collab.ID,
@@ -1482,23 +1497,15 @@ func TestCollaboratorJoined_EventPublished(t *testing.T) {
 	})
 	require.NoError(t, err)
 
-	// Allow the async goroutine to complete; poll via the mutex-guarded accessor.
-	deadline := time.Now().Add(2 * time.Second)
-	for time.Now().Before(deadline) {
-		if pub.collaboratorJoinedCount() > 0 {
-			break
-		}
+	// AcceptCollaborator enqueues synchronously inside the transaction closure.
+	// No goroutine needed — check immediately.
+	enqueued := recOutbox.enqueuedEvents()
+	require.Len(t, enqueued, 1, "collaborator_joined must be enqueued to the outbox exactly once")
 
-		time.Sleep(10 * time.Millisecond)
-	}
-
-	assert.Equal(t, 1, pub.collaboratorJoinedCount(), "collaborator_joined must be published once")
-	evts := pub.collaboratorJoinedEvents()
-	require.Len(t, evts, 1)
-
-	evt := evts[0]
-	assert.Equal(t, "EXECUTING", evt.Data.TenderStatus)
-	assert.Equal(t, listing.ID, evt.Data.TenderID)
-	assert.Equal(t, collab.ID, evt.Data.CollaboratorID)
-	assert.Equal(t, vendorID, evt.Data.VendorUserID)
+	evt := enqueued[0]
+	assert.Equal(t, "tender", evt.AggregateType)
+	assert.Equal(t, listing.ID, evt.AggregateID)
+	assert.Equal(t, "marketplace.collaborator_joined", evt.Channel)
+	assert.NotEmpty(t, evt.Payload, "outbox payload must not be empty")
+	assert.Nil(t, evt.PublishedAt, "freshly enqueued event must not yet be published")
 }

@@ -10,6 +10,7 @@ import (
 	"github.com/CoverOnes/marketplace/internal/client"
 	"github.com/CoverOnes/marketplace/internal/domain"
 	"github.com/CoverOnes/marketplace/internal/events"
+	"github.com/CoverOnes/marketplace/internal/outbox"
 	"github.com/CoverOnes/marketplace/internal/store"
 	"github.com/google/uuid"
 )
@@ -22,7 +23,8 @@ type TenderService struct {
 	roles           store.TenderRoleStore
 	collaborators   store.TenderCollaboratorStore
 	milestones      store.TenderMilestoneStore
-	tenderTx        store.TenderTxManager
+	tenderTx        store.TenderTxManager  // used by non-outbox operations
+	outboxTx        store.OutboxTxManager  // used by AcceptCollaborator (same-tx enqueue)
 	workspaceClient client.WorkspaceClient // nil = workspace call skipped (dev/test)
 	publisher       events.Publisher
 }
@@ -30,12 +32,15 @@ type TenderService struct {
 // NewTenderService returns a TenderService.
 // workspaceClient may be nil; when nil the add-party call is skipped (local dev).
 // publisher must not be nil; pass events.NewNoopPublisher() when Redis is absent.
+// outboxTx wraps AcceptCollaborator's transaction so collaborator_joined events are
+// enqueued in the same DB transaction (same-tx outbox pattern).
 func NewTenderService(
 	listings store.ListingStore,
 	roles store.TenderRoleStore,
 	collaborators store.TenderCollaboratorStore,
 	milestones store.TenderMilestoneStore,
 	tenderTx store.TenderTxManager,
+	outboxTx store.OutboxTxManager,
 	workspaceClient client.WorkspaceClient,
 	publisher events.Publisher,
 ) *TenderService {
@@ -45,6 +50,7 @@ func NewTenderService(
 		collaborators:   collaborators,
 		milestones:      milestones,
 		tenderTx:        tenderTx,
+		outboxTx:        outboxTx,
 		workspaceClient: workspaceClient,
 		publisher:       publisher,
 	}
@@ -278,25 +284,48 @@ func (s *TenderService) AcceptCollaborator(ctx context.Context, in *AcceptCollab
 	// tenderStatus is captured from the locked listing INSIDE the transaction via closure.
 	var capturedTenderStatus domain.TenderStatus
 
-	txErr := s.tenderTx.WithTenderTx(ctx, func(
+	// Use outboxTx so the collaborator_joined event is enqueued in the same DB
+	// transaction as the collaborator row mutation (same-tx outbox pattern).
+	// This replaces the ad-hoc publishCollaboratorJoinedAsync goroutine.
+	txErr := s.outboxTx.WithOutboxTx(ctx, func(
 		txCtx context.Context,
 		txListings store.ListingStore,
 		txRoles store.TenderRoleStore,
 		txCollaborators store.TenderCollaboratorStore,
+		txOutbox store.OutboxStore,
 	) error {
 		var innerErr error
 		result, capturedTenderStatus, innerErr = s.acceptCollaboratorTx(
 			txCtx, in, preflight.TenderRoleID, txListings, txRoles, txCollaborators,
 		)
+		if innerErr != nil {
+			return innerErr
+		}
 
-		return innerErr
+		// Enqueue collaborator_joined in the same transaction.
+		// The outbox poller delivers it after commit; consumers dedup on event_id.
+		roleID := result.TenderRoleID
+		evt := domain.CollaboratorJoinedEvent{
+			EventID:    uuid.New().String(),
+			OccurredAt: time.Now().UTC(),
+			Version:    1,
+			Data: domain.CollaboratorJoinedData{
+				TenderID:       result.ListingID,
+				CollaboratorID: result.ID,
+				VendorUserID:   result.VendorUserID,
+				RoleID:         &roleID,
+				TenderStatus:   string(capturedTenderStatus),
+			},
+		}
+
+		return outbox.EnqueueCollaboratorJoined(txCtx, txOutbox, &evt)
 	})
 	if txErr != nil {
 		return result, txErr
 	}
 
 	// Post-tx: if tender is EXECUTING, synchronously call workspace to add the party.
-	// Failure is surfaces as 502 — collaborator stays APPROVED; P5 outbox reconciles.
+	// Failure is surfaced as 502 — collaborator stays APPROVED; outbox reconciles.
 	if capturedTenderStatus == domain.TenderStatusExecuting {
 		if wsErr := s.addPartyToWorkspace(ctx, result, in.CallerID, capturedTenderStatus); wsErr != nil {
 			return result, wsErr
@@ -345,46 +374,10 @@ func (s *TenderService) addPartyToWorkspace(
 		return fmt.Errorf("%w: %s", domain.ErrUpstreamWorkspace, err)
 	}
 
-	// §14 event: best-effort detached goroutine; only when accept happened on EXECUTING.
-	s.publishCollaboratorJoinedAsync(ctx, collab, tenderStatus)
+	// collaborator_joined event is enqueued in the same DB transaction in
+	// AcceptCollaborator via outboxTx — no additional publish needed here.
 
 	return nil
-}
-
-// publishCollaboratorJoinedAsync publishes marketplace.collaborator_joined in a detached
-// goroutine after the tx commits and workspace call succeeds. Best-effort: failures are
-// logged but never propagated.
-// The ctx parameter is accepted only for contextcheck call-chain analysis; the detached
-// goroutine deliberately uses context.Background() (backend-security §5).
-func (s *TenderService) publishCollaboratorJoinedAsync(_ context.Context, collab *domain.TenderCollaborator, tenderStatus domain.TenderStatus) {
-	go func() { //nolint:contextcheck,gosec // G118+contextcheck: detached context per backend-security §5; goroutine must not be canceled on client disconnect
-		publishCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-		defer cancel()
-
-		roleID := collab.TenderRoleID
-
-		evt := domain.CollaboratorJoinedEvent{
-			EventID:    uuid.New().String(),
-			OccurredAt: time.Now().UTC(),
-			Version:    1,
-			Data: domain.CollaboratorJoinedData{
-				TenderID:       collab.ListingID,
-				CollaboratorID: collab.ID,
-				VendorUserID:   collab.VendorUserID,
-				RoleID:         &roleID,
-				TenderStatus:   string(tenderStatus),
-			},
-		}
-
-		if pubErr := s.publisher.PublishCollaboratorJoined(publishCtx, &evt); pubErr != nil {
-			slog.Warn(
-				"collaborator_joined publish failed; collaborator row is authoritative",
-				"collaborator_id", collab.ID,
-				"tender_id", collab.ListingID,
-				"err", pubErr,
-			)
-		}
-	}()
 }
 
 // acceptCollaboratorTx is the transactional body of AcceptCollaborator.

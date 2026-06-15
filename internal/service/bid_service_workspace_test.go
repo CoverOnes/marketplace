@@ -95,14 +95,15 @@ type decodedWSBody struct {
 // acceptFixture bundles the stores, tx manager and the canonical IDs for an
 // AcceptBid scenario so tests can set up a service in one line.
 type acceptFixture struct {
-	listings  *stubListingStore
-	bids      *stubBidStore
-	awards    *stubAwardStore
-	txMgr     *stubTxManager
-	ownerID   uuid.UUID
-	bidderID  uuid.UUID
-	listingID uuid.UUID
-	bidID     uuid.UUID
+	listings       *stubListingStore
+	bids           *stubBidStore
+	awards         *stubAwardStore
+	txMgr          *stubTxManager
+	bidOutboxTxMgr *stubBidOutboxTxManager
+	ownerID        uuid.UUID
+	bidderID       uuid.UUID
+	listingID      uuid.UUID
+	bidID          uuid.UUID
 }
 
 func newAcceptFixture(t *testing.T) acceptFixture {
@@ -139,16 +140,18 @@ func newAcceptFixture(t *testing.T) acceptFixture {
 	bidStore := newStubBidStore(bid)
 	awardStore := newStubAwardStore()
 	txMgr := &stubTxManager{listings: listingStore, bids: bidStore, awards: awardStore}
+	bidOutboxTxMgr := &stubBidOutboxTxManager{listings: listingStore, bids: bidStore, awards: awardStore}
 
 	return acceptFixture{
-		listings:  listingStore,
-		bids:      bidStore,
-		awards:    awardStore,
-		txMgr:     txMgr,
-		ownerID:   ownerID,
-		bidderID:  bidderID,
-		listingID: listingID,
-		bidID:     bidID,
+		listings:       listingStore,
+		bids:           bidStore,
+		awards:         awardStore,
+		txMgr:          txMgr,
+		bidOutboxTxMgr: bidOutboxTxMgr,
+		ownerID:        ownerID,
+		bidderID:       bidderID,
+		listingID:      listingID,
+		bidID:          bidID,
 	}
 }
 
@@ -163,7 +166,7 @@ func TestBidService_AcceptBid_FiresWorkspaceContract(t *testing.T) {
 	fake := newFakeWorkspaceClient()
 	publisher := events.NewNoopPublisher()
 
-	svc := service.NewBidService(fx.bids, fx.listings, fx.awards, fx.txMgr, publisher, fake)
+	svc := service.NewBidService(fx.bids, fx.listings, fx.awards, fx.txMgr, fx.bidOutboxTxMgr, publisher, fake)
 
 	award, err := svc.AcceptBid(context.Background(), fx.bidID, fx.ownerID)
 	require.NoError(t, err)
@@ -221,7 +224,7 @@ func TestBidService_AcceptBid_WorkspaceWireMapping(t *testing.T) {
 	realClient := client.NewHTTPWorkspaceClient(srv.URL, wsTestServiceToken)
 	publisher := events.NewNoopPublisher()
 
-	svc := service.NewBidService(fx.bids, fx.listings, fx.awards, fx.txMgr, publisher, realClient)
+	svc := service.NewBidService(fx.bids, fx.listings, fx.awards, fx.txMgr, fx.bidOutboxTxMgr, publisher, realClient)
 
 	_, err := svc.AcceptBid(context.Background(), fx.bidID, fx.ownerID)
 	require.NoError(t, err)
@@ -257,7 +260,7 @@ func TestBidService_AcceptBid_NilWorkspaceClientNoPanic(t *testing.T) {
 	publisher := events.NewNoopPublisher()
 
 	// nil workspace client — createWorkspaceContractAsync must early-return, never panic.
-	svc := service.NewBidService(fx.bids, fx.listings, fx.awards, fx.txMgr, publisher, nil)
+	svc := service.NewBidService(fx.bids, fx.listings, fx.awards, fx.txMgr, fx.bidOutboxTxMgr, publisher, nil)
 
 	var award *domain.Award
 

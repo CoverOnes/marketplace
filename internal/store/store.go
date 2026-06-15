@@ -140,6 +140,56 @@ type TenderTxManager interface {
 	) error) error
 }
 
+// OutboxStore defines persistence operations for the transactional outbox.
+// All Enqueue calls MUST be made inside the same DB transaction as the business
+// operation they represent (same-tx enqueue pattern).
+type OutboxStore interface {
+	// Enqueue inserts a new outbox event row. MUST be called inside an active
+	// transaction (via OutboxTxManager.WithOutboxTx) for the same-tx guarantee.
+	Enqueue(ctx context.Context, e *domain.OutboxEvent) error
+
+	// PollReady returns up to limit unpublished rows whose next_attempt_at <= now,
+	// locking them with SELECT ... FOR UPDATE SKIP LOCKED so concurrent pollers
+	// each claim a disjoint set.
+	PollReady(ctx context.Context, limit int) ([]*domain.OutboxEvent, error)
+
+	// MarkPublished sets published_at = now() for the given row.
+	MarkPublished(ctx context.Context, id uuid.UUID) error
+
+	// MarkFailed increments attempts, sets last_error, and advances next_attempt_at
+	// using exponential backoff (2^attempts seconds, capped at 10 minutes).
+	MarkFailed(ctx context.Context, id uuid.UUID, lastErr string) error
+
+	// DeletePublishedBefore removes rows with published_at < cutoff.
+	// Retention housekeeping: called by the poller on each cycle.
+	DeletePublishedBefore(ctx context.Context, cutoff time.Time) (int64, error)
+}
+
+// OutboxTxManager wraps the tender business operation + outbox Enqueue in a single
+// Postgres transaction, fulfilling the same-tx enqueue requirement.
+type OutboxTxManager interface {
+	WithOutboxTx(ctx context.Context, fn func(
+		ctx context.Context,
+		listings ListingStore,
+		roles TenderRoleStore,
+		collaborators TenderCollaboratorStore,
+		outbox OutboxStore,
+	) error) error
+}
+
+// BidOutboxTxManager wraps the bid accept operation + outbox Enqueue in a single
+// Postgres transaction, standardizing the ad-hoc bid_service MarkEventPublished
+// flag onto the outbox (same-tx enqueue pattern).
+type BidOutboxTxManager interface {
+	WithBidOutboxTx(ctx context.Context, fn func(
+		ctx context.Context,
+		listings ListingStore,
+		bids BidStore,
+		awards AwardStore,
+		outbox OutboxStore,
+	) error) error
+}
+
 // ListingAttachmentStore defines persistence operations for listing attachments.
 // Attachments are soft-references to file_objects in the file service.
 // Referential integrity (file exists, STORED status, owner-match, MIME allowlist)
