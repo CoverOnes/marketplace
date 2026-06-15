@@ -145,7 +145,8 @@ func (p *Poller) processEvent(evt *domain.OutboxEvent) {
 	defer markCancel()
 
 	if pubErr != nil {
-		slog.Warn("outbox publish failed; will retry",
+		slog.Warn(
+			"outbox publish failed; will retry",
 			"event_id", evt.EventID,
 			"channel", evt.Channel,
 			"attempts", evt.Attempts+1,
@@ -160,7 +161,8 @@ func (p *Poller) processEvent(evt *domain.OutboxEvent) {
 	}
 
 	if markErr := p.outbox.MarkPublished(markCtx, evt.ID); markErr != nil {
-		slog.Warn("outbox mark-published failed; event was delivered but may be re-delivered",
+		slog.Warn(
+			"outbox mark-published failed; event was delivered but may be re-delivered",
 			"outbox_id", evt.ID,
 			"event_id", evt.EventID,
 			"err", markErr,

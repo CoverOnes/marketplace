@@ -6,9 +6,10 @@
 --   * Same-transaction enqueue: INSERT into event_outbox inside the same DB tx as
 --     the business operation so events are never lost on server restart between
 --     commit and publish.
---   * In-process poller: SELECT ... FOR UPDATE SKIP LOCKED → publish to Redis → mark
---     published_at. Failed attempts increment attempts + exponential backoff
---     (tracked via next_attempt_at).
+--   * Atomic-claim poller: FetchPending uses a CTE that atomically sets
+--     claimed_until = now() + 30s for rows it claims, so concurrent pollers skip
+--     rows already in-flight. claimed_until is cleared by MarkPublished /
+--     MarkFailed, making the row eligible for the next poll cycle.
 --   * Retention: published rows deleted after 7 days by the poller's housekeeping
 --     pass. Unpublished rows are NEVER deleted by retention — manual reconciliation
 --     required if they age > 1 hour (slog.Warn alert in poller).
@@ -17,17 +18,18 @@
 --     is NOT (duplicate publishes can occur after crash between publish and mark).
 
 CREATE TABLE event_outbox (
-    id             uuid        PRIMARY KEY DEFAULT gen_random_uuid(),
-    aggregate_type text        NOT NULL CHECK (char_length(aggregate_type) BETWEEN 1 AND 127),
-    aggregate_id   uuid        NOT NULL,
-    event_id       uuid        NOT NULL,
-    channel        text        NOT NULL CHECK (char_length(channel) BETWEEN 1 AND 255),
-    payload        bytea       NOT NULL,
-    created_at     timestamptz NOT NULL DEFAULT now(),
-    published_at   timestamptz,
-    attempts       int         NOT NULL DEFAULT 0 CHECK (attempts >= 0),
-    last_error     text,
+    id              uuid        PRIMARY KEY DEFAULT gen_random_uuid(),
+    aggregate_type  text        NOT NULL CHECK (char_length(aggregate_type) BETWEEN 1 AND 127),
+    aggregate_id    uuid        NOT NULL,
+    event_id        uuid        NOT NULL,
+    channel         text        NOT NULL CHECK (char_length(channel) BETWEEN 1 AND 255),
+    payload         bytea       NOT NULL,
+    created_at      timestamptz NOT NULL DEFAULT now(),
+    published_at    timestamptz,
+    attempts        int         NOT NULL DEFAULT 0 CHECK (attempts >= 0),
+    last_error      text,
     next_attempt_at timestamptz NOT NULL DEFAULT now(),
+    claimed_until   timestamptz,
     CONSTRAINT event_outbox_event_id_unique UNIQUE (event_id)
 );
 

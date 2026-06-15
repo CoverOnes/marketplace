@@ -14,6 +14,9 @@ import (
 // in their own idempotency table and skip duplicates. The outbox guarantees
 // at-least-once delivery; exactly-once is NOT guaranteed (a crash between publish
 // and mark can cause a re-deliver).
+//
+// ClaimedUntil is set atomically by PollReady to prevent concurrent pollers from
+// picking up the same row. MarkPublished and MarkFailed both clear it.
 type OutboxEvent struct {
 	ID            uuid.UUID
 	AggregateType string
@@ -26,4 +29,5 @@ type OutboxEvent struct {
 	Attempts      int
 	LastError     *string
 	NextAttemptAt time.Time
+	ClaimedUntil  *time.Time
 }
