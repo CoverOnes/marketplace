@@ -2,6 +2,7 @@ package service
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"log/slog"
 	"time"
@@ -19,7 +20,8 @@ type BidService struct {
 	bids            store.BidStore
 	listings        store.ListingStore
 	awards          store.AwardStore
-	txManager       store.TxManager
+	txManager       store.TxManager          // used by RejectBid, WithdrawBid
+	bidOutboxTx     store.BidOutboxTxManager // used by AcceptBid (same-tx outbox enqueue)
 	publisher       events.Publisher
 	workspaceClient client.WorkspaceClient // nil = workspace call skipped (dev/test)
 }
@@ -27,11 +29,14 @@ type BidService struct {
 // NewBidService returns a BidService.
 // workspaceClient may be nil; when nil, the workspace contract-create call is
 // skipped (useful for local dev without the workspace service running).
+// bidOutboxTx wraps AcceptBid's transaction so the bid_accepted event is enqueued
+// in the same DB transaction as the award row (same-tx outbox pattern).
 func NewBidService(
 	bids store.BidStore,
 	listings store.ListingStore,
 	awards store.AwardStore,
 	txManager store.TxManager,
+	bidOutboxTx store.BidOutboxTxManager,
 	publisher events.Publisher,
 	workspaceClient client.WorkspaceClient,
 ) *BidService {
@@ -40,6 +45,7 @@ func NewBidService(
 		listings:        listings,
 		awards:          awards,
 		txManager:       txManager,
+		bidOutboxTx:     bidOutboxTx,
 		publisher:       publisher,
 		workspaceClient: workspaceClient,
 	}
@@ -176,8 +182,18 @@ func (s *BidService) AcceptBid(ctx context.Context, bidID, callerID uuid.UUID) (
 
 	var award *domain.Award
 
-	// Atomic transaction: lock both rows, re-check invariants, then mutate.
-	err = s.txManager.WithTx(ctx, func(txCtx context.Context, txListings store.ListingStore, txBids store.BidStore, txAwards store.AwardStore) error {
+	// Atomic transaction: lock both rows, re-check invariants, mutate, and enqueue
+	// the bid_accepted event into the outbox — all in a single DB transaction.
+	// The outbox poller delivers the event after commit (at-least-once; consumers
+	// must dedup on event_id). This replaces the ad-hoc publishBidAcceptedAsync
+	// goroutine + MarkEventPublished flag pattern.
+	err = s.bidOutboxTx.WithBidOutboxTx(ctx, func(
+		txCtx context.Context,
+		txListings store.ListingStore,
+		txBids store.BidStore,
+		txAwards store.AwardStore,
+		txOutbox store.OutboxStore,
+	) error {
 		// 1. Lock bid row first (lower PK in lock-ordering convention → bid then listing
 		//    avoids deadlock when paired with listing-first paths; both rows always locked
 		//    in the same order here since AcceptBid is the only path that locks both).
@@ -251,57 +267,53 @@ func (s *BidService) AcceptBid(ctx context.Context, bidID, callerID uuid.UUID) (
 			return fmt.Errorf("create award: %w", insertErr)
 		}
 
+		// 7. Enqueue bid_accepted event in the same transaction (same-tx outbox pattern).
+		// The outbox poller delivers it after commit; consumers must dedup on event_id.
+		if enqueueErr := enqueueBidAccepted(txCtx, txOutbox, award); enqueueErr != nil {
+			return fmt.Errorf("enqueue bid_accepted outbox: %w", enqueueErr)
+		}
+
 		return nil
 	})
 	if err != nil {
 		return nil, err
 	}
 
-	// After commit: best-effort side effects, each in a detached goroutine so a
-	// client disconnect does not suppress them (backend-security §5 — goroutine
-	// MUST NOT inherit request context). ctx is passed only to satisfy the
-	// contextcheck call-chain analysis; it is intentionally NOT propagated into
-	// the detached goroutines, which build their own context.Background().
-	s.publishBidAcceptedAsync(ctx, award)
+	// After commit: workspace S2S call in a detached goroutine (backend-security §5).
+	// Event delivery is now handled by the outbox poller — no publish goroutine needed.
 	s.createWorkspaceContractAsync(ctx, award)
 
 	return award, nil
 }
 
-// publishBidAcceptedAsync publishes marketplace.bid_accepted and marks the award
-// as published, all best-effort in a detached goroutine. Failures are logged but
-// never propagated — the committed award row is authoritative.
-// The ctx parameter is accepted only for contextcheck call-chain analysis; the
-// detached goroutine deliberately uses context.Background() (backend-security §5).
-func (s *BidService) publishBidAcceptedAsync(_ context.Context, award *domain.Award) {
-	go func() { //nolint:contextcheck,gosec // G118+contextcheck: detached context per backend-security §5; goroutine must not be canceled on client disconnect
-		publishCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-		defer cancel()
+// enqueueBidAccepted builds and enqueues a bid_accepted outbox event.
+// MUST be called inside an active transaction.
+func enqueueBidAccepted(ctx context.Context, ob store.OutboxStore, award *domain.Award) error {
+	evt := buildBidAcceptedEvent(award)
 
-		evt := buildBidAcceptedEvent(award)
+	payload, err := json.Marshal(evt)
+	if err != nil {
+		return fmt.Errorf("marshal bid_accepted event: %w", err)
+	}
 
-		if pubErr := s.publisher.PublishBidAccepted(publishCtx, &evt); pubErr != nil {
-			slog.Warn(
-				"bid_accepted publish failed; award row is authoritative",
-				"award_id", award.ID,
-				"err", pubErr,
-			)
+	eventID, err := uuid.Parse(evt.EventID)
+	if err != nil {
+		return fmt.Errorf("parse bid_accepted event_id: %w", err)
+	}
 
-			return
-		}
+	now := time.Now().UTC()
+	row := &domain.OutboxEvent{
+		ID:            uuid.New(),
+		AggregateType: "bid",
+		AggregateID:   award.ID,
+		EventID:       eventID,
+		Channel:       "marketplace.bid_accepted",
+		Payload:       payload,
+		CreatedAt:     now,
+		NextAttemptAt: now,
+	}
 
-		// Mark event_published_at in DB — best-effort, non-fatal on failure.
-		markCtx, markCancel := context.WithTimeout(context.Background(), 5*time.Second)
-		defer markCancel()
-
-		if markErr := s.awards.MarkEventPublished(markCtx, award.ID); markErr != nil {
-			slog.Warn(
-				"mark award event_published_at failed",
-				"award_id", award.ID,
-				"err", markErr,
-			)
-		}
-	}()
+	return ob.Enqueue(ctx, row)
 }
 
 // createWorkspaceContractAsync performs the server-to-server contract creation:

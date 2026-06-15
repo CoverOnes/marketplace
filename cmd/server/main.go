@@ -17,6 +17,7 @@ import (
 	"github.com/CoverOnes/marketplace/internal/config"
 	"github.com/CoverOnes/marketplace/internal/events"
 	"github.com/CoverOnes/marketplace/internal/handler"
+	"github.com/CoverOnes/marketplace/internal/outbox"
 	"github.com/CoverOnes/marketplace/internal/platform/logger"
 	"github.com/CoverOnes/marketplace/internal/service"
 	"github.com/CoverOnes/marketplace/internal/store/postgres"
@@ -145,12 +146,17 @@ func run() error {
 	bidStore := postgres.NewBidStore(pool)
 	awardStore := postgres.NewAwardStore(pool)
 	txManager := postgres.NewTxManager(pool)
+	bidOutboxTxManager := postgres.NewBidOutboxTxManager(pool)
 
 	// Tender store layer.
 	tenderRoleStore := postgres.NewTenderRoleStore(pool)
 	tenderCollabStore := postgres.NewTenderCollaboratorStore(pool)
 	tenderMilestoneStore := postgres.NewTenderMilestoneStore(pool)
 	tenderTxManager := postgres.NewTenderTxManager(pool)
+	outboxTxManager := postgres.NewOutboxTxManager(pool)
+
+	// Outbox store (for poller housekeeping — pool-backed).
+	outboxStore := postgres.NewOutboxStore(pool)
 
 	// Workspace S2S client (M-2 fix): marketplace calls workspace after AcceptBid
 	// to create the contract with authoritative award values.
@@ -165,16 +171,24 @@ func run() error {
 
 	// Service layer.
 	listingSvc := service.NewListingService(listingStore)
-	bidSvc := service.NewBidService(bidStore, listingStore, awardStore, txManager, publisher, workspaceClient)
+	bidSvc := service.NewBidService(bidStore, listingStore, awardStore, txManager, bidOutboxTxManager, publisher, workspaceClient)
 	tenderSvc := service.NewTenderService(
 		listingStore,
 		tenderRoleStore,
 		tenderCollabStore,
 		tenderMilestoneStore,
 		tenderTxManager,
+		outboxTxManager,
 		workspaceClient,
 		publisher,
 	)
+
+	// Outbox poller — start only when Redis is available; interval from env (default 2s).
+	// The poller goroutine is canceled on graceful shutdown via pollerCtx.
+	pollerCtx, pollerCancel := context.WithCancel(ctx)
+	defer pollerCancel()
+
+	startOutboxPoller(pollerCtx, redisClient, outboxStore)
 
 	// Router.
 	r := handler.NewRouter(handler.RouterConfig{
@@ -222,4 +236,52 @@ func run() error {
 	slog.Info("server stopped")
 
 	return nil
+}
+
+// startOutboxPoller starts the transactional outbox poller when redisClient is non-nil.
+// It reads the poll interval from MARKETPLACE_OUTBOX_POLL_INTERVAL (default 2s).
+// The poller goroutine runs until ctx is canceled.
+func startOutboxPoller(ctx context.Context, rdb *redis.Client, outboxStore *postgres.OutboxStore) {
+	if rdb == nil {
+		slog.Warn("redis not configured; outbox poller disabled — events will not be delivered")
+
+		return
+	}
+
+	interval := outboxPollInterval()
+	rawPublisher := outbox.NewRedisRawPublisher(rdb)
+	poller := outbox.NewPoller(outboxStore, rawPublisher, interval)
+
+	go func() {
+		poller.Run(ctx)
+	}()
+
+	slog.Info("outbox poller started", "interval", interval.String())
+}
+
+// outboxPollInterval parses MARKETPLACE_OUTBOX_POLL_INTERVAL and returns the
+// configured duration, or the default 2s when the env var is absent or invalid.
+func outboxPollInterval() time.Duration {
+	const defaultInterval = 2 * time.Second
+
+	v := os.Getenv("MARKETPLACE_OUTBOX_POLL_INTERVAL")
+	if v == "" {
+		return defaultInterval
+	}
+
+	d, err := time.ParseDuration(v)
+	if err != nil || d <= 0 {
+		// Truncate the raw value to prevent log-line flooding (G706: operator env, not user input).
+		truncated := v
+		if len(truncated) > 64 {
+			truncated = truncated[:64]
+		}
+
+		//nolint:gosec // G706 false positive: truncated is an operator-controlled env var, not user input; already capped to 64 chars
+		slog.Warn("invalid MARKETPLACE_OUTBOX_POLL_INTERVAL; using default 2s", "raw", truncated)
+
+		return defaultInterval
+	}
+
+	return d
 }
