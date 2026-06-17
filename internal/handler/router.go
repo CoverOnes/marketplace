@@ -42,7 +42,7 @@ type RouterConfig struct {
 // CORS handling. Adding permissive CORS here would widen the attack surface without
 // benefit (CONVENTIONS §9 positions CORS after the access-log in the chain but
 // the gateway/edge handles it before requests reach this service).
-func NewRouter(cfg RouterConfig) *gin.Engine {
+func NewRouter(cfg *RouterConfig) *gin.Engine {
 	gin.SetMode(gin.ReleaseMode)
 
 	r := gin.New()
