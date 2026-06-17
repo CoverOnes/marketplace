@@ -14,6 +14,17 @@ import (
 )
 
 // makeOutboxEvent builds a minimal domain.OutboxEvent for testing.
+//
+// next_attempt_at is set one minute in the PAST. PollReady gates on
+// `next_attempt_at <= now()` where now() is the Postgres container clock,
+// while this timestamp is computed from the host wall-clock. On macOS the
+// Postgres testcontainer runs inside a Linux VM whose clock can drift relative
+// to the host (skew grows under load / after the host sleeps). If next_attempt_at
+// were set to the host "now", a small host-ahead skew would make the event appear
+// not-yet-due and PollReady would silently skip it — producing flaky, run-order-
+// dependent failures. Backdating by a minute is far larger than any realistic VM
+// skew and matches production semantics (an event is enqueued, then polled later),
+// so the event is unambiguously due on the first poll.
 func makeOutboxEvent(aggregateID uuid.UUID, channel string) *domain.OutboxEvent {
 	now := time.Now().UTC().Truncate(time.Millisecond)
 
@@ -25,8 +36,22 @@ func makeOutboxEvent(aggregateID uuid.UUID, channel string) *domain.OutboxEvent 
 		Channel:       channel,
 		Payload:       []byte(`{"test":true}`),
 		CreatedAt:     now,
-		NextAttemptAt: now,
+		NextAttemptAt: now.Add(-time.Minute),
 	}
+}
+
+// resetOutbox clears the event_outbox table so each test starts from a clean
+// slate. The outbox tests share sharedTestPool + the single event_outbox table
+// and run sequentially. Without this, rows left by earlier tests (and stale
+// claimed_until leases) accumulate; a later test's PollReady(limit) then sorts
+// those older rows ahead of its own freshly-enqueued event and pushes it out of
+// the LIMIT window, so the test no longer finds its event. Truncating up front
+// makes every test hermetic regardless of execution order or surrounding load.
+func resetOutbox(ctx context.Context, t *testing.T) {
+	t.Helper()
+
+	_, err := sharedTestPool.Exec(ctx, `DELETE FROM event_outbox`)
+	require.NoError(t, err)
 }
 
 // Note: outbox integration tests are intentionally NOT run with t.Parallel().
@@ -40,6 +65,7 @@ func makeOutboxEvent(aggregateID uuid.UUID, channel string) *domain.OutboxEvent 
 // then retrieved by PollReady.
 func TestOutboxStore_EnqueueAndPoll_Integration(t *testing.T) {
 	ctx := context.Background()
+	resetOutbox(ctx, t)
 	s := pgstore.NewOutboxStore(sharedTestPool)
 
 	evt := makeOutboxEvent(uuid.New(), "marketplace.test_event")
@@ -79,6 +105,7 @@ func TestOutboxStore_EnqueueAndPoll_Integration(t *testing.T) {
 // event_id (ON CONFLICT DO NOTHING) does not produce a duplicate row.
 func TestOutboxStore_EnqueueIdempotency_Integration(t *testing.T) {
 	ctx := context.Background()
+	resetOutbox(ctx, t)
 	s := pgstore.NewOutboxStore(sharedTestPool)
 
 	evt := makeOutboxEvent(uuid.New(), "marketplace.idempotency_test")
@@ -108,6 +135,7 @@ func TestOutboxStore_EnqueueIdempotency_Integration(t *testing.T) {
 // and clears claimed_until, so the row is no longer returned by PollReady.
 func TestOutboxStore_MarkPublished_Integration(t *testing.T) {
 	ctx := context.Background()
+	resetOutbox(ctx, t)
 	s := pgstore.NewOutboxStore(sharedTestPool)
 
 	evt := makeOutboxEvent(uuid.New(), "marketplace.published_test")
@@ -141,6 +169,7 @@ func TestOutboxStore_MarkPublished_Integration(t *testing.T) {
 // event is not immediately re-polled (simulating at-least-once after a failed delivery).
 func TestOutboxStore_MarkFailed_Integration(t *testing.T) {
 	ctx := context.Background()
+	resetOutbox(ctx, t)
 	s := pgstore.NewOutboxStore(sharedTestPool)
 
 	evt := makeOutboxEvent(uuid.New(), "marketplace.failed_test")
@@ -200,6 +229,7 @@ func TestOutboxStore_MarkFailed_Integration(t *testing.T) {
 //  4. The event becomes re-pollable on the next cycle (after backoff).
 func TestOutboxStore_AtLeastOnceAfterCrash_Integration(t *testing.T) {
 	ctx := context.Background()
+	resetOutbox(ctx, t)
 	s := pgstore.NewOutboxStore(sharedTestPool)
 
 	evt := makeOutboxEvent(uuid.New(), "marketplace.crash_test")
@@ -250,6 +280,7 @@ func TestOutboxStore_AtLeastOnceAfterCrash_Integration(t *testing.T) {
 // therefore sees those rows as already claimed and skips them — no timing dependency.
 func TestOutboxStore_ConcurrentPollersSkipLocked_Integration(t *testing.T) {
 	ctx := context.Background()
+	resetOutbox(ctx, t)
 	seedStore := pgstore.NewOutboxStore(sharedTestPool)
 
 	// Enqueue 4 events.
@@ -358,6 +389,7 @@ func TestOutboxStore_ConcurrentPollersSkipLocked_Integration(t *testing.T) {
 // published rows older than the cutoff and leaves newer rows intact.
 func TestOutboxStore_Retention_Integration(t *testing.T) {
 	ctx := context.Background()
+	resetOutbox(ctx, t)
 	s := pgstore.NewOutboxStore(sharedTestPool)
 
 	// Enqueue and mark published (simulates a delivered event).
