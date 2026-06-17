@@ -204,6 +204,9 @@ func TestConfig_Load(t *testing.T) {
 				"MARKETPLACE_WORKSPACE_BASE_URL":      "https://workspace:8082",
 				"MARKETPLACE_WORKSPACE_SERVICE_TOKEN": testServiceToken,
 				"MARKETPLACE_GATEWAY_HMAC_SECRET":     testHMACSecret,
+				"MARKETPLACE_FILE_BASE_URL":           "https://file:8083",
+				"MARKETPLACE_FILE_SERVICE_ID":         "marketplace",
+				"MARKETPLACE_FILE_SERVICE_TOKEN":      testServiceToken,
 			},
 			wantErr: false,
 		},
@@ -269,6 +272,9 @@ func TestConfig_Load(t *testing.T) {
 				"MARKETPLACE_WORKSPACE_BASE_URL":      "https://workspace:8082",
 				"MARKETPLACE_WORKSPACE_SERVICE_TOKEN": testServiceToken,
 				"MARKETPLACE_GATEWAY_HMAC_SECRET":     testHMACSecret,
+				"MARKETPLACE_FILE_BASE_URL":           "https://file:8083",
+				"MARKETPLACE_FILE_SERVICE_ID":         "marketplace",
+				"MARKETPLACE_FILE_SERVICE_TOKEN":      testServiceToken,
 			},
 			wantErr: false,
 		},
@@ -416,6 +422,7 @@ func TestConfig_Load(t *testing.T) {
 				"MARKETPLACE_WORKSPACE_BASE_URL", "MARKETPLACE_WORKSPACE_SERVICE_TOKEN",
 				"MARKETPLACE_GATEWAY_HMAC_SECRET",
 				"MARKETPLACE_USER_RATE_LIMIT_PER_MIN", "MARKETPLACE_USER_RATE_LIMIT_BURST",
+				"MARKETPLACE_FILE_BASE_URL", "MARKETPLACE_FILE_SERVICE_ID", "MARKETPLACE_FILE_SERVICE_TOKEN",
 			}
 			for _, k := range allKnownVars {
 				t.Setenv(k, "")
