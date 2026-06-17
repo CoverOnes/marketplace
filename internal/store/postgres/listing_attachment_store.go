@@ -43,13 +43,17 @@ VALUES
 	return nil
 }
 
-// GetByID returns the attachment with the given id, or ErrAttachmentNotFound.
+// GetByID returns the ACTIVE (non-detached) attachment with the given id, or
+// ErrAttachmentNotFound. Detached (soft-deleted) rows are treated as not found so
+// a stale attachment id cannot be used to presign a download URL for content the
+// owner has already removed.
 func (s *ListingAttachmentStore) GetByID(ctx context.Context, id uuid.UUID) (*domain.ListingAttachment, error) {
 	const query = `
 SELECT id, listing_id, file_id, uploader_id, filename, content_type, size_bytes,
        detached_at, detached_by, created_at
 FROM listing_attachments
 WHERE id = $1
+  AND detached_at IS NULL
 `
 
 	return scanAttachment(s.q.QueryRow(ctx, query, id))
