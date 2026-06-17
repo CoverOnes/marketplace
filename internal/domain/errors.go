@@ -44,4 +44,20 @@ var (
 	// ErrAttachmentNotFound is returned when a listing attachment cannot be found
 	// or has already been detached.
 	ErrAttachmentNotFound = errors.New("attachment not found")
+
+	// ErrAttachmentCapReached is returned when a listing already has the maximum
+	// allowed number of active attachments (10).
+	ErrAttachmentCapReached = errors.New("listing has reached the maximum attachment limit")
+
+	// ErrContentTypeNotAllowed is returned when the caller supplies a MIME type
+	// that is not on the attachment allowlist.
+	ErrContentTypeNotAllowed = errors.New("content type not allowed")
+
+	// ErrAttachmentForbidden is returned when the caller is not authorized to
+	// attach, detach, or download attachments for the given listing.
+	ErrAttachmentForbidden = errors.New("attachment operation forbidden")
+
+	// ErrUpstreamFile is returned when the synchronous S2S call to the file
+	// service fails during register or presign. Callers map this to HTTP 502.
+	ErrUpstreamFile = errors.New("upstream file service error")
 )

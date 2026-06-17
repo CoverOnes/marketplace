@@ -14,11 +14,12 @@ import (
 
 // RouterConfig holds all handler-level dependencies.
 type RouterConfig struct {
-	ListingSvc *service.ListingService
-	BidSvc     *service.BidService
-	TenderSvc  *service.TenderService
-	Pool       *pgxpool.Pool
-	Redis      *redis.Client // may be nil in dev
+	ListingSvc    *service.ListingService
+	BidSvc        *service.BidService
+	TenderSvc     *service.TenderService
+	AttachmentSvc *service.AttachmentService
+	Pool          *pgxpool.Pool
+	Redis         *redis.Client // may be nil in dev
 
 	// GatewayHMACSecret is the §24.1 shared secret used to verify the
 	// gateway-origin identity signature. Empty == dev posture (verification
@@ -68,6 +69,7 @@ func NewRouter(cfg RouterConfig) *gin.Engine {
 	listingH := NewListingHandler(cfg.ListingSvc)
 	bidH := NewBidHandler(cfg.BidSvc)
 	tenderH := NewTenderHandler(cfg.TenderSvc)
+	attachmentH := NewAttachmentHandler(cfg.AttachmentSvc)
 
 	api := r.Group("/v1")
 	// Defense-in-depth (§24.1): verify the gateway-origin HMAC signature BEFORE
@@ -106,6 +108,13 @@ func NewRouter(cfg RouterConfig) *gin.Engine {
 	api.POST("/bids/:id/accept", middleware.RequireTier(2), bidH.AcceptBid)
 	api.POST("/bids/:id/reject", middleware.RequireTier(2), bidH.RejectBid)
 	api.POST("/bids/:id/withdraw", middleware.RequireTier(2), bidH.WithdrawBid)
+
+	// Attachments — POST/DELETE require Tier>=2; GET requires Tier>=1.
+	// :id is the listing ID; :attachmentId is the attachment UUID.
+	api.POST("/listings/:id/attachments", middleware.RequireTier(2), attachmentH.Attach)
+	api.GET("/listings/:id/attachments", middleware.RequireTier(1), attachmentH.List)
+	api.GET("/listings/:id/attachments/:attachmentId/download-url", middleware.RequireTier(1), attachmentH.DownloadURL)
+	api.DELETE("/listings/:id/attachments/:attachmentId", middleware.RequireTier(2), attachmentH.Detach)
 
 	// Tender — owner-only role/milestone management (Tier>=2); collaborator apply/exit (Tier>=2).
 	// Roles sub-resource under /listings/:id/tender/.

@@ -67,6 +67,23 @@ type Config struct {
 	// Env: MARKETPLACE_WORKSPACE_SERVICE_TOKEN
 	WorkspaceServiceToken string `mapstructure:"workspace_service_token"`
 
+	// FileBaseURL is the base URL of the file service, used for attachment S2S calls.
+	// Example: "http://file:8083"
+	// Optional: if empty, file S2S calls are skipped (local dev without file service).
+	// Env: MARKETPLACE_FILE_BASE_URL
+	FileBaseURL string `mapstructure:"file_base_url"`
+
+	// FileServiceID is the marketplace's own service identifier as registered in the
+	// file service's S2S ACL (e.g. "marketplace"). Required when FileBaseURL is set.
+	// Env: MARKETPLACE_FILE_SERVICE_ID
+	FileServiceID string `mapstructure:"file_service_id"`
+
+	// FileServiceToken is the shared secret sent in X-Service-Token when calling the
+	// file service's internal endpoints. Required when FileBaseURL is set.
+	// Must be at least 32 characters.
+	// Env: MARKETPLACE_FILE_SERVICE_TOKEN
+	FileServiceToken string `mapstructure:"file_service_token"`
+
 	// GatewayHMACSecret is the shared secret used to verify the gateway-origin
 	// identity signature (conventions §24.1). It MUST equal the gateway's
 	// GATEWAY_HMAC_SECRET. Non-dev (staging/production) fails fast at boot if
@@ -122,6 +139,9 @@ func Load() (*Config, error) {
 		"db_min_conns":            "MARKETPLACE_DB_MIN_CONNS",
 		"workspace_base_url":      "MARKETPLACE_WORKSPACE_BASE_URL",
 		"workspace_service_token": "MARKETPLACE_WORKSPACE_SERVICE_TOKEN",
+		"file_base_url":           "MARKETPLACE_FILE_BASE_URL",
+		"file_service_id":         "MARKETPLACE_FILE_SERVICE_ID",
+		"file_service_token":      "MARKETPLACE_FILE_SERVICE_TOKEN",
 		"gateway_hmac_secret":     "MARKETPLACE_GATEWAY_HMAC_SECRET",
 		"user_rate_limit_per_min": "MARKETPLACE_USER_RATE_LIMIT_PER_MIN",
 		"user_rate_limit_burst":   "MARKETPLACE_USER_RATE_LIMIT_BURST",
@@ -195,6 +215,7 @@ func (c *Config) validate() error {
 	}
 
 	errs = append(errs, c.validateWorkspace()...)
+	errs = append(errs, c.validateFileService()...)
 	errs = append(errs, c.validateGatewayHMAC()...)
 	errs = append(errs, c.validateUserRateLimit()...)
 
@@ -255,6 +276,57 @@ func (c *Config) validateWorkspace() []string {
 			}
 		} else if !strings.HasPrefix(lower, "https://") {
 			errs = append(errs, httpsMsg)
+		}
+	}
+
+	return errs
+}
+
+// validateFileService returns validation errors for the file service S2S config.
+//
+// Follows the same pattern as validateWorkspace:
+//   - In non-dev, MARKETPLACE_FILE_BASE_URL must be set with https:// (or http://localhost).
+//   - When FileBaseURL is set, FileServiceID and FileServiceToken (≥32 chars) are required.
+func (c *Config) validateFileService() []string {
+	var errs []string
+
+	if !c.IsDev() {
+		if c.FileBaseURL == "" {
+			errs = append(errs, "MARKETPLACE_FILE_BASE_URL must be set in production")
+		}
+
+		if c.FileServiceID == "" {
+			errs = append(errs, "MARKETPLACE_FILE_SERVICE_ID must be set in production")
+		}
+
+		if len(c.FileServiceToken) < minServiceTokenLen {
+			errs = append(errs, "MARKETPLACE_FILE_SERVICE_TOKEN must be at least 32 characters in production")
+		}
+	}
+
+	// When FileBaseURL is set in any environment, ServiceID and ServiceToken are required.
+	if c.FileBaseURL != "" {
+		if c.FileServiceID == "" {
+			errs = append(errs, "MARKETPLACE_FILE_SERVICE_ID is required when MARKETPLACE_FILE_BASE_URL is set")
+		}
+
+		if len(c.FileServiceToken) < minServiceTokenLen {
+			errs = append(errs, "MARKETPLACE_FILE_SERVICE_TOKEN must be at least 32 characters when MARKETPLACE_FILE_BASE_URL is set")
+		}
+
+		// In non-dev, enforce https:// (http://localhost is exempt for integration tests).
+		if !c.IsDev() {
+			const httpsMsg = "MARKETPLACE_FILE_BASE_URL must use https:// in non-dev" +
+				" (only http://localhost:<port> is permitted for integration tests)"
+			lower := strings.ToLower(c.FileBaseURL)
+			if strings.HasPrefix(lower, "http://") {
+				parsed, perr := url.Parse(c.FileBaseURL)
+				if perr != nil || strings.ToLower(parsed.Hostname()) != "localhost" {
+					errs = append(errs, httpsMsg)
+				}
+			} else if !strings.HasPrefix(lower, "https://") {
+				errs = append(errs, httpsMsg)
+			}
 		}
 	}
 
