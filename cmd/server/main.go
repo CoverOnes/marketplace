@@ -158,6 +158,9 @@ func run() error {
 	// Outbox store (for poller housekeeping — pool-backed).
 	outboxStore := postgres.NewOutboxStore(pool)
 
+	// Attachment store.
+	attachmentStore := postgres.NewListingAttachmentStore(pool)
+
 	// Workspace S2S client (M-2 fix): marketplace calls workspace after AcceptBid
 	// to create the contract with authoritative award values.
 	// When MARKETPLACE_WORKSPACE_BASE_URL is empty, the call is skipped (local dev).
@@ -167,6 +170,18 @@ func run() error {
 		slog.Info("workspace client configured", "base_url", cfg.WorkspaceBaseURL)
 	} else {
 		slog.Warn("MARKETPLACE_WORKSPACE_BASE_URL not set; workspace contract creation is disabled")
+	}
+
+	// File S2S client: marketplace calls file service to register and presign attachments.
+	// When MARKETPLACE_FILE_BASE_URL is empty, S2S calls are skipped (local dev).
+	// The file service must have "marketplace" mapped to FILE_SERVICE_TOKEN in its S2S ACL
+	// with entityType "listing" permitted (deploy requirement documented in PR notes).
+	var fileClient client.FileClient
+	if cfg.FileBaseURL != "" {
+		fileClient = client.NewHTTPFileClient(cfg.FileBaseURL, cfg.FileServiceID, cfg.FileServiceToken)
+		slog.Info("file client configured", "base_url", cfg.FileBaseURL, "service_id", cfg.FileServiceID)
+	} else {
+		slog.Warn("MARKETPLACE_FILE_BASE_URL not set; file S2S calls are disabled (dev mode)")
 	}
 
 	// Service layer.
@@ -182,6 +197,8 @@ func run() error {
 		workspaceClient,
 		publisher,
 	)
+	// fileClient may be nil when FILE_BASE_URL is unset (local dev — S2S calls are skipped).
+	attachmentSvc := service.NewAttachmentService(attachmentStore, listingStore, tenderCollabStore, fileClient)
 
 	// Outbox poller — start only when Redis is available; interval from env (default 2s).
 	// The poller goroutine is canceled on graceful shutdown via pollerCtx.
@@ -195,6 +212,7 @@ func run() error {
 		ListingSvc:          listingSvc,
 		BidSvc:              bidSvc,
 		TenderSvc:           tenderSvc,
+		AttachmentSvc:       attachmentSvc,
 		Pool:                pool,
 		Redis:               redisClient,
 		GatewayHMACSecret:   cfg.GatewayHMACSecret,
