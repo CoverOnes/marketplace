@@ -208,7 +208,7 @@ func run() error {
 	startOutboxPoller(pollerCtx, redisClient, outboxStore)
 
 	// Router.
-	r := handler.NewRouter(handler.RouterConfig{
+	r := handler.NewRouter(&handler.RouterConfig{
 		ListingSvc:          listingSvc,
 		BidSvc:              bidSvc,
 		TenderSvc:           tenderSvc,
