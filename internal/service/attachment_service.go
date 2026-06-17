@@ -3,6 +3,7 @@ package service
 import (
 	"context"
 	"fmt"
+	"log/slog"
 	"time"
 
 	"github.com/CoverOnes/marketplace/internal/client"
@@ -18,12 +19,15 @@ import (
 // This mirrors the spirit of the file service's allowedContentTypes list and
 // provides defense-in-depth: we validate at our boundary before the S2S call.
 var allowedContentTypes = map[string]bool{
-	// Images
-	"image/jpeg":    true,
-	"image/png":     true,
-	"image/gif":     true,
-	"image/webp":    true,
-	"image/svg+xml": true,
+	// Images.
+	// NOTE: image/svg+xml is intentionally EXCLUDED. SVG is XML that can carry
+	// inline <script>; if a presigned URL is ever rendered inline by a browser it
+	// becomes a stored-XSS vector. Re-enable only if the file service guarantees
+	// Content-Disposition: attachment + X-Content-Type-Options: nosniff on download.
+	"image/jpeg": true,
+	"image/png":  true,
+	"image/gif":  true,
+	"image/webp": true,
 	// Documents
 	"application/pdf":    true,
 	"application/msword": true,
@@ -109,9 +113,10 @@ func (s *AttachmentService) Attach(ctx context.Context, listingID, callerUserID 
 		return nil, err
 	}
 
-	// Step 3: MIME allowlist.
+	// Step 3: MIME allowlist. %q quotes the caller-supplied value so control
+	// characters (e.g. newlines) can't forge extra structured-log lines.
 	if !allowedContentTypes[in.ContentType] {
-		return nil, fmt.Errorf("%w: %s", domain.ErrContentTypeNotAllowed, in.ContentType)
+		return nil, fmt.Errorf("%w: %q", domain.ErrContentTypeNotAllowed, in.ContentType)
 	}
 
 	// Step 4: cap check (best-effort; TOCTOU race documented on maxAttachmentsPerListing).
@@ -124,11 +129,18 @@ func (s *AttachmentService) Attach(ctx context.Context, listingID, callerUserID 
 		return nil, domain.ErrAttachmentCapReached
 	}
 
-	// Step 5: S2S register with file service (skip when fileClient is nil — local dev).
+	// Step 5: S2S register with file service. When fileClient is nil the file
+	// service ownership/STORED/MIME check is skipped — this path exists ONLY for
+	// local dev. Config validation requires MARKETPLACE_FILE_BASE_URL in non-dev,
+	// so fileClient is never nil in staging/production; the warn flags the case
+	// loudly should that invariant ever be violated by misconfiguration.
 	if s.fileClient != nil {
 		if err := s.fileClient.RegisterAttachment(ctx, in.FileID, listingID, callerUserID); err != nil {
 			return nil, fmt.Errorf("register attachment with file service: %w", err)
 		}
+	} else {
+		slog.WarnContext(ctx, "file service not configured; skipping S2S attachment ownership validation (dev only)",
+			"listing_id", listingID, "file_id", in.FileID)
 	}
 
 	// Step 6: persist the attachment row. Metadata is client-asserted at attach time.

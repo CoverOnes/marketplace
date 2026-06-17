@@ -245,4 +245,45 @@ func TestAttachmentServiceIntegration(t *testing.T) {
 		require.NoError(t, err)
 		assert.Equal(t, vendorID, a.UploaderID)
 	})
+
+	t.Run("download_url_open_listing_by_stranger", func(t *testing.T) {
+		ownerID := uuid.New()
+		strangerID := uuid.New()
+		listing := createListing(t, ownerID, domain.ListingStatusOpen)
+
+		a := attachFile(t, svc, listing.ID, ownerID)
+
+		// OPEN listings are publicly readable: any authenticated user may presign.
+		url, err := svc.DownloadURL(ctx, listing.ID, a.ID, strangerID)
+		require.NoError(t, err)
+		assert.Equal(t, "https://integration-test.example.com/presigned", url)
+	})
+
+	t.Run("download_url_cross_listing_returns_not_found", func(t *testing.T) {
+		ownerID := uuid.New()
+		listingA := createListing(t, ownerID, domain.ListingStatusOpen)
+		listingB := createListing(t, ownerID, domain.ListingStatusOpen)
+
+		a := attachFile(t, svc, listingA.ID, ownerID)
+
+		// Attachment belongs to listingA; requesting it under listingB must 404,
+		// preventing cross-listing enumeration of attachment ids.
+		_, err := svc.DownloadURL(ctx, listingB.ID, a.ID, ownerID)
+		require.Error(t, err)
+		assert.ErrorIs(t, err, domain.ErrAttachmentNotFound)
+	})
+
+	t.Run("download_url_detached_returns_not_found", func(t *testing.T) {
+		ownerID := uuid.New()
+		listing := createListing(t, ownerID, domain.ListingStatusOpen)
+
+		a := attachFile(t, svc, listing.ID, ownerID)
+		require.NoError(t, svc.Detach(ctx, listing.ID, a.ID, ownerID))
+
+		// A detached (soft-deleted) attachment must not be presignable, otherwise a
+		// stale id could download content the owner already removed.
+		_, err := svc.DownloadURL(ctx, listing.ID, a.ID, ownerID)
+		require.Error(t, err)
+		assert.ErrorIs(t, err, domain.ErrAttachmentNotFound)
+	})
 }

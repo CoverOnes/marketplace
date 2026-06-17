@@ -12,6 +12,19 @@ import (
 	"github.com/google/uuid"
 )
 
+// Client-asserted metadata bounds. These mirror the DB CHECK constraints in
+// migration 000011 so an over-long value is rejected with a clean 400 at the
+// handler instead of surfacing a raw DB constraint violation as a 500
+// (backend-security-design §5.2: validate client-side, don't delegate to DB CHECK).
+const (
+	maxFilenameLen    = 255
+	maxContentTypeLen = 127
+	// maxAttachmentSizeBytes caps the client-asserted display size at 5 GiB — a
+	// sane upper bound that rejects absurd values (e.g. math.MaxInt64) while
+	// comfortably exceeding any real document/image attachment.
+	maxAttachmentSizeBytes = 5 * 1024 * 1024 * 1024
+)
+
 // AttachmentHandler handles listing attachment endpoints.
 type AttachmentHandler struct {
 	svc *service.AttachmentService
@@ -88,13 +101,28 @@ func (h *AttachmentHandler) Attach(c *gin.Context) {
 		return
 	}
 
+	if len(req.Filename) > maxFilenameLen {
+		httpx.ErrCode(c, http.StatusBadRequest, "VALIDATION_ERROR", "filename must be at most 255 characters")
+		return
+	}
+
 	if req.ContentType == "" {
 		httpx.ErrCode(c, http.StatusBadRequest, "VALIDATION_ERROR", "contentType is required")
 		return
 	}
 
+	if len(req.ContentType) > maxContentTypeLen {
+		httpx.ErrCode(c, http.StatusBadRequest, "VALIDATION_ERROR", "contentType must be at most 127 characters")
+		return
+	}
+
 	if req.SizeBytes <= 0 {
 		httpx.ErrCode(c, http.StatusBadRequest, "VALIDATION_ERROR", "sizeBytes must be > 0")
+		return
+	}
+
+	if req.SizeBytes > maxAttachmentSizeBytes {
+		httpx.ErrCode(c, http.StatusBadRequest, "VALIDATION_ERROR", "sizeBytes exceeds the maximum allowed")
 		return
 	}
 
