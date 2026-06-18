@@ -720,3 +720,63 @@ func TestAttachmentService_DownloadURL_FileClientError(t *testing.T) {
 	require.Error(t, err)
 	assert.True(t, errors.Is(err, domain.ErrUpstreamFile))
 }
+
+// TestAttachmentService_Attach_NormalizesContentType asserts that Attach stores the
+// canonical lower-case MIME type (without parameters) into the DB column, not the raw
+// client-supplied value. This verifies the normalizedContentType-persist fix: if
+// in.ContentType were stored instead of normalizedContentType, the assertion below
+// would fail for "APPLICATION/PDF; charset=utf-8".
+func TestAttachmentService_Attach_NormalizesContentType(t *testing.T) {
+	tests := []struct {
+		name            string
+		rawContentType  string
+		wantContentType string
+	}{
+		{
+			name:            "uppercase MIME with charset parameter",
+			rawContentType:  "APPLICATION/PDF; charset=utf-8",
+			wantContentType: "application/pdf",
+		},
+		{
+			name:            "mixed-case MIME with whitespace",
+			rawContentType:  "  Application/PDF  ",
+			wantContentType: "application/pdf",
+		},
+		{
+			name:            "already canonical",
+			rawContentType:  contentTypePDF,
+			wantContentType: contentTypePDF,
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			ownerID := uuid.New()
+			listing := makeOpenListing(ownerID)
+
+			attachStore := newFakeAttachmentStore()
+
+			svc := newAttachmentService(
+				attachStore,
+				newFakeListingStore(listing),
+				newFakeCollaboratorStore(),
+				&fakeFileClient{},
+			)
+
+			in := validAttachInput()
+			in.ContentType = tc.rawContentType
+
+			a, err := svc.Attach(context.Background(), listing.ID, ownerID, in)
+
+			require.NoError(t, err)
+			assert.Equal(t, tc.wantContentType, a.ContentType,
+				"persisted ContentType must be normalized; raw value was %q", tc.rawContentType)
+
+			// Also verify the stored attachment has the normalized value.
+			stored := attachStore.attachments[a.ID]
+			require.NotNil(t, stored)
+			assert.Equal(t, tc.wantContentType, stored.ContentType,
+				"stored attachment ContentType must be normalized")
+		})
+	}
+}

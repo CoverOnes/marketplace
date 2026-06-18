@@ -133,7 +133,7 @@ func (s *AttachmentService) Attach(ctx context.Context, listingID, callerUserID 
 		return nil, fmt.Errorf("%w: %q", domain.ErrContentTypeNotAllowed, in.ContentType)
 	}
 
-	// Step 4: cap check (best-effort; TOCTOU race documented on maxAttachmentsPerListing).
+	// Step 5: cap check (best-effort; TOCTOU race documented on maxAttachmentsPerListing).
 	count, err := s.attachments.CountActiveByListing(ctx, listingID)
 	if err != nil {
 		return nil, fmt.Errorf("count attachments for listing %s: %w", listingID, err)
@@ -143,7 +143,7 @@ func (s *AttachmentService) Attach(ctx context.Context, listingID, callerUserID 
 		return nil, domain.ErrAttachmentCapReached
 	}
 
-	// Step 5: S2S register with file service. When fileClient is nil the file
+	// Step 6: S2S register with file service. When fileClient is nil the file
 	// service ownership/STORED/MIME check is skipped — this path exists ONLY for
 	// local dev. Config validation requires MARKETPLACE_FILE_BASE_URL in non-dev,
 	// so fileClient is never nil in staging/production; the warn flags the case
@@ -157,7 +157,9 @@ func (s *AttachmentService) Attach(ctx context.Context, listingID, callerUserID 
 			"listing_id", listingID, "file_id", in.FileID)
 	}
 
-	// Step 6: persist the attachment row. Metadata is client-asserted at attach time.
+	// Step 7: persist the attachment row. Store the normalized content type (not the
+	// raw client-supplied value) so the DB column is always canonical lower-case MIME
+	// without parameters (e.g. "application/pdf" not "APPLICATION/PDF; charset=utf-8").
 	now := time.Now().UTC()
 	a := &domain.ListingAttachment{
 		ID:          uuid.New(),
@@ -165,7 +167,7 @@ func (s *AttachmentService) Attach(ctx context.Context, listingID, callerUserID 
 		FileID:      in.FileID,
 		UploaderID:  callerUserID,
 		Filename:    in.Filename,
-		ContentType: in.ContentType,
+		ContentType: normalizedContentType,
 		SizeBytes:   in.SizeBytes,
 		CreatedAt:   now,
 	}
