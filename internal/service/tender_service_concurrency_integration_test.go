@@ -482,6 +482,162 @@ func TestTenderExitCollaborator_TOCTOU_Integration(t *testing.T) {
 	})
 }
 
+// TestUpdateMilestone_TOCTOU_Integration verifies that two concurrent
+// UpdateMilestone calls on the same PENDING milestone are serialized by the
+// SELECT … FOR UPDATE row-lock inside WithMilestoneTx:
+//   - Exactly ONE call succeeds and writes the terminal status.
+//   - The other call loses the lock race and returns ErrInvalidTenderTransition
+//     (the milestone is no longer PENDING when it reads it under its own lock).
+//   - reached_at is written exactly once (not double-written by two winners).
+//
+// This test is only meaningful against a real Postgres instance, so it
+// skips under -short and must be run with -race.
+func TestUpdateMilestone_TOCTOU_Integration(t *testing.T) {
+	if testing.Short() {
+		t.Skip("skipping integration test in short mode")
+	}
+
+	ctx := context.Background()
+	dsn := sharedServiceDSN
+	ownerID := uuid.New()
+
+	t.Run("concurrent PENDING→REACHED races: exactly one winner", func(t *testing.T) {
+		listing := seedTenderListingForService(t, ctx, dsn, ownerID, domain.TenderStatusOpen)
+		m := seedMilestoneForService(t, ctx, dsn, listing.ID, domain.MilestoneStatusPending)
+
+		svc, cleanup := buildTenderTestService(t, ctx, dsn, nil)
+		defer cleanup()
+
+		const goroutines = 2
+
+		errs := make([]error, goroutines)
+		start := make(chan struct{}) // barrier: fire both goroutines at once
+
+		var wg sync.WaitGroup
+
+		for i := range goroutines {
+			wg.Add(1)
+
+			go func(idx int) {
+				defer wg.Done()
+
+				<-start // wait until barrier is released
+
+				_, errs[idx] = svc.UpdateMilestone(ctx, &service.UpdateMilestoneInput{
+					MilestoneID: m.ID,
+					CallerID:    ownerID,
+					Status:      domain.MilestoneStatusReached,
+				})
+			}(i)
+		}
+
+		close(start) // release both goroutines simultaneously
+		wg.Wait()
+
+		// Count outcomes.
+		successCount := 0
+		for _, err := range errs {
+			if err == nil {
+				successCount++
+			} else {
+				// The loser must return ErrInvalidTenderTransition — it sees a
+				// non-PENDING row (locked by the winner) and the transition is illegal.
+				require.ErrorIs(t, err, domain.ErrInvalidTenderTransition,
+					"loser must return ErrInvalidTenderTransition, got: %v", err)
+			}
+		}
+
+		require.Equal(t, 1, successCount,
+			"exactly one UpdateMilestone call must succeed; FOR UPDATE serializes both")
+
+		// The DB row must reflect exactly one write: REACHED with reached_at set.
+		stored := readMilestone(t, ctx, dsn, m.ID)
+		assert.Equal(t, domain.MilestoneStatusReached, stored.Status,
+			"final DB status must be REACHED")
+		assert.NotNil(t, stored.ReachedAt,
+			"reached_at must be set exactly once by the winning transaction")
+
+		t.Logf("goroutine errors: %v %v", errs[0], errs[1])
+	})
+
+	t.Run("concurrent PENDING→REACHED vs PENDING→SKIPPED: exactly one winner", func(t *testing.T) {
+		listing := seedTenderListingForService(t, ctx, dsn, ownerID, domain.TenderStatusOpen)
+		m := seedMilestoneForService(t, ctx, dsn, listing.ID, domain.MilestoneStatusPending)
+
+		svc, cleanup := buildTenderTestService(t, ctx, dsn, nil)
+		defer cleanup()
+
+		var (
+			wg       sync.WaitGroup
+			errReach error
+			errSkip  error
+		)
+
+		start := make(chan struct{})
+
+		wg.Add(2)
+
+		go func() {
+			defer wg.Done()
+			<-start
+			_, errReach = svc.UpdateMilestone(ctx, &service.UpdateMilestoneInput{
+				MilestoneID: m.ID,
+				CallerID:    ownerID,
+				Status:      domain.MilestoneStatusReached,
+			})
+		}()
+
+		go func() {
+			defer wg.Done()
+			<-start
+			_, errSkip = svc.UpdateMilestone(ctx, &service.UpdateMilestoneInput{
+				MilestoneID: m.ID,
+				CallerID:    ownerID,
+				Status:      domain.MilestoneStatusSkipped,
+			})
+		}()
+
+		close(start)
+		wg.Wait()
+
+		// Exactly one must succeed.
+		if errReach == nil && errSkip == nil {
+			t.Fatal("both goroutines succeeded — TOCTOU bug: FOR UPDATE not serializing")
+		}
+
+		if errReach != nil && errSkip != nil {
+			t.Fatalf("both goroutines failed — unexpected: errReach=%v errSkip=%v", errReach, errSkip)
+		}
+
+		// The loser gets ErrInvalidTenderTransition.
+		loserErr := errReach
+		if loserErr == nil {
+			loserErr = errSkip
+		}
+
+		require.ErrorIs(t, loserErr, domain.ErrInvalidTenderTransition,
+			"loser must return ErrInvalidTenderTransition, got: %v", loserErr)
+
+		// The final DB row must be one of the two valid terminal statuses,
+		// and reached_at correctness is validated per-status.
+		stored := readMilestone(t, ctx, dsn, m.ID)
+		validFinal := stored.Status == domain.MilestoneStatusReached ||
+			stored.Status == domain.MilestoneStatusSkipped
+		assert.True(t, validFinal,
+			"final status must be REACHED or SKIPPED, got %s", stored.Status)
+
+		if stored.Status == domain.MilestoneStatusReached {
+			assert.NotNil(t, stored.ReachedAt,
+				"REACHED status must have reached_at set")
+		} else {
+			assert.Nil(t, stored.ReachedAt,
+				"SKIPPED status must not have reached_at set")
+		}
+
+		t.Logf("errReach=%v errSkip=%v finalStatus=%s", errReach, errSkip, stored.Status)
+	})
+}
+
 // TestTenderAcceptCollaborator_TerminalState_Integration verifies that accepts on
 // CANCELED/COMPLETED tenders are rejected with ErrInvalidTenderTransition.
 func TestTenderAcceptCollaborator_TerminalState_Integration(t *testing.T) {
