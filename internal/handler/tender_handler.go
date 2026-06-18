@@ -384,3 +384,82 @@ func (h *TenderHandler) ListMilestones(c *gin.Context) {
 
 	httpx.OK(c, milestones)
 }
+
+// --- Milestone transition endpoints ---
+
+// UpdateMilestoneRequest is the PATCH /v1/listings/:id/tender/milestones/:milestoneId request body.
+type UpdateMilestoneRequest struct {
+	Status string `json:"status"` // "REACHED" or "SKIPPED"
+}
+
+// UpdateMilestone handles PATCH /v1/listings/:id/tender/milestones/:milestoneId.
+// Owner-only: transitions a milestone from PENDING to REACHED or SKIPPED.
+func (h *TenderHandler) UpdateMilestone(c *gin.Context) {
+	c.Request.Body = http.MaxBytesReader(c.Writer, c.Request.Body, maxBodyBytes)
+
+	identity, ok := middleware.IdentityFromCtx(c)
+	if !ok {
+		httpx.ErrCode(c, http.StatusUnauthorized, "UNAUTHORIZED", "authentication required")
+		return
+	}
+
+	milestoneID, err := uuid.Parse(c.Param("milestoneId"))
+	if err != nil {
+		httpx.ErrCode(c, http.StatusBadRequest, "VALIDATION_ERROR", "invalid milestone id")
+		return
+	}
+
+	var req UpdateMilestoneRequest
+	if err := c.ShouldBindJSON(&req); err != nil {
+		httpx.ErrCode(c, http.StatusBadRequest, "VALIDATION_ERROR", err.Error())
+		return
+	}
+
+	// M-2: allowlist BEFORE the cast to prevent attacker-controlled strings
+	// (including newlines and control characters) from flowing into error messages
+	// and logs (log injection vector).
+	switch req.Status {
+	case "REACHED", "SKIPPED":
+	default:
+		httpx.ErrCode(c, http.StatusBadRequest, "VALIDATION_ERROR", "status must be REACHED or SKIPPED")
+		return
+	}
+
+	status := domain.MilestoneStatus(req.Status)
+
+	milestone, err := h.svc.UpdateMilestone(c.Request.Context(), &service.UpdateMilestoneInput{
+		MilestoneID: milestoneID,
+		CallerID:    identity.UserID,
+		Status:      status,
+	})
+	if err != nil {
+		httpx.Err(c, err)
+		return
+	}
+
+	httpx.OK(c, milestone)
+}
+
+// GetMilestoneProgress handles GET /v1/listings/:id/tender/milestones/progress.
+// Owner-only: returns aggregated milestone status counts.
+func (h *TenderHandler) GetMilestoneProgress(c *gin.Context) {
+	identity, ok := middleware.IdentityFromCtx(c)
+	if !ok {
+		httpx.ErrCode(c, http.StatusUnauthorized, "UNAUTHORIZED", "authentication required")
+		return
+	}
+
+	listingID, err := uuid.Parse(c.Param("id"))
+	if err != nil {
+		httpx.ErrCode(c, http.StatusBadRequest, "VALIDATION_ERROR", "invalid listing id")
+		return
+	}
+
+	progress, err := h.svc.GetMilestoneProgress(c.Request.Context(), listingID, identity.UserID)
+	if err != nil {
+		httpx.Err(c, err)
+		return
+	}
+
+	httpx.OK(c, progress)
+}

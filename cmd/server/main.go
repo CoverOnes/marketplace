@@ -154,6 +154,7 @@ func run() error {
 	tenderMilestoneStore := postgres.NewTenderMilestoneStore(pool)
 	tenderTxManager := postgres.NewTenderTxManager(pool)
 	outboxTxManager := postgres.NewOutboxTxManager(pool)
+	milestoneTxManager := postgres.NewMilestoneTxManager(pool)
 
 	// Outbox store (for poller housekeeping — pool-backed).
 	outboxStore := postgres.NewOutboxStore(pool)
@@ -194,6 +195,7 @@ func run() error {
 		tenderMilestoneStore,
 		tenderTxManager,
 		outboxTxManager,
+		milestoneTxManager,
 		workspaceClient,
 		publisher,
 	)

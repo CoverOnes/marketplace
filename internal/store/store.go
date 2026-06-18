@@ -120,8 +120,21 @@ type TenderCollaboratorStore interface {
 type TenderMilestoneStore interface {
 	Create(ctx context.Context, m *domain.TenderMilestone) error
 	GetByID(ctx context.Context, id uuid.UUID) (*domain.TenderMilestone, error)
+	// GetByIDForUpdate fetches a milestone by ID with SELECT ... FOR UPDATE row-lock.
+	// Must be called inside an active transaction (txTenderMilestoneStore).
+	GetByIDForUpdate(ctx context.Context, id uuid.UUID) (*domain.TenderMilestone, error)
 	ListByListing(ctx context.Context, listingID uuid.UUID) ([]*domain.TenderMilestone, error)
 	Update(ctx context.Context, m *domain.TenderMilestone) error
+}
+
+// MilestoneTxManager runs milestone-specific operations inside a single Postgres transaction.
+// Used by UpdateMilestone to serialize concurrent status transitions on the same milestone.
+type MilestoneTxManager interface {
+	WithMilestoneTx(ctx context.Context, fn func(
+		ctx context.Context,
+		listings ListingStore,
+		milestones TenderMilestoneStore,
+	) error) error
 }
 
 // TxManager runs a function inside a single Postgres transaction.

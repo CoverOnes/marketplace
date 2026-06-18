@@ -176,6 +176,10 @@ func (s *stubTenderMilestoneStore) GetByID(_ context.Context, id uuid.UUID) (*do
 	return m, nil
 }
 
+func (s *stubTenderMilestoneStore) GetByIDForUpdate(ctx context.Context, id uuid.UUID) (*domain.TenderMilestone, error) {
+	return s.GetByID(ctx, id)
+}
+
 func (s *stubTenderMilestoneStore) ListByListing(_ context.Context, listingID uuid.UUID) ([]*domain.TenderMilestone, error) {
 	var result []*domain.TenderMilestone
 
@@ -228,6 +232,19 @@ func (m *stubOutboxTxManager) WithOutboxTx(
 	}
 
 	return fn(ctx, m.listings, m.roles, m.collaborators, ob)
+}
+
+// stubMilestoneTxManager calls fn synchronously with the provided stores, simulating a transaction.
+type stubMilestoneTxManager struct {
+	listings   store.ListingStore
+	milestones store.TenderMilestoneStore
+}
+
+func (m *stubMilestoneTxManager) WithMilestoneTx(
+	ctx context.Context,
+	fn func(context.Context, store.ListingStore, store.TenderMilestoneStore) error,
+) error {
+	return fn(ctx, m.listings, m.milestones)
 }
 
 // noopTenderOutboxStore satisfies store.OutboxStore for tender unit tests.
@@ -310,8 +327,9 @@ func newTenderSvc(
 ) *service.TenderService {
 	txm := &stubTenderTxManager{listings: ls, roles: rs, collaborators: cs}
 	outboxTxm := &stubOutboxTxManager{listings: ls, roles: rs, collaborators: cs}
+	milestoneTxm := &stubMilestoneTxManager{listings: ls, milestones: ms}
 
-	return service.NewTenderService(ls, rs, cs, ms, txm, outboxTxm, nil, events.NewNoopPublisher())
+	return service.NewTenderService(ls, rs, cs, ms, txm, outboxTxm, milestoneTxm, nil, events.NewNoopPublisher())
 }
 
 // newTenderSvcWithWorkspace builds a TenderService with a custom workspace client.
@@ -324,8 +342,9 @@ func newTenderSvcWithWorkspace(
 ) *service.TenderService {
 	txm := &stubTenderTxManager{listings: ls, roles: rs, collaborators: cs}
 	outboxTxm := &stubOutboxTxManager{listings: ls, roles: rs, collaborators: cs}
+	milestoneTxm := &stubMilestoneTxManager{listings: ls, milestones: ms}
 
-	return service.NewTenderService(ls, rs, cs, ms, txm, outboxTxm, wc, events.NewNoopPublisher())
+	return service.NewTenderService(ls, rs, cs, ms, txm, outboxTxm, milestoneTxm, wc, events.NewNoopPublisher())
 }
 
 // --- stub workspace client ---
@@ -1489,7 +1508,8 @@ func TestCollaboratorJoined_EnqueuedToOutbox(t *testing.T) {
 	// Wire the recording outbox store into the outbox tx manager.
 	txm := &stubTenderTxManager{listings: ls, roles: rs, collaborators: cs}
 	outboxTxm := &stubOutboxTxManager{listings: ls, roles: rs, collaborators: cs, outboxStore: recOutbox}
-	svc := service.NewTenderService(ls, rs, cs, ms, txm, outboxTxm, wc, events.NewNoopPublisher())
+	milestoneTxm := &stubMilestoneTxManager{listings: ls, milestones: ms}
+	svc := service.NewTenderService(ls, rs, cs, ms, txm, outboxTxm, milestoneTxm, wc, events.NewNoopPublisher())
 
 	_, err := svc.AcceptCollaborator(context.Background(), &service.AcceptCollaboratorInput{
 		CollaboratorID: collab.ID,
@@ -1508,4 +1528,291 @@ func TestCollaboratorJoined_EnqueuedToOutbox(t *testing.T) {
 	assert.Equal(t, "marketplace.collaborator_joined", evt.Channel)
 	assert.NotEmpty(t, evt.Payload, "outbox payload must not be empty")
 	assert.Nil(t, evt.PublishedAt, "freshly enqueued event must not yet be published")
+}
+
+// --- Milestone transition unit tests ---
+
+// TestUpdateMilestone_Transitions verifies legal and illegal milestone status transitions.
+func TestUpdateMilestone_Transitions(t *testing.T) {
+	t.Parallel()
+
+	ownerID := uuid.New()
+
+	tests := []struct {
+		name          string
+		initialStatus domain.MilestoneStatus
+		targetStatus  domain.MilestoneStatus
+		tenderStatus  domain.TenderStatus
+		wantErr       bool
+		wantErrIs     error
+		wantReachedAt bool // true = reached_at must be set after transition
+	}{
+		{
+			name:          "happy: PENDING → REACHED (sets reached_at)",
+			initialStatus: domain.MilestoneStatusPending,
+			targetStatus:  domain.MilestoneStatusReached,
+			tenderStatus:  domain.TenderStatusOpen,
+			wantErr:       false,
+			wantReachedAt: true,
+		},
+		{
+			name:          "happy: PENDING → SKIPPED",
+			initialStatus: domain.MilestoneStatusPending,
+			targetStatus:  domain.MilestoneStatusSkipped,
+			tenderStatus:  domain.TenderStatusOpen,
+			wantErr:       false,
+			wantReachedAt: false,
+		},
+		{
+			name:          "happy: PENDING → REACHED on EXECUTING tender",
+			initialStatus: domain.MilestoneStatusPending,
+			targetStatus:  domain.MilestoneStatusReached,
+			tenderStatus:  domain.TenderStatusExecuting,
+			wantErr:       false,
+			wantReachedAt: true,
+		},
+		{
+			name:          "error: REACHED → PENDING (revert not allowed)",
+			initialStatus: domain.MilestoneStatusReached,
+			targetStatus:  domain.MilestoneStatusPending,
+			tenderStatus:  domain.TenderStatusOpen,
+			wantErr:       true,
+			wantErrIs:     domain.ErrValidation, // caught by input validation before transition check
+		},
+		{
+			name:          "error: REACHED → SKIPPED (cross-transition not allowed)",
+			initialStatus: domain.MilestoneStatusReached,
+			targetStatus:  domain.MilestoneStatusSkipped,
+			tenderStatus:  domain.TenderStatusOpen,
+			wantErr:       true,
+			wantErrIs:     domain.ErrInvalidTenderTransition,
+		},
+		{
+			name:          "error: SKIPPED → REACHED (cross-transition not allowed)",
+			initialStatus: domain.MilestoneStatusSkipped,
+			targetStatus:  domain.MilestoneStatusReached,
+			tenderStatus:  domain.TenderStatusOpen,
+			wantErr:       true,
+			wantErrIs:     domain.ErrInvalidTenderTransition,
+		},
+		{
+			name:          "error: PENDING → REACHED on SETTLING tender (terminal reject)",
+			initialStatus: domain.MilestoneStatusPending,
+			targetStatus:  domain.MilestoneStatusReached,
+			tenderStatus:  domain.TenderStatusSettling,
+			wantErr:       true,
+			wantErrIs:     domain.ErrInvalidTenderTransition,
+		},
+		{
+			name:          "error: PENDING → REACHED on COMPLETED tender (terminal reject)",
+			initialStatus: domain.MilestoneStatusPending,
+			targetStatus:  domain.MilestoneStatusReached,
+			tenderStatus:  domain.TenderStatusCompleted,
+			wantErr:       true,
+			wantErrIs:     domain.ErrInvalidTenderTransition,
+		},
+		{
+			name:          "error: PENDING → REACHED on CANCELED tender (terminal reject)",
+			initialStatus: domain.MilestoneStatusPending,
+			targetStatus:  domain.MilestoneStatusReached,
+			tenderStatus:  domain.TenderStatusCancelled,
+			wantErr:       true,
+			wantErrIs:     domain.ErrInvalidTenderTransition,
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+
+			listing := makeTenderListing(ownerID, tc.tenderStatus)
+			ms := newStubTenderMilestoneStore()
+
+			m := &domain.TenderMilestone{
+				ID:        uuid.New(),
+				ListingID: listing.ID,
+				Title:     "Test milestone",
+				Status:    tc.initialStatus,
+				CreatedAt: time.Now().UTC(),
+				UpdatedAt: time.Now().UTC(),
+			}
+			ms.milestones[m.ID] = m
+
+			ls := newStubListingStore(listing)
+			rs := newStubTenderRoleStore()
+			cs := newStubTenderCollaboratorStore()
+			svc := newTenderSvc(ls, rs, cs, ms)
+
+			result, err := svc.UpdateMilestone(context.Background(), &service.UpdateMilestoneInput{
+				MilestoneID: m.ID,
+				CallerID:    ownerID,
+				Status:      tc.targetStatus,
+			})
+
+			if tc.wantErr {
+				require.Error(t, err)
+				if tc.wantErrIs != nil {
+					assert.True(t, errors.Is(err, tc.wantErrIs),
+						"expected %v, got %v", tc.wantErrIs, err)
+				}
+			} else {
+				require.NoError(t, err)
+				require.NotNil(t, result)
+				assert.Equal(t, tc.targetStatus, result.Status)
+
+				if tc.wantReachedAt {
+					assert.NotNil(t, result.ReachedAt, "reached_at must be set for REACHED transition")
+				} else {
+					assert.Nil(t, result.ReachedAt, "reached_at must not be set for SKIPPED transition")
+				}
+
+				// Verify the milestone in the store was updated.
+				stored := ms.milestones[m.ID]
+				assert.Equal(t, tc.targetStatus, stored.Status,
+					"store must reflect new status %s, got %s", tc.targetStatus, stored.Status)
+			}
+		})
+	}
+}
+
+// TestUpdateMilestone_OwnerGuard verifies that a non-owner gets 404 (enumeration guard).
+func TestUpdateMilestone_OwnerGuard(t *testing.T) {
+	t.Parallel()
+
+	ownerID := uuid.New()
+	strangerID := uuid.New()
+	listing := makeTenderListing(ownerID, domain.TenderStatusOpen)
+
+	ms := newStubTenderMilestoneStore()
+	m := &domain.TenderMilestone{
+		ID:        uuid.New(),
+		ListingID: listing.ID,
+		Title:     "Guarded milestone",
+		Status:    domain.MilestoneStatusPending,
+		CreatedAt: time.Now().UTC(),
+		UpdatedAt: time.Now().UTC(),
+	}
+	ms.milestones[m.ID] = m
+
+	ls := newStubListingStore(listing)
+	rs := newStubTenderRoleStore()
+	cs := newStubTenderCollaboratorStore()
+	svc := newTenderSvc(ls, rs, cs, ms)
+
+	_, err := svc.UpdateMilestone(context.Background(), &service.UpdateMilestoneInput{
+		MilestoneID: m.ID,
+		CallerID:    strangerID, // not the owner
+		Status:      domain.MilestoneStatusReached,
+	})
+
+	require.Error(t, err)
+	assert.True(t, errors.Is(err, domain.ErrTenderMilestoneNotFound),
+		"non-owner must receive ErrTenderMilestoneNotFound (404 guard), got: %v", err)
+}
+
+// TestUpdateMilestone_MilestoneNotFound verifies that a missing milestone returns 404.
+func TestUpdateMilestone_MilestoneNotFound(t *testing.T) {
+	t.Parallel()
+
+	ownerID := uuid.New()
+	listing := makeTenderListing(ownerID, domain.TenderStatusOpen)
+
+	ls := newStubListingStore(listing)
+	rs := newStubTenderRoleStore()
+	cs := newStubTenderCollaboratorStore()
+	ms := newStubTenderMilestoneStore() // empty: milestone not found
+	svc := newTenderSvc(ls, rs, cs, ms)
+
+	_, err := svc.UpdateMilestone(context.Background(), &service.UpdateMilestoneInput{
+		MilestoneID: uuid.New(), // non-existent
+		CallerID:    ownerID,
+		Status:      domain.MilestoneStatusReached,
+	})
+
+	require.Error(t, err)
+	assert.True(t, errors.Is(err, domain.ErrTenderMilestoneNotFound),
+		"missing milestone must return ErrTenderMilestoneNotFound, got: %v", err)
+}
+
+// TestGetMilestoneProgress_Counts verifies progress aggregation across statuses.
+func TestGetMilestoneProgress_Counts(t *testing.T) {
+	t.Parallel()
+
+	ownerID := uuid.New()
+	listing := makeTenderListing(ownerID, domain.TenderStatusExecuting)
+
+	ms := newStubTenderMilestoneStore()
+
+	statuses := []domain.MilestoneStatus{
+		domain.MilestoneStatusPending,
+		domain.MilestoneStatusPending,
+		domain.MilestoneStatusReached,
+		domain.MilestoneStatusSkipped,
+	}
+	for _, st := range statuses {
+		id := uuid.New()
+		ms.milestones[id] = &domain.TenderMilestone{
+			ID:        id,
+			ListingID: listing.ID,
+			Title:     "m",
+			Status:    st,
+			CreatedAt: time.Now().UTC(),
+			UpdatedAt: time.Now().UTC(),
+		}
+	}
+
+	ls := newStubListingStore(listing)
+	rs := newStubTenderRoleStore()
+	cs := newStubTenderCollaboratorStore()
+	svc := newTenderSvc(ls, rs, cs, ms)
+
+	progress, err := svc.GetMilestoneProgress(context.Background(), listing.ID, ownerID)
+	require.NoError(t, err)
+	require.NotNil(t, progress)
+	assert.Equal(t, 4, progress.Total)
+	assert.Equal(t, 2, progress.Pending)
+	assert.Equal(t, 1, progress.Reached)
+	assert.Equal(t, 1, progress.Skipped)
+}
+
+// TestGetMilestoneProgress_OwnerGuard verifies that non-owner gets 404.
+func TestGetMilestoneProgress_OwnerGuard(t *testing.T) {
+	t.Parallel()
+
+	ownerID := uuid.New()
+	strangerID := uuid.New()
+	listing := makeTenderListing(ownerID, domain.TenderStatusOpen)
+
+	ls := newStubListingStore(listing)
+	rs := newStubTenderRoleStore()
+	cs := newStubTenderCollaboratorStore()
+	ms := newStubTenderMilestoneStore()
+	svc := newTenderSvc(ls, rs, cs, ms)
+
+	_, err := svc.GetMilestoneProgress(context.Background(), listing.ID, strangerID)
+	require.Error(t, err)
+	assert.True(t, errors.Is(err, domain.ErrListingNotFound),
+		"non-owner must receive ErrListingNotFound (404 guard), got: %v", err)
+}
+
+// TestGetMilestoneProgress_EmptyList verifies progress on a listing with no milestones.
+func TestGetMilestoneProgress_EmptyList(t *testing.T) {
+	t.Parallel()
+
+	ownerID := uuid.New()
+	listing := makeTenderListing(ownerID, domain.TenderStatusOpen)
+
+	ls := newStubListingStore(listing)
+	rs := newStubTenderRoleStore()
+	cs := newStubTenderCollaboratorStore()
+	ms := newStubTenderMilestoneStore()
+	svc := newTenderSvc(ls, rs, cs, ms)
+
+	progress, err := svc.GetMilestoneProgress(context.Background(), listing.ID, ownerID)
+	require.NoError(t, err)
+	require.NotNil(t, progress)
+	assert.Equal(t, 0, progress.Total)
+	assert.Equal(t, 0, progress.Pending)
+	assert.Equal(t, 0, progress.Reached)
+	assert.Equal(t, 0, progress.Skipped)
 }
