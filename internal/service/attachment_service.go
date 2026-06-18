@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"log/slog"
+	"strings"
 	"time"
 
 	"github.com/CoverOnes/marketplace/internal/client"
@@ -96,11 +97,12 @@ func NewAttachmentService(
 //
 // Steps:
 //  1. Load listing (404 if missing).
-//  2. Authorization: caller must be the listing owner OR an APPROVED collaborator.
-//  3. MIME allowlist check on ContentType.
-//  4. Cap check: listing must have fewer than maxAttachmentsPerListing active attachments.
-//  5. Call FileClient.RegisterAttachment (S2S): file must exist, be STORED, and be owned by caller.
-//  6. Insert the listing_attachments row with the client-provided display metadata.
+//  2. Status gate: listing must be OPEN. AWARDED and CLOSED listings reject with ErrListingNotOpen.
+//  3. Authorization: caller must be the listing owner OR an APPROVED collaborator.
+//  4. MIME allowlist check on ContentType.
+//  5. Cap check: listing must have fewer than maxAttachmentsPerListing active attachments.
+//  6. Call FileClient.RegisterAttachment (S2S): file must exist, be STORED, and be owned by caller.
+//  7. Insert the listing_attachments row with the client-provided display metadata.
 func (s *AttachmentService) Attach(ctx context.Context, listingID, callerUserID uuid.UUID, in AttachInput) (*domain.ListingAttachment, error) {
 	// Step 1: load listing.
 	listing, err := s.listings.GetByID(ctx, listingID)
@@ -108,14 +110,26 @@ func (s *AttachmentService) Attach(ctx context.Context, listingID, callerUserID 
 		return nil, err // ErrListingNotFound propagates as-is
 	}
 
-	// Step 2: authorization — listing owner or APPROVED collaborator.
+	// Step 2: status gate — only OPEN listings accept new attachments.
+	// List/DownloadURL allow owner/collaborator access on non-OPEN listings, but
+	// Attach is a write operation that must be refused after a listing is AWARDED
+	// or CLOSED; accepting attachments on a closed listing is a logic error.
+	if listing.Status != domain.ListingStatusOpen {
+		return nil, domain.ErrListingNotOpen
+	}
+
+	// Step 3: authorization — listing owner or APPROVED collaborator.
 	if err := s.requireOwnerOrApprovedCollaborator(ctx, listing, callerUserID); err != nil {
 		return nil, err
 	}
 
-	// Step 3: MIME allowlist. %q quotes the caller-supplied value so control
-	// characters (e.g. newlines) can't forge extra structured-log lines.
-	if !allowedContentTypes[in.ContentType] {
+	// Step 4: MIME allowlist. Normalize before lookup: strip parameters (e.g.
+	// "application/pdf; charset=utf-8" → "application/pdf"), lowercase, and trim
+	// whitespace — so callers can't bypass the allowlist with case/charset variants.
+	// %q quotes the caller-supplied raw value so control characters (e.g. newlines)
+	// can't forge extra structured-log lines.
+	normalizedContentType := strings.ToLower(strings.TrimSpace(strings.SplitN(in.ContentType, ";", 2)[0]))
+	if !allowedContentTypes[normalizedContentType] {
 		return nil, fmt.Errorf("%w: %q", domain.ErrContentTypeNotAllowed, in.ContentType)
 	}
 

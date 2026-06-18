@@ -588,6 +588,45 @@ func TestAttachmentService_Detach_WrongListingIDReturnsNotFound(t *testing.T) {
 	assert.True(t, errors.Is(err, domain.ErrAttachmentNotFound))
 }
 
+// TestAttachmentService_Attach_ClosedListingForbidsAttach verifies the status gate
+// added in the review fix: Attach must return ErrListingNotOpen when the listing
+// status is not OPEN, even if the caller is the owner or an approved collaborator.
+func TestAttachmentService_Attach_ClosedListingForbidsAttach(t *testing.T) {
+	tests := []struct {
+		name   string
+		status domain.ListingStatus
+	}{
+		{name: "closed listing", status: domain.ListingStatusClosed},
+		{name: "awarded listing", status: domain.ListingStatusAwarded},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			ownerID := uuid.New()
+			listing := &domain.Listing{
+				ID:          uuid.New(),
+				OwnerUserID: ownerID,
+				Status:      tc.status,
+				CreatedAt:   time.Now().UTC(),
+				UpdatedAt:   time.Now().UTC(),
+			}
+
+			svc := newAttachmentService(
+				newFakeAttachmentStore(),
+				newFakeListingStore(listing),
+				newFakeCollaboratorStore(),
+				&fakeFileClient{},
+			)
+
+			_, err := svc.Attach(context.Background(), listing.ID, ownerID, validAttachInput())
+
+			require.Error(t, err)
+			assert.True(t, errors.Is(err, domain.ErrListingNotOpen),
+				"expected ErrListingNotOpen for %s listing, got: %v", tc.name, err)
+		})
+	}
+}
+
 // --- DownloadURL tests ---
 
 func TestAttachmentService_DownloadURL_OpenListingAnyoneCanPresign(t *testing.T) {
@@ -617,6 +656,41 @@ func TestAttachmentService_DownloadURL_OpenListingAnyoneCanPresign(t *testing.T)
 
 	require.NoError(t, err)
 	assert.Equal(t, "https://example.com/presigned", url)
+}
+
+// TestAttachmentService_DownloadURL_ClosedListingForbidsStranger mirrors
+// TestAttachmentService_List_ClosedListingForbidsStranger for the DownloadURL path.
+// A stranger (non-owner, non-collaborator) must be rejected on a non-OPEN listing.
+func TestAttachmentService_DownloadURL_ClosedListingForbidsStranger(t *testing.T) {
+	ownerID := uuid.New()
+	strangerID := uuid.New()
+	listing := &domain.Listing{
+		ID:          uuid.New(),
+		OwnerUserID: ownerID,
+		Status:      domain.ListingStatusClosed,
+	}
+
+	attachStore := newFakeAttachmentStore()
+	a := &domain.ListingAttachment{
+		ID:        uuid.New(),
+		ListingID: listing.ID,
+		FileID:    uuid.New(),
+		CreatedAt: time.Now().UTC(),
+	}
+	attachStore.attachments[a.ID] = a
+
+	svc := newAttachmentService(
+		attachStore,
+		newFakeListingStore(listing),
+		newFakeCollaboratorStore(),
+		&fakeFileClient{},
+	)
+
+	_, err := svc.DownloadURL(context.Background(), listing.ID, a.ID, strangerID)
+
+	require.Error(t, err)
+	assert.True(t, errors.Is(err, domain.ErrAttachmentForbidden),
+		"stranger must be forbidden on a closed listing, got: %v", err)
 }
 
 func TestAttachmentService_DownloadURL_FileClientError(t *testing.T) {

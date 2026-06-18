@@ -216,3 +216,36 @@ func TestHTTPFileClient_PresignAttachment_MissingURLMapsToUpstreamFile(t *testin
 	require.Error(t, err)
 	assert.True(t, errors.Is(err, domain.ErrUpstreamFile))
 }
+
+// TestHTTPFileClient_RegisterAttachment_CancelledContextPropagates verifies that a
+// context cancellation (e.g. caller timeout) surfaces as an error rather than silently
+// succeeding. The unreachable server forces the underlying net/http Do to return a
+// context error, which doPost wraps — the caller just needs to see a non-nil error.
+func TestHTTPFileClient_RegisterAttachment_CancelledContextPropagates(t *testing.T) {
+	// Point at a non-existent address so the dial attempt is never completed.
+	// Use 192.0.2.0/24 (TEST-NET-1, RFC 5737) — guaranteed unroutable.
+	c := client.NewHTTPFileClient("http://192.0.2.1:19999", testFileServiceID, testFileServiceToken)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel() // cancel immediately before the request is issued
+
+	err := c.RegisterAttachment(ctx, uuid.New(), uuid.New(), uuid.New())
+
+	require.Error(t, err,
+		"canceled context must propagate as an error; ErrUpstreamFile is not required here "+
+			"because the error originates in net/http transport, not from a well-formed upstream response")
+}
+
+// TestHTTPFileClient_PresignAttachment_CancelledContextPropagates mirrors the above
+// for the presign path.
+func TestHTTPFileClient_PresignAttachment_CancelledContextPropagates(t *testing.T) {
+	c := client.NewHTTPFileClient("http://192.0.2.1:19999", testFileServiceID, testFileServiceToken)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel() // cancel immediately
+
+	_, err := c.PresignAttachment(ctx, uuid.New(), uuid.New())
+
+	require.Error(t, err,
+		"canceled context must propagate as an error on the presign path")
+}

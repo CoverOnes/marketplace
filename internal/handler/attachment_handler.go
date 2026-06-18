@@ -30,6 +30,20 @@ type AttachmentHandler struct {
 	svc *service.AttachmentService
 }
 
+// filenameContainsControlChars reports whether s contains any ASCII control
+// character below 0x20 (except horizontal tab, which is harmless). This guards
+// against null bytes, CRLF injection, and ANSI escape sequences that could
+// propagate into HTTP headers (Content-Disposition) or log lines.
+func filenameContainsControlChars(s string) bool {
+	for _, r := range s {
+		if r < 0x20 && r != '\t' {
+			return true
+		}
+	}
+
+	return false
+}
+
 // NewAttachmentHandler returns an AttachmentHandler.
 func NewAttachmentHandler(svc *service.AttachmentService) *AttachmentHandler {
 	return &AttachmentHandler{svc: svc}
@@ -81,7 +95,9 @@ func (h *AttachmentHandler) Attach(c *gin.Context) {
 
 	var req AttachRequest
 	if err := c.ShouldBindJSON(&req); err != nil {
-		httpx.ErrCode(c, http.StatusBadRequest, "VALIDATION_ERROR", err.Error())
+		// Do NOT forward err.Error() — it can leak internal JSON parser details
+		// (field names, type mismatch descriptions) to the caller (info leak fix).
+		httpx.ErrCode(c, http.StatusBadRequest, "VALIDATION_ERROR", "request body is invalid")
 		return
 	}
 
@@ -103,6 +119,13 @@ func (h *AttachmentHandler) Attach(c *gin.Context) {
 
 	if len(req.Filename) > maxFilenameLen {
 		httpx.ErrCode(c, http.StatusBadRequest, "VALIDATION_ERROR", "filename must be at most 255 characters")
+		return
+	}
+
+	// Reject control characters in filename (null bytes, CRLF, ANSI escape sequences)
+	// to prevent downstream header injection and log forging via Content-Disposition.
+	if filenameContainsControlChars(req.Filename) {
+		httpx.ErrCode(c, http.StatusBadRequest, "VALIDATION_ERROR", "filename contains invalid characters")
 		return
 	}
 
@@ -255,6 +278,13 @@ func translateAttachmentError(c *gin.Context, err error) {
 	switch {
 	case errors.Is(err, domain.ErrListingNotFound):
 		httpx.ErrCode(c, http.StatusNotFound, "LISTING_NOT_FOUND", "listing not found")
+
+	case errors.Is(err, domain.ErrListingNotOpen):
+		// 409 Conflict: the resource exists but its current state (AWARDED/CLOSED)
+		// conflicts with the requested operation (attach). Mirrors how the workspace
+		// service surfaces status-gate violations (ErrInvalidTenderTransition → 409).
+		httpx.ErrCode(c, http.StatusConflict, "LISTING_NOT_OPEN",
+			"attachments can only be added to an open listing")
 
 	case errors.Is(err, domain.ErrAttachmentNotFound):
 		httpx.ErrCode(c, http.StatusNotFound, "ATTACHMENT_NOT_FOUND", "attachment not found")
