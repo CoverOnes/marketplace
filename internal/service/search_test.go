@@ -41,7 +41,7 @@ func TestListingService_SearchListings_VisibilityWiredToStore(t *testing.T) {
 
 	ls := newStubListingStore()
 	ls.searchResult = []*domain.Listing{openMine}
-	svc := service.NewListingService(ls)
+	svc := service.NewListingService(ls, nil)
 
 	res, err := svc.SearchListings(context.Background(), &service.SearchListingsInput{
 		CallerID: caller,
@@ -104,7 +104,7 @@ func TestListingService_SearchListings_Pagination(t *testing.T) {
 
 			ls := newStubListingStore()
 			ls.searchResult = tc.stored
-			svc := service.NewListingService(ls)
+			svc := service.NewListingService(ls, nil)
 
 			res, err := svc.SearchListings(context.Background(), &service.SearchListingsInput{
 				CallerID: caller,
@@ -163,7 +163,7 @@ func TestListingService_SearchListings_Validation(t *testing.T) {
 			t.Parallel()
 
 			ls := newStubListingStore()
-			svc := service.NewListingService(ls)
+			svc := service.NewListingService(ls, nil)
 
 			input := tc.in
 			_, err := svc.SearchListings(context.Background(), &input)
@@ -180,7 +180,7 @@ func TestListingService_SearchListings_LimitClamp(t *testing.T) {
 
 	caller := uuid.New()
 	ls := newStubListingStore()
-	svc := service.NewListingService(ls)
+	svc := service.NewListingService(ls, nil)
 
 	_, err := svc.SearchListings(context.Background(), &service.SearchListingsInput{
 		CallerID: caller,

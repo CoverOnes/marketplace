@@ -145,6 +145,32 @@ func (m *MilestoneTxManager) WithMilestoneTx(
 	})
 }
 
+// ListingOutboxTxManager implements store.ListingOutboxTxManager using pgxpool.Pool.
+// It wraps a listing create/update + outbox Enqueue in a single transaction so
+// the embedding_reindex event is never lost on crash (same-tx outbox pattern).
+type ListingOutboxTxManager struct {
+	pool *pgxpool.Pool
+}
+
+// NewListingOutboxTxManager returns a ListingOutboxTxManager backed by the given pool.
+func NewListingOutboxTxManager(pool *pgxpool.Pool) *ListingOutboxTxManager {
+	return &ListingOutboxTxManager{pool: pool}
+}
+
+// WithListingOutboxTx runs fn inside a single Postgres transaction with a
+// listing store and a transaction-scoped outbox store.
+func (m *ListingOutboxTxManager) WithListingOutboxTx(
+	ctx context.Context,
+	fn func(ctx context.Context, listings store.ListingStore, outbox store.OutboxStore) error,
+) error {
+	return runTx(ctx, m.pool, func(tx pgx.Tx) error {
+		txListings := &txListingStore{tx: tx}
+		txOutbox := &txOutboxStore{tx: tx}
+
+		return fn(ctx, txListings, txOutbox)
+	})
+}
+
 // BidOutboxTxManager implements store.BidOutboxTxManager using pgxpool.Pool.
 // It runs the bid accept operation and outbox Enqueue in a single transaction
 // to standardize the ad-hoc bid_service MarkEventPublished flag onto the outbox.
