@@ -34,3 +34,9 @@ CREATE TABLE ai_recommendation (
 -- by recency. Partial index not applicable -- subject_user_id cardinality is high.
 CREATE INDEX ai_recommendation_subject_created_idx
     ON ai_recommendation (subject_user_id, created_at DESC);
+
+-- Retention scan index: the retention runner DELETEs rows WHERE created_at < cutoff.
+-- A standalone created_at index allows an index-only scan on the retention DELETE
+-- without touching the composite subject index above.
+CREATE INDEX ai_recommendation_created_at_idx
+    ON ai_recommendation (created_at);

@@ -59,7 +59,7 @@ func TestRecommendationStore_Insert_Integration(t *testing.T) {
 
 	require.NoError(t, s.Insert(ctx, rec))
 
-	rows, err := s.ListBySubject(ctx, subjectID)
+	rows, err := s.ListBySubject(ctx, subjectID, 0)
 	require.NoError(t, err)
 	require.Len(t, rows, 1)
 
@@ -163,7 +163,7 @@ func TestRecommendationStore_ListBySubject_MultipleRows_Integration(t *testing.T
 	recB := makeRecommendation(subjectB, "tender_match")
 	require.NoError(t, s.Insert(ctx, recB))
 
-	rows, err := s.ListBySubject(ctx, subjectA)
+	rows, err := s.ListBySubject(ctx, subjectA, 0)
 	require.NoError(t, err)
 	require.Len(t, rows, 2, "must return exactly 2 rows for subjectA")
 
@@ -183,7 +183,7 @@ func TestRecommendationStore_ListBySubject_Empty_Integration(t *testing.T) {
 	ctx := context.Background()
 	s := pgstore.NewRecommendationStore(sharedTestPool)
 
-	rows, err := s.ListBySubject(ctx, uuid.New())
+	rows, err := s.ListBySubject(ctx, uuid.New(), 0)
 	require.NoError(t, err)
 	assert.Empty(t, rows)
 }
@@ -215,7 +215,7 @@ func TestRecommendationStore_Retention_Integration(t *testing.T) {
 	assert.Equal(t, int64(1), n, "exactly one old row must be deleted")
 
 	// The new row must survive.
-	rows, err := s.ListBySubject(ctx, subjectID)
+	rows, err := s.ListBySubject(ctx, subjectID, 0)
 	require.NoError(t, err)
 	require.Len(t, rows, 1, "new row must survive retention delete")
 	assert.Equal(t, newRec.ID, rows[0].ID)
@@ -238,7 +238,7 @@ func TestRecommendationStore_Retention_DeleteAll_Integration(t *testing.T) {
 	require.NoError(t, err)
 	assert.GreaterOrEqual(t, n, int64(1), "at least one row must be deleted")
 
-	rows, err := s.ListBySubject(ctx, subjectID)
+	rows, err := s.ListBySubject(ctx, subjectID, 0)
 	require.NoError(t, err)
 	assert.Empty(t, rows, "no rows must remain after full retention delete")
 }
@@ -269,7 +269,7 @@ func TestRecommendationStore_AcceptedField_Integration(t *testing.T) {
 			rec.Accepted = tc.accepted
 			require.NoError(t, s.Insert(ctx, rec))
 
-			rows, err := s.ListBySubject(ctx, subjectID)
+			rows, err := s.ListBySubject(ctx, subjectID, 0)
 			require.NoError(t, err)
 			require.Len(t, rows, 1)
 
@@ -339,4 +339,160 @@ func TestRecommendationStore_MigrationDDL_Integration(t *testing.T) {
 
 	require.NoError(t, err)
 	assert.Equal(t, 0, fkCount, "ai_recommendation must have ZERO foreign key constraints (CLAUDE.md #9)")
+
+	// Verify created_at index exists (db-inspector item 7).
+	var createdAtIdxExists bool
+
+	err = sharedTestPool.QueryRow(
+		ctx,
+		`SELECT EXISTS (
+			SELECT 1 FROM pg_indexes
+			WHERE indexname = 'ai_recommendation_created_at_idx'
+		)`,
+	).Scan(&createdAtIdxExists)
+
+	require.NoError(t, err)
+	assert.True(t, createdAtIdxExists, "ai_recommendation_created_at_idx must exist after migration 000013")
+}
+
+// TestRecommendationStore_ScoreBreakdownValidation_Integration verifies that
+// Insert rejects sub-dimension scores outside [0, 1].
+func TestRecommendationStore_ScoreBreakdownValidation_Integration(t *testing.T) {
+	ctx := context.Background()
+	s := pgstore.NewRecommendationStore(sharedTestPool)
+	subjectID := uuid.New()
+
+	tests := []struct {
+		name    string
+		mutate  func(r *domain.AIRecommendation)
+		wantErr string
+	}{
+		{
+			name: "skill below 0",
+			mutate: func(r *domain.AIRecommendation) {
+				r.ScoreBreakdown.Skill = -0.1
+			},
+			wantErr: "score_breakdown.skill must be in [0, 1]",
+		},
+		{
+			name: "reliability above 1",
+			mutate: func(r *domain.AIRecommendation) {
+				r.ScoreBreakdown.Reliability = 1.01
+			},
+			wantErr: "score_breakdown.reliability must be in [0, 1]",
+		},
+		{
+			name: "collab below 0",
+			mutate: func(r *domain.AIRecommendation) {
+				r.ScoreBreakdown.Collab = -1.0
+			},
+			wantErr: "score_breakdown.collab must be in [0, 1]",
+		},
+		{
+			name: "fit above 1",
+			mutate: func(r *domain.AIRecommendation) {
+				r.ScoreBreakdown.Fit = 2.0
+			},
+			wantErr: "score_breakdown.fit must be in [0, 1]",
+		},
+		{
+			name: "comm below 0",
+			mutate: func(r *domain.AIRecommendation) {
+				r.ScoreBreakdown.Comm = -0.5
+			},
+			wantErr: "score_breakdown.comm must be in [0, 1]",
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			rec := makeRecommendation(subjectID, "vendor_match")
+			tc.mutate(rec)
+			err := s.Insert(ctx, rec)
+			require.Error(t, err)
+			assert.Contains(t, err.Error(), tc.wantErr)
+		})
+	}
+}
+
+// TestRecommendationStore_BasisSanitization_Integration verifies that Insert
+// rejects basis strings with control characters or over the rune cap, and that
+// credential patterns are redacted before persistence.
+func TestRecommendationStore_BasisSanitization_Integration(t *testing.T) {
+	ctx := context.Background()
+	resetRecommendations(ctx, t)
+	s := pgstore.NewRecommendationStore(sharedTestPool)
+	subjectID := uuid.New()
+
+	// Basis with null byte must be rejected.
+	t.Run("null byte rejected", func(t *testing.T) {
+		rec := makeRecommendation(subjectID, "vendor_match")
+		nullBasis := "good match\x00injected"
+		rec.Basis = &nullBasis
+		require.ErrorContains(t, s.Insert(ctx, rec), "invalid control characters")
+	})
+
+	// Basis with newline must be rejected.
+	t.Run("newline rejected", func(t *testing.T) {
+		rec := makeRecommendation(subjectID, "vendor_match")
+		newlineBasis := "line1\nline2"
+		rec.Basis = &newlineBasis
+		require.ErrorContains(t, s.Insert(ctx, rec), "invalid control characters")
+	})
+
+	// Basis exceeding maxBasisRunes must be rejected.
+	t.Run("too long basis rejected", func(t *testing.T) {
+		rec := makeRecommendation(subjectID, "vendor_match")
+		// Fill with 'a' runes so the control-char check passes and we reach the length check.
+		runeSlice := make([]rune, 5001)
+		for i := range runeSlice {
+			runeSlice[i] = 'a'
+		}
+		longBasis := string(runeSlice)
+		rec.Basis = &longBasis
+		require.ErrorContains(t, s.Insert(ctx, rec), "exceeds maximum length")
+	})
+
+	// Basis with a credential pattern must be redacted before storing.
+	t.Run("credential redacted before storing", func(t *testing.T) {
+		rec := makeRecommendation(subjectID, "vendor_match")
+		credBasis := "Good match. Key: ghp_ABCDEF1234567890 was present." //nolint:gosec // G101 false positive: test fixture string, not a real credential
+		rec.Basis = &credBasis
+		require.NoError(t, s.Insert(ctx, rec))
+
+		rows, err := s.ListBySubject(ctx, subjectID, 1)
+		require.NoError(t, err)
+		require.Len(t, rows, 1)
+		require.NotNil(t, rows[0].Basis)
+		assert.Contains(t, *rows[0].Basis, "[REDACTED]")
+		assert.NotContains(t, *rows[0].Basis, "ghp_ABCDEF1234567890")
+	})
+}
+
+// TestRecommendationStore_ListBySubject_Limit_Integration verifies that
+// ListBySubject honors the explicit limit parameter.
+func TestRecommendationStore_ListBySubject_Limit_Integration(t *testing.T) {
+	ctx := context.Background()
+	resetRecommendations(ctx, t)
+	s := pgstore.NewRecommendationStore(sharedTestPool)
+
+	subjectID := uuid.New()
+
+	// Insert 3 rows with distinct timestamps.
+	for i := range 3 {
+		rec := makeRecommendation(subjectID, "vendor_match")
+		rec.CreatedAt = time.Now().UTC().Add(time.Duration(-i) * time.Hour).Truncate(time.Millisecond)
+		rec.ID = uuid.New()
+		require.NoError(t, s.Insert(ctx, rec))
+	}
+
+	// Request only 2 rows; must not return all 3.
+	rows, err := s.ListBySubject(ctx, subjectID, 2)
+	require.NoError(t, err)
+	assert.Len(t, rows, 2, "limit=2 must return exactly 2 rows")
+
+	// limit=0 uses default (200); all 3 rows returned.
+	all, err := s.ListBySubject(ctx, subjectID, 0)
+	require.NoError(t, err)
+	assert.Len(t, all, 3, "limit=0 must use default and return all 3 rows")
 }

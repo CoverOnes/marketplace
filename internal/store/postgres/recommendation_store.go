@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"regexp"
 	"time"
 	"unicode/utf8"
 
@@ -23,7 +24,38 @@ const (
 	// maxModelVersionLenRec is the maximum rune count for model_version in ai_recommendation.
 	// MUST match CHECK (char_length(model_version) BETWEEN 1 AND 100) in migration 000013.
 	maxModelVersionLenRec = 100
+
+	// maxBasisRunes is the maximum rune count for the basis field (backend-security §5.4).
+	maxBasisRunes = 5000
+
+	// defaultListBySubjectLimit is the default and maximum number of rows returned
+	// by ListBySubject when limit <= 0.
+	defaultListBySubjectLimit = 200
 )
+
+// credentialPatterns are the regex patterns applied by redactBasis to scrub
+// credential-like strings from AI-generated basis text before persisting
+// (backend-security §3.1). Patterns mirror the spec in backend-security-design.md.
+var credentialPatterns = []*regexp.Regexp{ // package-level compiled regexes; initialized once at startup, never mutated
+	regexp.MustCompile(`sk_live_[A-Za-z0-9_]+`),
+	regexp.MustCompile(`ghp_[A-Za-z0-9_]+`),
+	regexp.MustCompile(`xoxb-[A-Za-z0-9_-]+`),
+	regexp.MustCompile(`Bearer ey[A-Za-z0-9._-]+`),
+	regexp.MustCompile(`postgres://[^:]+:[^@]+@\S+`),
+	regexp.MustCompile(`AKIA[0-9A-Z]{16}`),
+	regexp.MustCompile(`(?i)password[=:]\s*['"]?[^\s'"]+`),
+	regexp.MustCompile(`(?i)api[_-]?key[=:]\s*['"]?[^\s'"]+`),
+}
+
+// redactBasis applies the §3.1 credential patterns to text, replacing each
+// match with [REDACTED]. It is called on *r.Basis before any DB Exec.
+func redactBasis(text string) string {
+	for _, re := range credentialPatterns {
+		text = re.ReplaceAllString(text, "[REDACTED]")
+	}
+
+	return text
+}
 
 // RecommendationStore is a pool-backed recommendation store.
 // It satisfies store.RecommendationStore.
@@ -45,10 +77,11 @@ func (s *RecommendationStore) Insert(ctx context.Context, r *domain.AIRecommenda
 	return insertRecommendation(ctx, s.q, r)
 }
 
-// ListBySubject returns all recommendation rows for subjectUserID ordered by
-// created_at descending.
-func (s *RecommendationStore) ListBySubject(ctx context.Context, subjectUserID uuid.UUID) ([]*domain.AIRecommendation, error) {
-	return listRecommendationsBySubject(ctx, s.q, subjectUserID)
+// ListBySubject returns up to limit recommendation rows for subjectUserID
+// ordered by created_at descending. limit is clamped to defaultListBySubjectLimit
+// when <= 0.
+func (s *RecommendationStore) ListBySubject(ctx context.Context, subjectUserID uuid.UUID, limit int) ([]*domain.AIRecommendation, error) {
+	return listRecommendationsBySubject(ctx, s.q, subjectUserID, limit)
 }
 
 // DeleteOlderThan removes rows with created_at < cutoff. Returns row count deleted.
@@ -81,6 +114,15 @@ func insertRecommendation(ctx context.Context, q querier, r *domain.AIRecommenda
 		return fmt.Errorf("insert recommendation: overall_score must be in [0, 1] (got %v)", r.OverallScore)
 	}
 
+	if err := validateScoreBreakdown(r.ScoreBreakdown); err != nil {
+		return err
+	}
+
+	basisVal, err := prepareBasis(r.Basis)
+	if err != nil {
+		return err
+	}
+
 	breakdownJSON, err := json.Marshal(r.ScoreBreakdown)
 	if err != nil {
 		return fmt.Errorf("insert recommendation: marshal score_breakdown: %w", err)
@@ -97,7 +139,7 @@ VALUES
 	_, execErr := q.Exec(
 		ctx, query,
 		r.ID, r.RecommendationType, r.TargetID, r.SubjectUserID,
-		r.OverallScore, breakdownJSON, r.Basis, r.Accepted, r.ModelVersion, r.CreatedAt,
+		r.OverallScore, breakdownJSON, basisVal, r.Accepted, r.ModelVersion, r.CreatedAt,
 	)
 	if execErr != nil {
 		return fmt.Errorf("insert recommendation: %w", execErr)
@@ -106,16 +148,74 @@ VALUES
 	return nil
 }
 
-func listRecommendationsBySubject(ctx context.Context, q querier, subjectUserID uuid.UUID) ([]*domain.AIRecommendation, error) {
+// validateScoreBreakdown rejects any ScoreBreakdown sub-dimension outside [0, 1]
+// (security finding Mi-1).
+func validateScoreBreakdown(bd domain.ScoreBreakdown) error {
+	for dimName, val := range map[string]float64{
+		"skill":       bd.Skill,
+		"reliability": bd.Reliability,
+		"collab":      bd.Collab,
+		"fit":         bd.Fit,
+		"comm":        bd.Comm,
+	} {
+		if val < 0 || val > 1 {
+			return fmt.Errorf(
+				"insert recommendation: score_breakdown.%s must be in [0, 1] (got %v)",
+				dimName, val,
+			)
+		}
+	}
+
+	return nil
+}
+
+// prepareBasis sanitizes and redacts the optional basis string before persist
+// (backend-security §3.1 + §5.4). Returns a pointer to the sanitized+redacted
+// copy, or nil when basis is nil. Returns an error when the text fails sanity
+// checks (control chars, length cap).
+func prepareBasis(basis *string) (*string, error) {
+	if basis == nil {
+		return nil, nil
+	}
+
+	sanitized := *basis
+
+	// Reject control characters (backend-security §5.4).
+	for _, ch := range sanitized {
+		if ch == '\x00' || ch == '\r' || ch == '\n' || (ch < 0x20 && ch != '\t') {
+			return nil, fmt.Errorf("insert recommendation: basis contains invalid control characters")
+		}
+	}
+
+	// Cap length at maxBasisRunes (backend-security §5.4).
+	if utf8.RuneCountInString(sanitized) > maxBasisRunes {
+		return nil, fmt.Errorf(
+			"insert recommendation: basis exceeds maximum length of %d runes",
+			maxBasisRunes,
+		)
+	}
+
+	// Apply credential redaction (backend-security §3.1).
+	redacted := redactBasis(sanitized)
+
+	return &redacted, nil
+}
+
+func listRecommendationsBySubject(ctx context.Context, q querier, subjectUserID uuid.UUID, limit int) ([]*domain.AIRecommendation, error) {
+	if limit <= 0 {
+		limit = defaultListBySubjectLimit
+	}
+
 	const query = `
 SELECT id, recommendation_type, target_id, subject_user_id,
        overall_score, score_breakdown, basis, accepted, model_version, created_at
 FROM ai_recommendation
 WHERE subject_user_id = $1
 ORDER BY created_at DESC
+LIMIT $2
 `
 
-	rows, err := q.Query(ctx, query, subjectUserID)
+	rows, err := q.Query(ctx, query, subjectUserID, limit)
 	if err != nil {
 		return nil, fmt.Errorf("list recommendations by subject: %w", err)
 	}
