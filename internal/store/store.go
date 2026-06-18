@@ -242,3 +242,22 @@ type EmbeddingStore interface {
 	// values > 200 are reduced to 200 to prevent full-index OOM scans.
 	NearestNeighbors(ctx context.Context, queryVec []float32, entityType domain.EmbeddingEntityType, topK int) ([]*domain.Embedding, error)
 }
+
+// RecommendationStore defines persistence operations for AI recommendation audit rows.
+type RecommendationStore interface {
+	// Insert writes one AI recommendation audit row.
+	// The Basis field MUST be redacted by the caller before calling Insert
+	// (backend-security §3.1): any generated text matching credential patterns
+	// must be replaced with [REDACTED:type] before reaching the store layer.
+	Insert(ctx context.Context, r *domain.AIRecommendation) error
+
+	// ListBySubject returns up to limit recommendation rows for the given subject
+	// user, ordered by created_at descending (most recent first).
+	// limit is clamped to 200 when <= 0 the default of 200 is used.
+	ListBySubject(ctx context.Context, subjectUserID uuid.UUID, limit int) ([]*domain.AIRecommendation, error)
+
+	// DeleteOlderThan removes ai_recommendation rows with created_at < cutoff.
+	// Returns the number of rows deleted.
+	// Called by the retention runner (30-day TTL per migration 000013 comment).
+	DeleteOlderThan(ctx context.Context, cutoff time.Time) (int64, error)
+}

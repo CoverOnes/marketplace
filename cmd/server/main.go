@@ -19,6 +19,7 @@ import (
 	"github.com/CoverOnes/marketplace/internal/handler"
 	"github.com/CoverOnes/marketplace/internal/outbox"
 	"github.com/CoverOnes/marketplace/internal/platform/logger"
+	"github.com/CoverOnes/marketplace/internal/recommendation"
 	"github.com/CoverOnes/marketplace/internal/service"
 	"github.com/CoverOnes/marketplace/internal/store/postgres"
 	"github.com/redis/go-redis/v9"
@@ -208,6 +209,16 @@ func run() error {
 	defer pollerCancel()
 
 	startOutboxPoller(pollerCtx, redisClient, outboxStore)
+
+	// Recommendation retention runner — deletes ai_recommendation rows older
+	// than 30 days on a 24-hour cycle (backend-security §1.3 TTL requirement).
+	// Uses pollerCtx so it is canceled on graceful shutdown alongside the poller.
+	recStore := postgres.NewRecommendationStore(pool)
+	retentionRunner := recommendation.NewRetentionRunner(recStore, 0) // 0 = 24h default
+
+	go retentionRunner.Run(pollerCtx)
+
+	slog.Info("recommendation retention runner started")
 
 	// Router.
 	r := handler.NewRouter(&handler.RouterConfig{
