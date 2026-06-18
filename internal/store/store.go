@@ -203,6 +203,18 @@ type BidOutboxTxManager interface {
 	) error) error
 }
 
+// ListingOutboxTxManager wraps a listing create/update operation + outbox Enqueue
+// in a single Postgres transaction. Used by ListingService.CreateListing and
+// UpdateListing to enqueue embedding_reindex events in the same tx as the listing
+// write (same-tx outbox pattern — backend-security §1.3 / outbox §2).
+type ListingOutboxTxManager interface {
+	WithListingOutboxTx(ctx context.Context, fn func(
+		ctx context.Context,
+		listings ListingStore,
+		outbox OutboxStore,
+	) error) error
+}
+
 // ListingAttachmentStore defines persistence operations for listing attachments.
 // Attachments are soft-references to file_objects in the file service.
 // Referential integrity (file exists, STORED status, owner-match, MIME allowlist)

@@ -194,7 +194,7 @@ func (s *stubListingStoreH) Update(_ context.Context, l *domain.Listing) error {
 func buildListingRouter(ls *stubListingStoreH) *gin.Engine {
 	gin.SetMode(gin.TestMode)
 
-	svc := service.NewListingService(ls)
+	svc := service.NewListingService(ls, nil) // nil outbox: no embedding in handler tests
 	h := handler.NewListingHandler(svc)
 
 	r := gin.New()

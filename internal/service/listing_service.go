@@ -8,6 +8,7 @@ import (
 	"unicode/utf8"
 
 	"github.com/CoverOnes/marketplace/internal/domain"
+	"github.com/CoverOnes/marketplace/internal/outbox"
 	"github.com/CoverOnes/marketplace/internal/store"
 	"github.com/google/uuid"
 	"github.com/shopspring/decimal"
@@ -15,12 +16,15 @@ import (
 
 // ListingService handles listing business logic.
 type ListingService struct {
-	listings store.ListingStore
+	listings      store.ListingStore
+	listingOutbox store.ListingOutboxTxManager // nil → no outbox (non-tender / disabled)
 }
 
 // NewListingService returns a ListingService.
-func NewListingService(listings store.ListingStore) *ListingService {
-	return &ListingService{listings: listings}
+// listingOutbox may be nil; when nil, no outbox event is enqueued on create/update.
+// Pass a real ListingOutboxTxManager to enable same-tx embedding_reindex enqueue.
+func NewListingService(listings store.ListingStore, listingOutbox store.ListingOutboxTxManager) *ListingService {
+	return &ListingService{listings: listings, listingOutbox: listingOutbox}
 }
 
 // CreateListingInput carries validated input for creating a listing.
@@ -39,6 +43,8 @@ type CreateListingInput struct {
 // CreateListing creates a new listing owned by the calling user.
 // The OwnerUserID MUST be set exclusively from the X-User-Id header — never from the request body.
 // When IsTender=true the listing is created with tender_status='OPEN' and recruiter_mode='CLOSED'.
+// When IsTender=true and a ListingOutboxTxManager is configured, an embedding_reindex event is
+// enqueued in the same transaction as the listing insert (same-tx outbox pattern).
 func (s *ListingService) CreateListing(ctx context.Context, in *CreateListingInput) (*domain.Listing, error) {
 	if err := validateListingInput(in.Title, in.Description, in.BudgetMin, in.BudgetMax, in.Currency); err != nil {
 		return nil, err
@@ -72,11 +78,43 @@ func (s *ListingService) CreateListing(ctx context.Context, in *CreateListingInp
 		l.KYCTierRequired = in.KYCTierRequired
 	}
 
+	// When creating a tender and the outbox tx manager is configured, run the insert
+	// + outbox enqueue in the same transaction (same-tx outbox pattern). For classic
+	// (non-tender) listings no embedding is needed, so fall back to the plain insert.
+	if in.IsTender && s.listingOutbox != nil {
+		return s.createTenderWithOutbox(ctx, l)
+	}
+
 	if err := s.listings.Create(ctx, l); err != nil {
 		return nil, fmt.Errorf("create listing: %w", err)
 	}
 
 	return l, nil
+}
+
+// createTenderWithOutbox inserts the tender listing and enqueues an
+// embedding_reindex event in a single Postgres transaction.
+func (s *ListingService) createTenderWithOutbox(ctx context.Context, l *domain.Listing) (*domain.Listing, error) {
+	var created *domain.Listing
+
+	err := s.listingOutbox.WithListingOutboxTx(ctx, func(txCtx context.Context, listings store.ListingStore, ob store.OutboxStore) error {
+		if createErr := listings.Create(txCtx, l); createErr != nil {
+			return fmt.Errorf("create listing: %w", createErr)
+		}
+
+		if enqErr := outbox.EnqueueTenderEmbeddingReindex(txCtx, ob, l.ID); enqErr != nil {
+			return fmt.Errorf("enqueue embedding_reindex: %w", enqErr)
+		}
+
+		created = l
+
+		return nil
+	})
+	if err != nil {
+		return nil, err
+	}
+
+	return created, nil
 }
 
 // GetListing returns a listing by ID, applying the listing visibility rule
@@ -242,6 +280,9 @@ type UpdateListingInput struct {
 // UpdateListing applies a partial update to a listing.
 // Returns ErrListingNotFound if not found, ErrForbidden if caller is not owner,
 // ErrListingNotOpen if listing is not in OPEN status.
+// When updating a tender and the embeddable text (title or description) changes,
+// an embedding_reindex event is enqueued in the same transaction as the update.
+// Budget-only or currency-only updates do NOT enqueue a reindex (cost control).
 func (s *ListingService) UpdateListing(ctx context.Context, in UpdateListingInput) (*domain.Listing, error) {
 	l, err := s.listings.GetByID(ctx, in.ID)
 	if err != nil {
@@ -256,6 +297,10 @@ func (s *ListingService) UpdateListing(ctx context.Context, in UpdateListingInpu
 	if l.Status != domain.ListingStatusOpen {
 		return nil, fmt.Errorf("%w: only OPEN listings can be updated", domain.ErrListingNotOpen)
 	}
+
+	// Snapshot embeddable text before applying changes, to detect drift.
+	oldTitle := l.Title
+	oldDescription := l.Description
 
 	// Apply partial fields.
 	if in.Title != nil {
@@ -282,11 +327,43 @@ func (s *ListingService) UpdateListing(ctx context.Context, in UpdateListingInpu
 		return nil, err
 	}
 
+	// Determine whether embeddable text changed — only then schedule a reindex.
+	textChanged := l.Title != oldTitle || l.Description != oldDescription
+
+	if l.IsTender && textChanged && s.listingOutbox != nil {
+		return s.updateTenderWithOutbox(ctx, l)
+	}
+
 	if err := s.listings.Update(ctx, l); err != nil {
 		return nil, err
 	}
 
 	return l, nil
+}
+
+// updateTenderWithOutbox updates the tender listing and enqueues an
+// embedding_reindex event in a single Postgres transaction.
+func (s *ListingService) updateTenderWithOutbox(ctx context.Context, l *domain.Listing) (*domain.Listing, error) {
+	var updated *domain.Listing
+
+	err := s.listingOutbox.WithListingOutboxTx(ctx, func(txCtx context.Context, listings store.ListingStore, ob store.OutboxStore) error {
+		if updateErr := listings.Update(txCtx, l); updateErr != nil {
+			return updateErr
+		}
+
+		if enqErr := outbox.EnqueueTenderEmbeddingReindex(txCtx, ob, l.ID); enqErr != nil {
+			return fmt.Errorf("enqueue embedding_reindex: %w", enqErr)
+		}
+
+		updated = l
+
+		return nil
+	})
+	if err != nil {
+		return nil, err
+	}
+
+	return updated, nil
 }
 
 // maxNumeric14_2 is the maximum value representable by numeric(14,2): 999999999999.99.

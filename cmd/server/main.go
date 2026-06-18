@@ -15,6 +15,7 @@ import (
 
 	"github.com/CoverOnes/marketplace/internal/client"
 	"github.com/CoverOnes/marketplace/internal/config"
+	"github.com/CoverOnes/marketplace/internal/embedding"
 	"github.com/CoverOnes/marketplace/internal/events"
 	"github.com/CoverOnes/marketplace/internal/handler"
 	"github.com/CoverOnes/marketplace/internal/outbox"
@@ -87,16 +88,6 @@ func run() error {
 	// to isolate this service within a shared Aiven database.
 	// cfg.DBMaxConns / cfg.DBMinConns default to 10 / 2; lower them when sharing a
 	// small Aiven plan across multiple services (MARKETPLACE_DB_MAX_CONNS / _MIN_CONNS).
-	// IMPORTANT (M-1): This pool does NOT register the pgvector codec.
-	// Any handler or service that calls EmbeddingStore MUST use postgres.NewEmbeddingPool
-	// instead — it registers the pgvector codec via an AfterConnect hook. Using this plain
-	// pool with EmbeddingStore will produce "unknown type" scan errors at runtime.
-	// TODO: when wiring an EmbeddingStore consumer, replace or supplement this pool with
-	// postgres.NewEmbeddingPool(ctx, cfg.PostgresDSN, cfg.PostgresSchema, ...).
-	// TODO(#25/T2): wire client.NewEmbeddingClientFromConfig(client.EmbeddingClientConfig{
-	//   APIKey:  cfg.EmbeddingAPIKey, Model: cfg.EmbeddingModel,
-	//   BaseURL: cfg.EmbeddingBaseURL, Timeout: time.Duration(cfg.EmbeddingTimeoutSec)*time.Second,
-	// }) + switch EmbeddingStore consumers to NewEmbeddingPool when building the auto-embedding indexer.
 	pool, err := postgres.NewPool(ctx, cfg.PostgresDSN, cfg.PostgresSchema, postgres.PoolOptions{
 		MaxConns: int32(cfg.DBMaxConns),
 		MinConns: int32(cfg.DBMinConns),
@@ -108,6 +99,21 @@ func run() error {
 	defer pool.Close()
 
 	slog.Info("postgres connected")
+
+	// M-1 fix: EmbeddingStore requires a pgvector-codec-registered pool.
+	// NewEmbeddingPool adds an AfterConnect hook that calls pgxvec.RegisterTypes;
+	// using the plain pool with pgvector.NewVector scan produces "unknown type" errors.
+	embPool, err := postgres.NewEmbeddingPool(ctx, cfg.PostgresDSN, cfg.PostgresSchema, postgres.PoolOptions{
+		MaxConns: int32(cfg.DBMaxConns),
+		MinConns: int32(cfg.DBMinConns),
+	})
+	if err != nil {
+		return fmt.Errorf("connect embedding postgres: %w", err)
+	}
+
+	defer embPool.Close()
+
+	slog.Info("embedding postgres pool connected")
 
 	// Migrations are applied by `task migrate` in dev-stack (or the equivalent
 	// operator step in production) — NOT on boot. Running golang-migrate at boot
@@ -190,8 +196,21 @@ func run() error {
 		slog.Warn("MARKETPLACE_FILE_BASE_URL not set; file S2S calls are disabled (dev mode)")
 	}
 
+	// Embedding client — NoopEmbeddingClient when API key is unset or embedding is disabled.
+	embClient := client.NewEmbeddingClientFromConfig(client.EmbeddingClientConfig{
+		APIKey:  cfg.EmbeddingAPIKey,
+		Model:   cfg.EmbeddingModel,
+		BaseURL: cfg.EmbeddingBaseURL,
+		Timeout: time.Duration(cfg.EmbeddingTimeoutSec) * time.Second,
+	})
+
+	// EmbeddingStore + ListingOutboxTxManager for the auto-embedding pipeline (M-1 fix:
+	// embPool has pgvector codec registered via AfterConnect — plain pool would error).
+	embeddingStore := postgres.NewEmbeddingStore(embPool)
+	listingOutboxTxManager := postgres.NewListingOutboxTxManager(pool)
+
 	// Service layer.
-	listingSvc := service.NewListingService(listingStore)
+	listingSvc := service.NewListingService(listingStore, listingOutboxTxManager)
 	bidSvc := service.NewBidService(bidStore, listingStore, awardStore, txManager, bidOutboxTxManager, publisher, workspaceClient)
 	tenderSvc := service.NewTenderService(
 		listingStore,
@@ -213,6 +232,25 @@ func run() error {
 	defer pollerCancel()
 
 	startOutboxPoller(pollerCtx, redisClient, outboxStore)
+
+	// Embedding indexer — consumes marketplace.embedding_reindex outbox events,
+	// composes tender text, calls the embedding API, and upserts to the embeddings
+	// table. Starts only when the outbox poller is active (Redis present);
+	// when Redis is absent, outbox events are never delivered, so the indexer is a
+	// no-op drain — starting it is harmless but unnecessary.
+	// The indexer goroutine is also canceled on graceful shutdown via pollerCtx.
+	indexerOutboxStore := postgres.NewOutboxStore(pool)
+	indexer := embedding.NewIndexer(&embedding.IndexerConfig{
+		OutboxStore:    indexerOutboxStore,
+		ListingStore:   listingStore,
+		EmbeddingStore: embeddingStore,
+		EmbClient:      embClient,
+		ModelVersion:   cfg.EmbeddingModel,
+	})
+
+	go indexer.Run(pollerCtx)
+
+	slog.Info("embedding indexer started")
 
 	// Recommendation retention runner — deletes ai_recommendation rows older
 	// than 30 days on a 24-hour cycle (backend-security §1.3 TTL requirement).
