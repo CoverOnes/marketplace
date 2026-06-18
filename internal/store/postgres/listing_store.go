@@ -386,16 +386,17 @@ WHERE deleted_at IS NULL`)
 		n++
 	}
 
-	// Optional budget filters — same contract as lexical search.
+	// Optional budget filters — NULL-guard mirrors lexical buildSearchQuery:
+	// a listing with NULL budget_min/budget_max is included (no budget declared).
 	if filter.BudgetMin != nil {
-		fmt.Fprintf(&sb, " AND budget_max >= $%d", n)
-		args = append(args, filter.BudgetMin)
+		fmt.Fprintf(&sb, " AND (budget_max IS NULL OR budget_max >= $%d)", n)
+		args = append(args, decimalToString(filter.BudgetMin))
 		n++
 	}
 
 	if filter.BudgetMax != nil {
-		fmt.Fprintf(&sb, " AND budget_min <= $%d", n)
-		args = append(args, filter.BudgetMax)
+		fmt.Fprintf(&sb, " AND (budget_min IS NULL OR budget_min <= $%d)", n)
+		args = append(args, decimalToString(filter.BudgetMax))
 		n++
 	}
 

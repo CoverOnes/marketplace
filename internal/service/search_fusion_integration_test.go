@@ -566,6 +566,64 @@ func TestSearchFusion_SemanticBudgetFilter_Integration(t *testing.T) {
 	assert.True(t, found, "expensive listing (budget_max >= minBudget) must appear in semantic results")
 }
 
+// TestSearchFusion_SemanticBudgetNullParity_Integration verifies that a listing
+// with NULL budget_min/budget_max is INCLUDED when a minBudget filter is active
+// in semantic mode — matching the lexical-mode behavior (NULL = no budget
+// declared, always a candidate).
+func TestSearchFusion_SemanticBudgetNullParity_Integration(t *testing.T) {
+	if testing.Short() {
+		t.Skip("skipping integration test in short mode")
+	}
+
+	t.Parallel()
+
+	ctx := context.Background()
+	callerID := uuid.New()
+
+	pool, err := pgstore.NewEmbeddingPool(ctx, sharedServiceDSN, "", pgstore.PoolOptions{})
+	require.NoError(t, err)
+	t.Cleanup(pool.Close)
+
+	// Insert a tender with NULL budget_min and budget_max.
+	nullBudgetID := uuid.New()
+	_, err = pool.Exec(ctx, `
+		INSERT INTO listings (id, owner_user_id, title, description, currency, status,
+		                      budget_min, budget_max, is_tender, created_at, updated_at)
+		VALUES ($1, $2, 'null-budget tender for parity test', 'desc', 'TWD', 'OPEN',
+		        NULL, NULL, true, NOW(), NOW())`,
+		nullBudgetID, callerID)
+	require.NoError(t, err, "insert null-budget tender")
+
+	// Seed embedding at dim-450 so it ranks at cosine distance 0 from the query.
+	embStore := pgstore.NewEmbeddingStore(pool)
+	seedFusionEmbedding(t, ctx, embStore, nullBudgetID, unitVec1536(450)) //nolint:mnd // dim 450: unique, avoids other test interference
+
+	// Query semantic mode with minBudget=1000 — the NULL-budget listing must appear.
+	minBudget := decimal.NewFromInt(1000)                                             //nolint:mnd // 1000 TWD floor
+	searchSvc := buildFusionService(t, ctx, &fixedEmbedClient{vec: unitVec1536(450)}) //nolint:mnd // dim 450
+
+	res, err := searchSvc.SearchListings(ctx, &service.SearchListingsInput{
+		CallerID:  callerID,
+		Mode:      service.SearchModeSemantic,
+		BudgetMin: &minBudget,
+		Limit:     10,
+	})
+	require.NoError(t, err)
+
+	found := false
+
+	for _, l := range res.Listings {
+		if l.ID == nullBudgetID {
+			found = true
+
+			break
+		}
+	}
+
+	assert.True(t, found,
+		"NULL-budget listing must be included in semantic search with minBudget filter (parity with lexical mode)")
+}
+
 // ─── M-2 fix: hybrid fallback pagination matches lexical ─────────────────────
 
 // TestSearchFusion_HybridFallback_PaginationMatchesLexical_Integration verifies
