@@ -1,0 +1,177 @@
+package postgres
+
+import (
+	"context"
+	"encoding/json"
+	"errors"
+	"fmt"
+	"time"
+	"unicode/utf8"
+
+	"github.com/CoverOnes/marketplace/internal/domain"
+	"github.com/CoverOnes/marketplace/internal/store"
+	"github.com/google/uuid"
+	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgxpool"
+)
+
+const (
+	// maxRecommendationTypeLen is the maximum rune count for recommendation_type.
+	// MUST match CHECK (char_length(recommendation_type) BETWEEN 1 AND 127) in migration 000013.
+	maxRecommendationTypeLen = 127
+
+	// maxModelVersionLenRec is the maximum rune count for model_version in ai_recommendation.
+	// MUST match CHECK (char_length(model_version) BETWEEN 1 AND 100) in migration 000013.
+	maxModelVersionLenRec = 100
+)
+
+// RecommendationStore is a pool-backed recommendation store.
+// It satisfies store.RecommendationStore.
+type RecommendationStore struct {
+	q querier
+}
+
+// NewRecommendationStore returns a RecommendationStore backed by pool.
+func NewRecommendationStore(pool *pgxpool.Pool) *RecommendationStore {
+	return &RecommendationStore{q: pool}
+}
+
+// compile-time interface check.
+var _ store.RecommendationStore = (*RecommendationStore)(nil)
+
+// Insert writes one AI recommendation audit row.
+// Basis MUST already be redacted by the caller (backend-security §3.1).
+func (s *RecommendationStore) Insert(ctx context.Context, r *domain.AIRecommendation) error {
+	return insertRecommendation(ctx, s.q, r)
+}
+
+// ListBySubject returns all recommendation rows for subjectUserID ordered by
+// created_at descending.
+func (s *RecommendationStore) ListBySubject(ctx context.Context, subjectUserID uuid.UUID) ([]*domain.AIRecommendation, error) {
+	return listRecommendationsBySubject(ctx, s.q, subjectUserID)
+}
+
+// DeleteOlderThan removes rows with created_at < cutoff. Returns row count deleted.
+func (s *RecommendationStore) DeleteOlderThan(ctx context.Context, cutoff time.Time) (int64, error) {
+	return deleteRecommendationsOlderThan(ctx, s.q, cutoff)
+}
+
+// --- helpers ---
+
+func insertRecommendation(ctx context.Context, q querier, r *domain.AIRecommendation) error {
+	// Go-level validation to surface friendly errors before DB round-trip
+	// (backend-security §5.2: don't let raw check_violation surface to callers).
+	recTypeLen := utf8.RuneCountInString(r.RecommendationType)
+	if recTypeLen < 1 || recTypeLen > maxRecommendationTypeLen {
+		return fmt.Errorf(
+			"insert recommendation: recommendation_type length must be 1-%d runes (got %d)",
+			maxRecommendationTypeLen, recTypeLen,
+		)
+	}
+
+	modelVersionLen := utf8.RuneCountInString(r.ModelVersion)
+	if modelVersionLen < 1 || modelVersionLen > maxModelVersionLenRec {
+		return fmt.Errorf(
+			"insert recommendation: model_version length must be 1-%d runes (got %d)",
+			maxModelVersionLenRec, modelVersionLen,
+		)
+	}
+
+	if r.OverallScore < 0 || r.OverallScore > 1 {
+		return fmt.Errorf("insert recommendation: overall_score must be in [0, 1] (got %v)", r.OverallScore)
+	}
+
+	breakdownJSON, err := json.Marshal(r.ScoreBreakdown)
+	if err != nil {
+		return fmt.Errorf("insert recommendation: marshal score_breakdown: %w", err)
+	}
+
+	const query = `
+INSERT INTO ai_recommendation
+    (id, recommendation_type, target_id, subject_user_id,
+     overall_score, score_breakdown, basis, accepted, model_version, created_at)
+VALUES
+    ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
+`
+
+	_, execErr := q.Exec(
+		ctx, query,
+		r.ID, r.RecommendationType, r.TargetID, r.SubjectUserID,
+		r.OverallScore, breakdownJSON, r.Basis, r.Accepted, r.ModelVersion, r.CreatedAt,
+	)
+	if execErr != nil {
+		return fmt.Errorf("insert recommendation: %w", execErr)
+	}
+
+	return nil
+}
+
+func listRecommendationsBySubject(ctx context.Context, q querier, subjectUserID uuid.UUID) ([]*domain.AIRecommendation, error) {
+	const query = `
+SELECT id, recommendation_type, target_id, subject_user_id,
+       overall_score, score_breakdown, basis, accepted, model_version, created_at
+FROM ai_recommendation
+WHERE subject_user_id = $1
+ORDER BY created_at DESC
+`
+
+	rows, err := q.Query(ctx, query, subjectUserID)
+	if err != nil {
+		return nil, fmt.Errorf("list recommendations by subject: %w", err)
+	}
+
+	defer rows.Close()
+
+	var results []*domain.AIRecommendation
+
+	for rows.Next() {
+		rec, scanErr := scanRecommendation(rows)
+		if scanErr != nil {
+			return nil, scanErr
+		}
+
+		results = append(results, rec)
+	}
+
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("iterate recommendation rows: %w", err)
+	}
+
+	return results, nil
+}
+
+func deleteRecommendationsOlderThan(ctx context.Context, q querier, cutoff time.Time) (int64, error) {
+	const query = `DELETE FROM ai_recommendation WHERE created_at < $1`
+
+	tag, err := q.Exec(ctx, query, cutoff)
+	if err != nil {
+		return 0, fmt.Errorf("delete recommendations older than %s: %w", cutoff.Format(time.RFC3339), err)
+	}
+
+	return tag.RowsAffected(), nil
+}
+
+func scanRecommendation(row rowScanner) (*domain.AIRecommendation, error) {
+	var (
+		r             domain.AIRecommendation
+		breakdownJSON []byte
+	)
+
+	err := row.Scan(
+		&r.ID, &r.RecommendationType, &r.TargetID, &r.SubjectUserID,
+		&r.OverallScore, &breakdownJSON, &r.Basis, &r.Accepted, &r.ModelVersion, &r.CreatedAt,
+	)
+	if err != nil {
+		if errors.Is(err, pgx.ErrNoRows) {
+			return nil, domain.ErrNotFound
+		}
+
+		return nil, fmt.Errorf("scan recommendation: %w", err)
+	}
+
+	if jsonErr := json.Unmarshal(breakdownJSON, &r.ScoreBreakdown); jsonErr != nil {
+		return nil, fmt.Errorf("unmarshal score_breakdown: %w", jsonErr)
+	}
+
+	return &r, nil
+}
