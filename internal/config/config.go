@@ -263,6 +263,11 @@ func (c *Config) validate() error {
 // minServiceTokenLen is the minimum length of the workspace service token.
 const minServiceTokenLen = 32
 
+// localhostHostname is the only hostname permitted for http:// base URLs in the
+// https-enforcement guards (workspace, file, embedding). Extracted as a constant
+// because it appears in three identical hostname checks.
+const localhostHostname = "localhost"
+
 // validateWorkspace returns the validation errors for the workspace S2S config.
 //
 // Production guard (M-2): in non-dev environments the workspace service MUST be
@@ -305,7 +310,7 @@ func (c *Config) validateWorkspace() []string {
 		lower := strings.ToLower(c.WorkspaceBaseURL)
 		if strings.HasPrefix(lower, "http://") {
 			parsed, perr := url.Parse(c.WorkspaceBaseURL)
-			if perr != nil || strings.ToLower(parsed.Hostname()) != "localhost" {
+			if perr != nil || strings.ToLower(parsed.Hostname()) != localhostHostname {
 				errs = append(errs, httpsMsg)
 			}
 		} else if !strings.HasPrefix(lower, "https://") {
@@ -355,7 +360,7 @@ func (c *Config) validateFileService() []string {
 			lower := strings.ToLower(c.FileBaseURL)
 			if strings.HasPrefix(lower, "http://") {
 				parsed, perr := url.Parse(c.FileBaseURL)
-				if perr != nil || strings.ToLower(parsed.Hostname()) != "localhost" {
+				if perr != nil || strings.ToLower(parsed.Hostname()) != localhostHostname {
 					errs = append(errs, httpsMsg)
 				}
 			} else if !strings.HasPrefix(lower, "https://") {
@@ -421,11 +426,21 @@ func (c *Config) IsDev() bool {
 	return strings.EqualFold(c.Env, "development")
 }
 
+// minEmbeddingAPIKeyLen is the minimum accepted length for EmbeddingAPIKey.
+// This catches placeholder values like "REPLACE_ME" (9 chars) that would
+// pass the non-empty check but produce silent 401s at runtime. Real OpenRouter
+// keys are at least 32 characters.
+const minEmbeddingAPIKeyLen = 32
+
 // validateEmbedding returns validation errors for the embedding provider config.
 //
 // Fail-closed posture: in non-dev environments, an API key MUST be provided
 // unless embedding is explicitly disabled via EmbeddingDisabled. This prevents
 // a misconfigured deploy from silently degrading AI matching without notice.
+//
+// Security guard: when EmbeddingBaseURL is non-empty, it MUST use https:// to
+// prevent the Authorization: Bearer key from being transmitted in cleartext.
+// http://localhost is permitted in all environments for integration tests.
 func (c *Config) validateEmbedding() []string {
 	var errs []string
 
@@ -433,8 +448,31 @@ func (c *Config) validateEmbedding() []string {
 		errs = append(errs, "MARKETPLACE_EMBEDDING_API_KEY must be set in non-dev environments (or set MARKETPLACE_EMBEDDING_DISABLED=true to opt out)")
 	}
 
+	// M-2: reject API keys shorter than 32 chars when non-empty. Real OpenRouter
+	// keys are ≥32 chars; this catches placeholder values like "REPLACE_ME".
+	if c.EmbeddingAPIKey != "" && len(c.EmbeddingAPIKey) < minEmbeddingAPIKeyLen {
+		errs = append(errs, "MARKETPLACE_EMBEDDING_API_KEY, when set, must be at least 32 characters (placeholder values like REPLACE_ME are not accepted)")
+	}
+
 	if c.EmbeddingTimeoutSec < 1 || c.EmbeddingTimeoutSec > 300 {
 		errs = append(errs, "MARKETPLACE_EMBEDDING_TIMEOUT_SEC must be between 1 and 300 seconds")
+	}
+
+	// M-1: when EmbeddingBaseURL is non-empty, enforce https:// to prevent the
+	// Authorization: Bearer key from leaking over cleartext. http://localhost (exact
+	// hostname match) is permitted in any env for integration-test convenience.
+	// This mirrors the same guard in validateWorkspace() / validateFileService().
+	if c.EmbeddingBaseURL != "" {
+		const httpsMsg = "MARKETPLACE_EMBEDDING_BASE_URL must use https:// (only http://localhost is permitted for integration tests)"
+		lower := strings.ToLower(c.EmbeddingBaseURL)
+		if strings.HasPrefix(lower, "http://") {
+			parsed, perr := url.Parse(c.EmbeddingBaseURL)
+			if perr != nil || strings.ToLower(parsed.Hostname()) != localhostHostname {
+				errs = append(errs, httpsMsg)
+			}
+		} else if !strings.HasPrefix(lower, "https://") {
+			errs = append(errs, httpsMsg)
+		}
 	}
 
 	return errs

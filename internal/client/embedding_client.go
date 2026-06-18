@@ -10,6 +10,7 @@ import (
 	"io"
 	"log/slog"
 	"net/http"
+	"strings"
 	"time"
 	"unicode/utf8"
 )
@@ -176,7 +177,7 @@ func (c *HTTPEmbeddingClient) Generate(ctx context.Context, text string) ([]floa
 		return nil, fmt.Errorf("embedding client: marshal request: %w", err)
 	}
 
-	url := c.baseURL + openRouterEmbeddingsPath
+	url := strings.TrimRight(c.baseURL, "/") + openRouterEmbeddingsPath
 
 	var (
 		statusCode int

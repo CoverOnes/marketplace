@@ -588,6 +588,102 @@ func TestConfig_Load(t *testing.T) {
 			},
 			wantErr: true,
 		},
+
+		// --- M-2: API key minimum length ---
+
+		{
+			// Placeholder values like "REPLACE_ME" (9 chars) are shorter than 32 and
+			// must be rejected so they don't silently reach the API and produce 401s.
+			name: "error: embedding API key is placeholder REPLACE_ME (too short)",
+			envVars: map[string]string{
+				"MARKETPLACE_POSTGRES_DSN":      testDSN,
+				"MARKETPLACE_PORT":              "8081",
+				"MARKETPLACE_LOG_LEVEL":         "INFO",
+				"MARKETPLACE_ENV":               "development",
+				"MARKETPLACE_EMBEDDING_API_KEY": "REPLACE_ME",
+			},
+			wantErr: true,
+		},
+		{
+			// A key shorter than 32 chars that is not the placeholder is still rejected.
+			name: "error: embedding API key shorter than 32 chars rejected",
+			envVars: map[string]string{
+				"MARKETPLACE_POSTGRES_DSN":      testDSN,
+				"MARKETPLACE_PORT":              "8081",
+				"MARKETPLACE_LOG_LEVEL":         "INFO",
+				"MARKETPLACE_ENV":               "development",
+				"MARKETPLACE_EMBEDDING_API_KEY": "tooshort",
+			},
+			wantErr: true,
+		},
+		{
+			// A key of exactly 32 chars is accepted.
+			name: "happy path: embedding API key exactly 32 chars is accepted",
+			envVars: map[string]string{
+				"MARKETPLACE_POSTGRES_DSN":      testDSN,
+				"MARKETPLACE_PORT":              "8081",
+				"MARKETPLACE_LOG_LEVEL":         "INFO",
+				"MARKETPLACE_ENV":               "development",
+				"MARKETPLACE_EMBEDDING_API_KEY": "sk-or-v1-testkey-exactly-32chars!!", // exactly 32 runes
+			},
+			wantErr: false,
+		},
+
+		// --- M-1: https enforcement on EmbeddingBaseURL ---
+
+		{
+			// Plain http:// to a non-localhost host leaks the Bearer key in cleartext.
+			name: "error: embedding base URL with http:// non-localhost rejected",
+			envVars: map[string]string{
+				"MARKETPLACE_POSTGRES_DSN":       testDSN,
+				"MARKETPLACE_PORT":               "8081",
+				"MARKETPLACE_LOG_LEVEL":          "INFO",
+				"MARKETPLACE_ENV":                "development",
+				"MARKETPLACE_EMBEDDING_BASE_URL": "http://openrouter.ai",
+				"MARKETPLACE_EMBEDDING_API_KEY":  "sk-or-v1-testkey-exactly-32chars!!",
+			},
+			wantErr: true,
+		},
+		{
+			// Localhost bypass-attempt: "http://localhostevil.com" must be rejected
+			// (hostname is not "localhost" exactly).
+			name: "error: embedding base URL http://localhostevil.com rejected (prefix bypass)",
+			envVars: map[string]string{
+				"MARKETPLACE_POSTGRES_DSN":       testDSN,
+				"MARKETPLACE_PORT":               "8081",
+				"MARKETPLACE_LOG_LEVEL":          "INFO",
+				"MARKETPLACE_ENV":                "development",
+				"MARKETPLACE_EMBEDDING_BASE_URL": "http://localhostevil.com",
+				"MARKETPLACE_EMBEDDING_API_KEY":  "sk-or-v1-testkey-exactly-32chars!!",
+			},
+			wantErr: true,
+		},
+		{
+			// https:// base URL is always accepted.
+			name: "happy path: embedding base URL with https:// accepted",
+			envVars: map[string]string{
+				"MARKETPLACE_POSTGRES_DSN":       testDSN,
+				"MARKETPLACE_PORT":               "8081",
+				"MARKETPLACE_LOG_LEVEL":          "INFO",
+				"MARKETPLACE_ENV":                "development",
+				"MARKETPLACE_EMBEDDING_BASE_URL": "https://openrouter.ai",
+				"MARKETPLACE_EMBEDDING_API_KEY":  "sk-or-v1-testkey-exactly-32chars!!",
+			},
+			wantErr: false,
+		},
+		{
+			// http://localhost is permitted in any env for integration-test convenience.
+			name: "happy path: embedding base URL http://localhost accepted (integration test)",
+			envVars: map[string]string{
+				"MARKETPLACE_POSTGRES_DSN":       testDSN,
+				"MARKETPLACE_PORT":               "8081",
+				"MARKETPLACE_LOG_LEVEL":          "INFO",
+				"MARKETPLACE_ENV":                "development",
+				"MARKETPLACE_EMBEDDING_BASE_URL": "http://localhost:8099",
+				"MARKETPLACE_EMBEDDING_API_KEY":  "sk-or-v1-testkey-exactly-32chars!!",
+			},
+			wantErr: false,
+		},
 	}
 
 	for _, tc := range tests {

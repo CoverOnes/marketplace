@@ -92,6 +92,10 @@ func run() error {
 	// pool with EmbeddingStore will produce "unknown type" scan errors at runtime.
 	// TODO: when wiring an EmbeddingStore consumer, replace or supplement this pool with
 	// postgres.NewEmbeddingPool(ctx, cfg.PostgresDSN, cfg.PostgresSchema, ...).
+	// TODO(#25/T2): wire client.NewEmbeddingClientFromConfig(client.EmbeddingClientConfig{
+	//   APIKey:  cfg.EmbeddingAPIKey, Model: cfg.EmbeddingModel,
+	//   BaseURL: cfg.EmbeddingBaseURL, Timeout: time.Duration(cfg.EmbeddingTimeoutSec)*time.Second,
+	// }) + switch EmbeddingStore consumers to NewEmbeddingPool when building the auto-embedding indexer.
 	pool, err := postgres.NewPool(ctx, cfg.PostgresDSN, cfg.PostgresSchema, postgres.PoolOptions{
 		MaxConns: int32(cfg.DBMaxConns),
 		MinConns: int32(cfg.DBMinConns),
