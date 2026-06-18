@@ -204,6 +204,9 @@ func TestConfig_Load(t *testing.T) {
 				"MARKETPLACE_WORKSPACE_BASE_URL":      "https://workspace:8082",
 				"MARKETPLACE_WORKSPACE_SERVICE_TOKEN": testServiceToken,
 				"MARKETPLACE_GATEWAY_HMAC_SECRET":     testHMACSecret,
+				"MARKETPLACE_FILE_BASE_URL":           "https://file:8083",
+				"MARKETPLACE_FILE_SERVICE_ID":         "marketplace",
+				"MARKETPLACE_FILE_SERVICE_TOKEN":      testServiceToken,
 			},
 			wantErr: false,
 		},
@@ -269,6 +272,9 @@ func TestConfig_Load(t *testing.T) {
 				"MARKETPLACE_WORKSPACE_BASE_URL":      "https://workspace:8082",
 				"MARKETPLACE_WORKSPACE_SERVICE_TOKEN": testServiceToken,
 				"MARKETPLACE_GATEWAY_HMAC_SECRET":     testHMACSecret,
+				"MARKETPLACE_FILE_BASE_URL":           "https://file:8083",
+				"MARKETPLACE_FILE_SERVICE_ID":         "marketplace",
+				"MARKETPLACE_FILE_SERVICE_TOKEN":      testServiceToken,
 			},
 			wantErr: false,
 		},
@@ -348,6 +354,90 @@ func TestConfig_Load(t *testing.T) {
 			},
 			wantErr: false,
 		},
+		// --- validateFileService error branches ---
+
+		{
+			// Branch 1: non-dev without FileBaseURL must fail (file service required in prod).
+			name: "error: production without file base URL",
+			envVars: map[string]string{
+				"MARKETPLACE_POSTGRES_DSN":            testDSN,
+				"MARKETPLACE_PORT":                    "8081",
+				"MARKETPLACE_LOG_LEVEL":               "INFO",
+				"MARKETPLACE_ENV":                     "production",
+				"MARKETPLACE_WORKSPACE_BASE_URL":      "https://workspace:8082",
+				"MARKETPLACE_WORKSPACE_SERVICE_TOKEN": testServiceToken,
+				"MARKETPLACE_GATEWAY_HMAC_SECRET":     testHMACSecret,
+				// MARKETPLACE_FILE_BASE_URL intentionally unset
+				"MARKETPLACE_FILE_SERVICE_ID":    "marketplace",
+				"MARKETPLACE_FILE_SERVICE_TOKEN": testServiceToken,
+			},
+			wantErr: true,
+		},
+		{
+			// Branch 2: non-dev without FileServiceID must fail.
+			name: "error: production without file service ID",
+			envVars: map[string]string{
+				"MARKETPLACE_POSTGRES_DSN":            testDSN,
+				"MARKETPLACE_PORT":                    "8081",
+				"MARKETPLACE_LOG_LEVEL":               "INFO",
+				"MARKETPLACE_ENV":                     "production",
+				"MARKETPLACE_WORKSPACE_BASE_URL":      "https://workspace:8082",
+				"MARKETPLACE_WORKSPACE_SERVICE_TOKEN": testServiceToken,
+				"MARKETPLACE_GATEWAY_HMAC_SECRET":     testHMACSecret,
+				"MARKETPLACE_FILE_BASE_URL":           "https://file:8083",
+				// MARKETPLACE_FILE_SERVICE_ID intentionally unset
+				"MARKETPLACE_FILE_SERVICE_TOKEN": testServiceToken,
+			},
+			wantErr: true,
+		},
+		{
+			// Branch 3: non-dev with short FileServiceToken must fail.
+			name: "error: production with short file service token",
+			envVars: map[string]string{
+				"MARKETPLACE_POSTGRES_DSN":            testDSN,
+				"MARKETPLACE_PORT":                    "8081",
+				"MARKETPLACE_LOG_LEVEL":               "INFO",
+				"MARKETPLACE_ENV":                     "production",
+				"MARKETPLACE_WORKSPACE_BASE_URL":      "https://workspace:8082",
+				"MARKETPLACE_WORKSPACE_SERVICE_TOKEN": testServiceToken,
+				"MARKETPLACE_GATEWAY_HMAC_SECRET":     testHMACSecret,
+				"MARKETPLACE_FILE_BASE_URL":           "https://file:8083",
+				"MARKETPLACE_FILE_SERVICE_ID":         "marketplace",
+				"MARKETPLACE_FILE_SERVICE_TOKEN":      "tooshort",
+			},
+			wantErr: true,
+		},
+		{
+			// Branch 4: any env — FileBaseURL set but FileServiceID empty must fail.
+			name: "error: dev with file base URL but missing service ID",
+			envVars: map[string]string{
+				"MARKETPLACE_POSTGRES_DSN":       testDSN,
+				"MARKETPLACE_PORT":               "8081",
+				"MARKETPLACE_LOG_LEVEL":          "INFO",
+				"MARKETPLACE_ENV":                "development",
+				"MARKETPLACE_FILE_BASE_URL":      "http://localhost:8083",
+				"MARKETPLACE_FILE_SERVICE_TOKEN": testServiceToken,
+				// MARKETPLACE_FILE_SERVICE_ID intentionally unset
+			},
+			wantErr: true,
+		},
+		{
+			// Branch 5: any env — FileBaseURL set but FileServiceToken < 32 chars must fail.
+			name: "error: dev with file base URL but short service token",
+			envVars: map[string]string{
+				"MARKETPLACE_POSTGRES_DSN":       testDSN,
+				"MARKETPLACE_PORT":               "8081",
+				"MARKETPLACE_LOG_LEVEL":          "INFO",
+				"MARKETPLACE_ENV":                "development",
+				"MARKETPLACE_FILE_BASE_URL":      "http://localhost:8083",
+				"MARKETPLACE_FILE_SERVICE_ID":    "marketplace",
+				"MARKETPLACE_FILE_SERVICE_TOKEN": "tooshort",
+			},
+			wantErr: true,
+		},
+
+		// --- validateUserRateLimit error branches ---
+
 		{
 			// validateUserRateLimit: negative perMin is rejected.
 			name: "error: negative user rate limit per-min",
@@ -416,6 +506,7 @@ func TestConfig_Load(t *testing.T) {
 				"MARKETPLACE_WORKSPACE_BASE_URL", "MARKETPLACE_WORKSPACE_SERVICE_TOKEN",
 				"MARKETPLACE_GATEWAY_HMAC_SECRET",
 				"MARKETPLACE_USER_RATE_LIMIT_PER_MIN", "MARKETPLACE_USER_RATE_LIMIT_BURST",
+				"MARKETPLACE_FILE_BASE_URL", "MARKETPLACE_FILE_SERVICE_ID", "MARKETPLACE_FILE_SERVICE_TOKEN",
 			}
 			for _, k := range allKnownVars {
 				t.Setenv(k, "")

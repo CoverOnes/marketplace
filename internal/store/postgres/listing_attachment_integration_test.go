@@ -116,11 +116,23 @@ func TestListingAttachmentStore_Integration(t *testing.T) {
 		byUser := uuid.New()
 		require.NoError(t, store.Detach(ctx, a.ID, byUser))
 
-		got, err := store.GetByID(ctx, a.ID)
+		// GetByID intentionally hides detached rows, so verify the soft-delete
+		// columns with a direct query against the persisted row.
+		var (
+			detachedAt *time.Time
+			detachedBy *uuid.UUID
+		)
+		err := pool.QueryRow(ctx,
+			"SELECT detached_at, detached_by FROM listing_attachments WHERE id = $1", a.ID,
+		).Scan(&detachedAt, &detachedBy)
 		require.NoError(t, err)
-		assert.NotNil(t, got.DetachedAt)
-		assert.NotNil(t, got.DetachedBy)
-		assert.Equal(t, byUser, *got.DetachedBy)
+		assert.NotNil(t, detachedAt)
+		require.NotNil(t, detachedBy)
+		assert.Equal(t, byUser, *detachedBy)
+
+		// And GetByID must now report it as not found.
+		_, err = store.GetByID(ctx, a.ID)
+		assert.ErrorIs(t, err, domain.ErrAttachmentNotFound)
 	})
 
 	t.Run("Detach returns ErrAttachmentNotFound for unknown id", func(t *testing.T) {
