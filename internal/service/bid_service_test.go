@@ -72,6 +72,20 @@ func (s *stubListingStore) Search(_ context.Context, filter store.SearchFilter) 
 	return s.searchResult, nil
 }
 
+// GetByIDs returns the listings for the given IDs in order, filtering by visibility.
+// In tests the visibility rule is not enforced (no DB); return all matching listings.
+func (s *stubListingStore) GetByIDs(_ context.Context, ids []uuid.UUID, _ uuid.UUID) ([]*domain.Listing, error) {
+	out := make([]*domain.Listing, 0, len(ids))
+
+	for _, id := range ids {
+		if l, ok := s.listings[id]; ok {
+			out = append(out, l)
+		}
+	}
+
+	return out, nil
+}
+
 func (s *stubListingStore) Update(_ context.Context, l *domain.Listing) error {
 	s.listings[l.ID] = l
 	s.updated = append(s.updated, l)

@@ -20,6 +20,12 @@ type ListingStore interface {
 	List(ctx context.Context, filter ListingFilter) ([]*domain.Listing, error)
 	// Search runs a full-text + structured filter query with keyset pagination.
 	Search(ctx context.Context, filter SearchFilter) ([]*domain.Listing, error)
+	// GetByIDs fetches listings for a ranked candidate set, enforcing the
+	// visibility rule IN SQL (OPEN public, non-OPEN owner-only). IDs that the
+	// viewer cannot see are silently omitted — never post-filtered in Go, which
+	// would leak hidden-doc counts. The returned slice preserves the input ID
+	// order so the caller can apply RRF ranking without a secondary sort.
+	GetByIDs(ctx context.Context, ids []uuid.UUID, viewerID uuid.UUID) ([]*domain.Listing, error)
 	Update(ctx context.Context, l *domain.Listing) error
 }
 

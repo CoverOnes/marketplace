@@ -58,6 +58,10 @@ func (s *txListingStore) Search(ctx context.Context, filter store.SearchFilter) 
 	return searchListings(ctx, s.tx, filter)
 }
 
+func (s *txListingStore) GetByIDs(ctx context.Context, ids []uuid.UUID, viewerID uuid.UUID) ([]*domain.Listing, error) {
+	return getListingsByIDs(ctx, s.tx, ids, viewerID)
+}
+
 func (s *txListingStore) Update(ctx context.Context, l *domain.Listing) error {
 	return updateListing(ctx, s.tx, l)
 }
@@ -86,6 +90,12 @@ func (s *ListingStore) List(ctx context.Context, filter store.ListingFilter) ([]
 // Search runs a full-text + structured filter query with keyset pagination.
 func (s *ListingStore) Search(ctx context.Context, filter store.SearchFilter) ([]*domain.Listing, error) {
 	return searchListings(ctx, s.q, filter)
+}
+
+// GetByIDs hydrates a ranked candidate ID set while enforcing visibility in SQL.
+// IDs the viewer cannot see are dropped by the WHERE clause, never post-filtered in Go.
+func (s *ListingStore) GetByIDs(ctx context.Context, ids []uuid.UUID, viewerID uuid.UUID) ([]*domain.Listing, error) {
+	return getListingsByIDs(ctx, s.q, ids, viewerID)
 }
 
 // Update persists changes to a listing.
@@ -335,6 +345,86 @@ WHERE deleted_at IS NULL`)
 	args = append(args, limit)
 
 	return sb.String(), args
+}
+
+// getListingsByIDs fetches listings for the given ID set, enforcing visibility
+// IN SQL (OPEN public, non-OPEN owner-only). Rows not visible to viewerID are
+// silently omitted — no post-filtering in Go, which would leak hidden-doc counts.
+// The returned slice is ordered to match the input ID ordering using a CASE
+// expression, so the caller (RRF) does not need a secondary sort.
+func getListingsByIDs(ctx context.Context, q querier, ids []uuid.UUID, viewerID uuid.UUID) ([]*domain.Listing, error) {
+	if len(ids) == 0 {
+		return nil, nil
+	}
+
+	var (
+		sb   strings.Builder
+		args []any
+		n    = 1
+	)
+
+	sb.WriteString(`
+SELECT id, owner_user_id, title, description, budget_min, budget_max,
+       currency, status, awarded_bid_id,
+       is_tender, recruiter_mode, tender_status, kyc_tier_required,
+       deleted_at, created_at, updated_at
+FROM listings
+WHERE deleted_at IS NULL`)
+
+	// Visibility: same predicate as buildSearchQuery — OPEN public, non-OPEN owner-only.
+	fmt.Fprintf(&sb, " AND (status = 'OPEN' OR owner_user_id = $%d)", n)
+	args = append(args, viewerID)
+	n++
+
+	// Build the $N,$N+1,... IN clause for the id set.
+	sb.WriteString(" AND id IN (")
+
+	for i, id := range ids {
+		if i > 0 {
+			sb.WriteString(",")
+		}
+
+		fmt.Fprintf(&sb, "$%d", n)
+		args = append(args, id)
+		n++
+	}
+
+	sb.WriteString(")")
+
+	// Preserve the input ordering via CASE so RRF rank is stable.
+	sb.WriteString(" ORDER BY CASE id")
+
+	for i, id := range ids {
+		fmt.Fprintf(&sb, " WHEN $%d THEN %d", n, i)
+		args = append(args, id)
+		n++
+	}
+
+	sb.WriteString(" END")
+
+	rows, err := q.Query(ctx, sb.String(), args...)
+	if err != nil {
+		return nil, fmt.Errorf("get listings by ids: %w", err)
+	}
+
+	defer rows.Close()
+
+	var listings []*domain.Listing
+
+	for rows.Next() {
+		l, scanErr := scanListing(rows)
+		if scanErr != nil {
+			return nil, scanErr
+		}
+
+		listings = append(listings, l)
+	}
+
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("iterate listings by ids: %w", err)
+	}
+
+	return listings, nil
 }
 
 func updateListing(ctx context.Context, q querier, l *domain.Listing) error {

@@ -101,7 +101,7 @@ func buildListingEmbeddingSetup(
 
 	listingStore := pgstore.NewListingStore(pool)
 	listingOutboxTxMgr := pgstore.NewListingOutboxTxManager(pool)
-	svc := service.NewListingService(listingStore, listingOutboxTxMgr)
+	svc := service.NewListingService(listingStore, listingOutboxTxMgr, nil, nil)
 
 	idx := embedding.NewIndexer(&embedding.IndexerConfig{
 		OutboxStore:    pgstore.NewOutboxStore(pool),
@@ -404,7 +404,7 @@ func TestListingService_Embedding_CreateTender_EnqueuesOutbox_Unit(t *testing.T)
 	ls := newStubListingStore()
 	ls.listings = make(map[uuid.UUID]*domain.Listing)
 	ob := &recordingOutboxStore{}
-	svc := service.NewListingService(ls, &stubListingOutboxTxManager{listings: ls, outbox: ob})
+	svc := service.NewListingService(ls, &stubListingOutboxTxManager{listings: ls, outbox: ob}, nil, nil)
 
 	listing, err := svc.CreateListing(context.Background(), &service.CreateListingInput{
 		OwnerUserID: ownerID,
@@ -431,7 +431,7 @@ func TestListingService_Embedding_CreateNonTender_NoEnqueue_Unit(t *testing.T) {
 	ls := newStubListingStore()
 	ls.listings = make(map[uuid.UUID]*domain.Listing)
 	ob := &recordingOutboxStore{}
-	svc := service.NewListingService(ls, &stubListingOutboxTxManager{listings: ls, outbox: ob})
+	svc := service.NewListingService(ls, &stubListingOutboxTxManager{listings: ls, outbox: ob}, nil, nil)
 
 	listing, err := svc.CreateListing(context.Background(), &service.CreateListingInput{
 		OwnerUserID: ownerID,
@@ -469,7 +469,7 @@ func TestListingService_Embedding_UpdateTitle_EnqueuesOutbox_Unit(t *testing.T) 
 
 	ls := newStubListingStore(existingTender)
 	ob := &recordingOutboxStore{}
-	svc := service.NewListingService(ls, &stubListingOutboxTxManager{listings: ls, outbox: ob})
+	svc := service.NewListingService(ls, &stubListingOutboxTxManager{listings: ls, outbox: ob}, nil, nil)
 
 	newTitle := "Updated Title"
 	_, err := svc.UpdateListing(context.Background(), service.UpdateListingInput{
@@ -507,7 +507,7 @@ func TestListingService_Embedding_UpdateBudgetOnly_NoEnqueue_Unit(t *testing.T) 
 
 	ls := newStubListingStore(existingTender)
 	ob := &recordingOutboxStore{}
-	svc := service.NewListingService(ls, &stubListingOutboxTxManager{listings: ls, outbox: ob})
+	svc := service.NewListingService(ls, &stubListingOutboxTxManager{listings: ls, outbox: ob}, nil, nil)
 
 	budgetMin := decimal.NewFromInt(100)
 	_, err := svc.UpdateListing(context.Background(), service.UpdateListingInput{
@@ -541,7 +541,7 @@ func TestListingService_Embedding_UpdateTitleOnNonTender_NoEnqueue_Unit(t *testi
 
 	ls := newStubListingStore(classicListing)
 	ob := &recordingOutboxStore{}
-	svc := service.NewListingService(ls, &stubListingOutboxTxManager{listings: ls, outbox: ob})
+	svc := service.NewListingService(ls, &stubListingOutboxTxManager{listings: ls, outbox: ob}, nil, nil)
 
 	newTitle := "Classic Updated"
 	_, err := svc.UpdateListing(context.Background(), service.UpdateListingInput{
