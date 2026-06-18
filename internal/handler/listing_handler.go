@@ -147,9 +147,11 @@ func (h *ListingHandler) List(c *gin.Context) {
 
 // Search handles GET /v1/listings/search.
 //
-// Query params: q (full-text), status, minBudget, maxBudget, cursor, limit.
-// Results are keyset-paginated (newest-first). Non-OPEN listings are only
-// visible to their owner — enforced in the service layer.
+// Query params: q (full-text), status, minBudget, maxBudget, cursor, limit,
+// mode (lexical|semantic|hybrid; default lexical).
+// Results are keyset-paginated (newest-first) in lexical mode; ranked modes
+// return a single bounded page (up to 200 candidates fused). Non-OPEN listings
+// are only visible to their owner — enforced in the service layer.
 func (h *ListingHandler) Search(c *gin.Context) {
 	identity, ok := middleware.IdentityFromCtx(c)
 	if !ok {
@@ -163,9 +165,25 @@ func (h *ListingHandler) Search(c *gin.Context) {
 		Cursor:   c.Query("cursor"),
 	}
 
+	if modeStr := c.Query("mode"); modeStr != "" {
+		switch service.SearchMode(modeStr) {
+		case service.SearchModeLexical, service.SearchModeSemantic, service.SearchModeHybrid:
+			in.Mode = service.SearchMode(modeStr)
+		default:
+			httpx.ErrCode(c, http.StatusBadRequest, "VALIDATION_ERROR", "mode must be lexical, semantic, or hybrid")
+			return
+		}
+	}
+
 	if statusStr := c.Query("status"); statusStr != "" {
-		s := domain.ListingStatus(statusStr)
-		in.Status = &s
+		switch domain.ListingStatus(statusStr) {
+		case domain.ListingStatusOpen, domain.ListingStatusAwarded, domain.ListingStatusClosed:
+			s := domain.ListingStatus(statusStr)
+			in.Status = &s
+		default:
+			httpx.ErrCode(c, http.StatusBadRequest, "VALIDATION_ERROR", "invalid status filter")
+			return
+		}
 	}
 
 	if minStr := c.Query("minBudget"); minStr != "" {

@@ -119,7 +119,7 @@ func TestListingService_CreateListing(t *testing.T) {
 			ls := newStubListingStore()
 			ls.listings = make(map[uuid.UUID]*domain.Listing)
 
-			svc := service.NewListingService(ls, nil)
+			svc := service.NewListingService(ls, nil, nil, nil)
 
 			listing, err := svc.CreateListing(context.Background(), &tc.input)
 
@@ -199,7 +199,7 @@ func TestListingService_UpdateListing(t *testing.T) {
 			t.Parallel()
 
 			ls := newStubListingStore(baseOpenListing())
-			svc := service.NewListingService(ls, nil)
+			svc := service.NewListingService(ls, nil, nil, nil)
 
 			listing, err := svc.UpdateListing(context.Background(), tc.input)
 
@@ -280,7 +280,7 @@ func TestListingService_GetListing_Visibility(t *testing.T) {
 			t.Parallel()
 
 			ls := newStubListingStore(tc.listing)
-			svc := service.NewListingService(ls, nil)
+			svc := service.NewListingService(ls, nil, nil, nil)
 
 			got, err := svc.GetListing(context.Background(), tc.listing.ID, tc.callerID)
 
@@ -303,7 +303,7 @@ func TestListingService_GetListing_NotFound(t *testing.T) {
 	t.Parallel()
 
 	ls := newStubListingStore()
-	svc := service.NewListingService(ls, nil)
+	svc := service.NewListingService(ls, nil, nil, nil)
 
 	got, err := svc.GetListing(context.Background(), uuid.New(), uuid.New())
 	require.Error(t, err)

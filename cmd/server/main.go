@@ -210,7 +210,10 @@ func run() error {
 	listingOutboxTxManager := postgres.NewListingOutboxTxManager(pool)
 
 	// Service layer.
-	listingSvc := service.NewListingService(listingStore, listingOutboxTxManager)
+	// embClient + embeddingStore are wired for semantic/hybrid search (T3).
+	// When MARKETPLACE_EMBEDDING_API_KEY is empty, embClient is a NoopEmbeddingClient
+	// that returns ErrEmbeddingDisabled; SearchListings silently falls back to lexical.
+	listingSvc := service.NewListingService(listingStore, listingOutboxTxManager, embClient, embeddingStore)
 	bidSvc := service.NewBidService(bidStore, listingStore, awardStore, txManager, bidOutboxTxManager, publisher, workspaceClient)
 	tenderSvc := service.NewTenderService(
 		listingStore,

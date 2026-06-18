@@ -185,6 +185,27 @@ func tokenize(s string) map[string]bool {
 	return out
 }
 
+// GetByIDs returns the listings for the given IDs in order, visibility-filtered.
+func (s *stubListingStoreH) GetByIDs(_ context.Context, ids []uuid.UUID, filter store.HydrationFilter) ([]*domain.Listing, error) {
+	out := make([]*domain.Listing, 0, len(ids))
+
+	for _, id := range ids {
+		l, ok := s.listings[id]
+		if !ok {
+			continue
+		}
+
+		// Visibility: OPEN is public; non-OPEN only to owner.
+		if l.Status != domain.ListingStatusOpen && l.OwnerUserID != filter.ViewerID {
+			continue
+		}
+
+		out = append(out, l)
+	}
+
+	return out, nil
+}
+
 func (s *stubListingStoreH) Update(_ context.Context, l *domain.Listing) error {
 	s.listings[l.ID] = l
 	return nil
@@ -194,7 +215,7 @@ func (s *stubListingStoreH) Update(_ context.Context, l *domain.Listing) error {
 func buildListingRouter(ls *stubListingStoreH) *gin.Engine {
 	gin.SetMode(gin.TestMode)
 
-	svc := service.NewListingService(ls, nil) // nil outbox: no embedding in handler tests
+	svc := service.NewListingService(ls, nil, nil, nil) // nil outbox/emb: no embedding in handler tests
 	h := handler.NewListingHandler(svc)
 
 	r := gin.New()
@@ -635,6 +656,12 @@ func TestListingHandler_Search(t *testing.T) {
 		{
 			name:       "error: invalid status filter -> 400",
 			query:      "status=BOGUS",
+			wantStatus: http.StatusBadRequest,
+			wantCode:   "VALIDATION_ERROR",
+		},
+		{
+			name:       "error: invalid mode -> 400",
+			query:      "mode=bogus",
 			wantStatus: http.StatusBadRequest,
 			wantCode:   "VALIDATION_ERROR",
 		},

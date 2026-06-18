@@ -54,6 +54,18 @@ func (f *fakeListingStore) Search(_ context.Context, _ store.SearchFilter) ([]*d
 	return nil, nil
 }
 
+func (f *fakeListingStore) GetByIDs(_ context.Context, ids []uuid.UUID, _ store.HydrationFilter) ([]*domain.Listing, error) {
+	out := make([]*domain.Listing, 0, len(ids))
+
+	for _, id := range ids {
+		if l, ok := f.listings[id]; ok {
+			out = append(out, l)
+		}
+	}
+
+	return out, nil
+}
+
 func (f *fakeListingStore) Update(_ context.Context, _ *domain.Listing) error { return nil }
 
 // fakeAttachmentStore is a minimal in-memory stub for ListingAttachmentStore.

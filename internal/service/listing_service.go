@@ -3,10 +3,13 @@ package service
 
 import (
 	"context"
+	"errors"
 	"fmt"
+	"log/slog"
 	"time"
 	"unicode/utf8"
 
+	"github.com/CoverOnes/marketplace/internal/client"
 	"github.com/CoverOnes/marketplace/internal/domain"
 	"github.com/CoverOnes/marketplace/internal/outbox"
 	"github.com/CoverOnes/marketplace/internal/store"
@@ -14,17 +17,46 @@ import (
 	"github.com/shopspring/decimal"
 )
 
+// SearchMode controls which retrieval strategy is used for search.
+type SearchMode string
+
+const (
+	// SearchModeLexical uses FTS only (keyset-paginated, byte-identical to legacy behavior).
+	SearchModeLexical SearchMode = "lexical"
+	// SearchModeSemantic uses pgvector cosine similarity only.
+	SearchModeSemantic SearchMode = "semantic"
+	// SearchModeHybrid fuses lexical + semantic via RRF (k=60).
+	SearchModeHybrid SearchMode = "hybrid"
+)
+
+// searchTopK is the maximum number of candidates fetched from each list for
+// ranked modes. Bounded to prevent unbounded vector scans.
+const searchTopK = 200
+
 // ListingService handles listing business logic.
 type ListingService struct {
 	listings      store.ListingStore
 	listingOutbox store.ListingOutboxTxManager // nil → no outbox (non-tender / disabled)
+	embClient     client.EmbeddingClient       // nil → semantic/hybrid falls back to lexical
+	embStore      store.EmbeddingStore         // nil → semantic/hybrid falls back to lexical
 }
 
 // NewListingService returns a ListingService.
 // listingOutbox may be nil; when nil, no outbox event is enqueued on create/update.
 // Pass a real ListingOutboxTxManager to enable same-tx embedding_reindex enqueue.
-func NewListingService(listings store.ListingStore, listingOutbox store.ListingOutboxTxManager) *ListingService {
-	return &ListingService{listings: listings, listingOutbox: listingOutbox}
+// embClient and embStore are optional; when nil, semantic/hybrid modes fall back to lexical.
+func NewListingService(
+	listings store.ListingStore,
+	listingOutbox store.ListingOutboxTxManager,
+	embClient client.EmbeddingClient,
+	embStore store.EmbeddingStore,
+) *ListingService {
+	return &ListingService{
+		listings:      listings,
+		listingOutbox: listingOutbox,
+		embClient:     embClient,
+		embStore:      embStore,
+	}
 }
 
 // CreateListingInput carries validated input for creating a listing.
@@ -162,14 +194,17 @@ const (
 //
 // CallerID is the authenticated caller (X-User-Id). Visibility: non-OPEN
 // listings are only returned to their owner; everyone else sees OPEN only.
+// Mode controls retrieval strategy: lexical (default), semantic, or hybrid.
+// Semantic/hybrid fall back to lexical when embedding is disabled or cold.
 type SearchListingsInput struct {
 	CallerID  uuid.UUID
 	Query     string
 	Status    *domain.ListingStatus
 	BudgetMin *decimal.Decimal
 	BudgetMax *decimal.Decimal
-	Cursor    string // opaque, base64-encoded keyset cursor ("" = first page)
+	Cursor    string // opaque, base64-encoded keyset cursor ("" = first page); only used for lexical mode
 	Limit     int
+	Mode      SearchMode // default: SearchModeLexical
 }
 
 // SearchListingsResult is the paginated search response.
@@ -178,21 +213,25 @@ type SearchListingsResult struct {
 	NextCursor string            `json:"nextCursor,omitempty"` // empty when no further pages
 }
 
-// SearchListings runs a full-text + structured-filter search over listings.
+// SearchListings runs a search over listings using the requested mode.
+//
+// Modes:
+//   - lexical (default/empty): FTS filter + keyset pagination — byte-identical to the
+//     previous behavior. The Cursor field is honored for pagination.
+//   - semantic: generate query embedding → NearestNeighbors → hydrate + visibility SQL.
+//   - hybrid: run both lists (up to searchTopK candidates each), fuse with RRF (k=60),
+//     hydrate the fused ranking with visibility enforced IN SQL.
+//
+// Cold-start / disabled fallback: if the embedding client or store is nil, if
+// ErrEmbeddingDisabled is returned, or if the embed call errors, semantic/hybrid
+// modes silently fall back to lexical-only and return 200.
 //
 // Visibility (MK security): callers may always see OPEN listings. Non-OPEN
 // listings (AWARDED/CLOSED) are restricted to their owner, mirroring the
-// List/Get visibility rules. When a status filter is supplied it is honored,
-// but a non-OPEN status filter is silently scoped to the caller's own listings
-// so it cannot be used to enumerate other users' awarded/closed cases.
+// List/Get visibility rules.
 func (s *ListingService) SearchListings(ctx context.Context, in *SearchListingsInput) (*SearchListingsResult, error) {
 	if err := validateSearchInput(in); err != nil {
 		return nil, err
-	}
-
-	cursor, err := decodeSearchCursor(in.Cursor)
-	if err != nil {
-		return nil, fmt.Errorf("%w: invalid cursor", domain.ErrValidation)
 	}
 
 	limit := in.Limit
@@ -204,14 +243,45 @@ func (s *ListingService) SearchListings(ctx context.Context, in *SearchListingsI
 		limit = searchMaxLimit
 	}
 
+	mode := in.Mode
+	if mode == "" {
+		mode = SearchModeLexical
+	}
+
+	// Ranked modes require an embedding client and store.
+	// Fall back to lexical when they are unavailable (cold-start / dev).
+	if (mode == SearchModeSemantic || mode == SearchModeHybrid) &&
+		(s.embClient == nil || s.embStore == nil) {
+		slog.Warn("search: embedding client or store not configured; falling back to lexical",
+			"requested_mode", mode)
+		mode = SearchModeLexical
+	}
+
+	switch mode {
+	case SearchModeSemantic:
+		return s.searchSemantic(ctx, in, limit)
+	case SearchModeHybrid:
+		return s.searchHybrid(ctx, in, limit)
+	default:
+		return s.searchLexical(ctx, in, limit)
+	}
+}
+
+// searchLexical runs the existing FTS+keyset path — byte-identical to the pre-T3 behavior.
+func (s *ListingService) searchLexical(ctx context.Context, in *SearchListingsInput, limit int) (*SearchListingsResult, error) {
+	cursor, err := decodeSearchCursor(in.Cursor)
+	if err != nil {
+		return nil, fmt.Errorf("%w: invalid cursor", domain.ErrValidation)
+	}
+
 	filter := store.SearchFilter{
 		Query:           in.Query,
 		Status:          in.Status,
 		BudgetMin:       in.BudgetMin,
 		BudgetMax:       in.BudgetMax,
 		After:           cursor,
-		VisibleToUserID: in.CallerID, // visibility enforced in SQL
-		Limit:           limit + 1,   // over-fetch one row to detect a next page
+		VisibleToUserID: in.CallerID,
+		Limit:           limit + 1, // over-fetch one row to detect a next page
 	}
 
 	rows, err := s.listings.Search(ctx, filter)
@@ -220,6 +290,138 @@ func (s *ListingService) SearchListings(ctx context.Context, in *SearchListingsI
 	}
 
 	return buildSearchResult(rows, limit), nil
+}
+
+// searchSemantic generates a query embedding, finds nearest neighbors, and
+// hydrates the ranked ID set with visibility enforced in SQL. Errors in the
+// embedding call fall back silently to lexical.
+func (s *ListingService) searchSemantic(ctx context.Context, in *SearchListingsInput, limit int) (*SearchListingsResult, error) {
+	semIDs, fallback := s.semanticIDs(ctx, in.Query)
+	if fallback {
+		return s.searchLexical(ctx, in, limit)
+	}
+
+	// Pass all ranked candidates to GetByIDs. The SQL layer applies visibility
+	// AND optional status/budget filters, which may exclude some candidates.
+	// We cap the hydrated result to limit AFTER filtering to avoid returning
+	// fewer than limit rows when filters exclude candidates from the pre-cap set.
+	rows, err := s.listings.GetByIDs(ctx, semIDs, store.HydrationFilter{
+		ViewerID:  in.CallerID,
+		Status:    in.Status,
+		BudgetMin: in.BudgetMin,
+		BudgetMax: in.BudgetMax,
+	})
+	if err != nil {
+		return nil, fmt.Errorf("hydrate semantic results: %w", err)
+	}
+
+	if len(rows) > limit {
+		rows = rows[:limit]
+	}
+
+	return &SearchListingsResult{Listings: nonNilListings(rows)}, nil
+}
+
+// searchHybrid fuses lexical and semantic candidate lists with RRF (k=60),
+// hydrates the fused ranking with visibility enforced in SQL. Falls back to
+// lexical silently when the embedding call fails.
+func (s *ListingService) searchHybrid(ctx context.Context, in *SearchListingsInput, limit int) (*SearchListingsResult, error) {
+	// Lexical candidates — fetch up to searchTopK from FTS (no cursor, fresh ranking).
+	lexFilter := store.SearchFilter{
+		Query:           in.Query,
+		Status:          in.Status,
+		BudgetMin:       in.BudgetMin,
+		BudgetMax:       in.BudgetMax,
+		VisibleToUserID: in.CallerID,
+		Limit:           searchTopK,
+	}
+
+	lexRows, err := s.listings.Search(ctx, lexFilter)
+	if err != nil {
+		return nil, fmt.Errorf("hybrid: lexical search: %w", err)
+	}
+
+	lexIDs := make([]uuid.UUID, len(lexRows))
+	for i, r := range lexRows {
+		lexIDs[i] = r.ID
+	}
+
+	// Semantic candidates — falls back to lexical if embedding unavailable.
+	semIDs, fallback := s.semanticIDs(ctx, in.Query)
+	if fallback {
+		slog.Warn("hybrid: embedding fallback; returning lexical-only results")
+		// Delegate to searchLexical so the response uses the correct over-fetch
+		// (limit+1) for reliable nextCursor detection, rather than the searchTopK
+		// over-fetch used for the RRF candidate set.
+		return s.searchLexical(ctx, in, limit)
+	}
+
+	// Fuse via RRF and hydrate. Pass all fused candidates to GetByIDs so the SQL
+	// layer can apply visibility + optional status/budget filters without
+	// under-returning when filters exclude candidates from a pre-cap set.
+	// Cap AFTER hydration.
+	fusedIDs := RRFCombine(lexIDs, semIDs)
+
+	rows, err := s.listings.GetByIDs(ctx, fusedIDs, store.HydrationFilter{
+		ViewerID:  in.CallerID,
+		Status:    in.Status,
+		BudgetMin: in.BudgetMin,
+		BudgetMax: in.BudgetMax,
+	})
+	if err != nil {
+		return nil, fmt.Errorf("hybrid: hydrate fused results: %w", err)
+	}
+
+	if len(rows) > limit {
+		rows = rows[:limit]
+	}
+
+	return &SearchListingsResult{Listings: nonNilListings(rows)}, nil
+}
+
+// semanticIDs generates a query embedding and returns nearest-neighbor IDs
+// ordered by ascending cosine distance (most-similar first). The second return
+// value is true when the caller should fall back to lexical (disabled, cold, or error).
+func (s *ListingService) semanticIDs(ctx context.Context, query string) (ids []uuid.UUID, fallback bool) {
+	vec, err := s.embClient.Generate(ctx, query)
+	if err != nil {
+		if errors.Is(err, client.ErrEmbeddingDisabled) {
+			slog.Warn("search: embedding disabled; falling back to lexical")
+		} else {
+			slog.Warn("search: embedding generate failed; falling back to lexical", "err", err)
+		}
+
+		return nil, true
+	}
+
+	neighbors, err := s.embStore.NearestNeighbors(ctx, vec, domain.EmbeddingEntityTypeTender, searchTopK)
+	if err != nil {
+		slog.Warn("search: nearest neighbors failed; falling back to lexical", "err", err)
+
+		return nil, true
+	}
+
+	if len(neighbors) == 0 {
+		// Cold-start: no embeddings indexed yet; fall back to lexical.
+		return nil, true
+	}
+
+	out := make([]uuid.UUID, len(neighbors))
+	for i, n := range neighbors {
+		out[i] = n.EntityID
+	}
+
+	return out, false
+}
+
+// nonNilListings returns a non-nil slice, converting nil to an empty slice so
+// the JSON response always has "listings": [] instead of "listings": null.
+func nonNilListings(ls []*domain.Listing) []*domain.Listing {
+	if ls == nil {
+		return []*domain.Listing{}
+	}
+
+	return ls
 }
 
 // buildSearchResult trims the over-fetched page to limit and emits the next
