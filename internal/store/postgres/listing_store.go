@@ -58,8 +58,8 @@ func (s *txListingStore) Search(ctx context.Context, filter store.SearchFilter) 
 	return searchListings(ctx, s.tx, filter)
 }
 
-func (s *txListingStore) GetByIDs(ctx context.Context, ids []uuid.UUID, viewerID uuid.UUID) ([]*domain.Listing, error) {
-	return getListingsByIDs(ctx, s.tx, ids, viewerID)
+func (s *txListingStore) GetByIDs(ctx context.Context, ids []uuid.UUID, filter store.HydrationFilter) ([]*domain.Listing, error) {
+	return getListingsByIDs(ctx, s.tx, ids, filter)
 }
 
 func (s *txListingStore) Update(ctx context.Context, l *domain.Listing) error {
@@ -93,9 +93,10 @@ func (s *ListingStore) Search(ctx context.Context, filter store.SearchFilter) ([
 }
 
 // GetByIDs hydrates a ranked candidate ID set while enforcing visibility in SQL.
-// IDs the viewer cannot see are dropped by the WHERE clause, never post-filtered in Go.
-func (s *ListingStore) GetByIDs(ctx context.Context, ids []uuid.UUID, viewerID uuid.UUID) ([]*domain.Listing, error) {
-	return getListingsByIDs(ctx, s.q, ids, viewerID)
+// IDs the viewer cannot see, or that fail optional Status/Budget filters, are
+// dropped by the WHERE clause — never post-filtered in Go.
+func (s *ListingStore) GetByIDs(ctx context.Context, ids []uuid.UUID, filter store.HydrationFilter) ([]*domain.Listing, error) {
+	return getListingsByIDs(ctx, s.q, ids, filter)
 }
 
 // Update persists changes to a listing.
@@ -348,11 +349,13 @@ WHERE deleted_at IS NULL`)
 }
 
 // getListingsByIDs fetches listings for the given ID set, enforcing visibility
-// IN SQL (OPEN public, non-OPEN owner-only). Rows not visible to viewerID are
-// silently omitted — no post-filtering in Go, which would leak hidden-doc counts.
-// The returned slice is ordered to match the input ID ordering using a CASE
-// expression, so the caller (RRF) does not need a secondary sort.
-func getListingsByIDs(ctx context.Context, q querier, ids []uuid.UUID, viewerID uuid.UUID) ([]*domain.Listing, error) {
+// IN SQL (OPEN public, non-OPEN owner-only) plus any optional structured
+// filters (Status, BudgetMin, BudgetMax) from filter.  Rows that fail any
+// predicate are silently omitted — no post-filtering in Go, which would leak
+// hidden-doc counts. The returned slice is ordered to match the input ID
+// ordering using a CASE expression, so the caller (RRF) does not need a
+// secondary sort.
+func getListingsByIDs(ctx context.Context, q querier, ids []uuid.UUID, filter store.HydrationFilter) ([]*domain.Listing, error) {
 	if len(ids) == 0 {
 		return nil, nil
 	}
@@ -373,8 +376,28 @@ WHERE deleted_at IS NULL`)
 
 	// Visibility: same predicate as buildSearchQuery — OPEN public, non-OPEN owner-only.
 	fmt.Fprintf(&sb, " AND (status = 'OPEN' OR owner_user_id = $%d)", n)
-	args = append(args, viewerID)
+	args = append(args, filter.ViewerID)
 	n++
+
+	// Optional status filter — same contract as lexical search.
+	if filter.Status != nil {
+		fmt.Fprintf(&sb, " AND status = $%d", n)
+		args = append(args, string(*filter.Status))
+		n++
+	}
+
+	// Optional budget filters — same contract as lexical search.
+	if filter.BudgetMin != nil {
+		fmt.Fprintf(&sb, " AND budget_max >= $%d", n)
+		args = append(args, filter.BudgetMin)
+		n++
+	}
+
+	if filter.BudgetMax != nil {
+		fmt.Fprintf(&sb, " AND budget_min <= $%d", n)
+		args = append(args, filter.BudgetMax)
+		n++
+	}
 
 	// Build the $N,$N+1,... IN clause for the id set.
 	sb.WriteString(" AND id IN (")

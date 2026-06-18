@@ -64,7 +64,7 @@ func (s *stubTenderListingStoreH) Search(_ context.Context, _ store.SearchFilter
 	return nil, nil
 }
 
-func (s *stubTenderListingStoreH) GetByIDs(_ context.Context, ids []uuid.UUID, _ uuid.UUID) ([]*domain.Listing, error) {
+func (s *stubTenderListingStoreH) GetByIDs(_ context.Context, ids []uuid.UUID, _ store.HydrationFilter) ([]*domain.Listing, error) {
 	out := make([]*domain.Listing, 0, len(ids))
 
 	for _, id := range ids {

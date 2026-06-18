@@ -176,8 +176,14 @@ func (h *ListingHandler) Search(c *gin.Context) {
 	}
 
 	if statusStr := c.Query("status"); statusStr != "" {
-		s := domain.ListingStatus(statusStr)
-		in.Status = &s
+		switch domain.ListingStatus(statusStr) {
+		case domain.ListingStatusOpen, domain.ListingStatusAwarded, domain.ListingStatusClosed:
+			s := domain.ListingStatus(statusStr)
+			in.Status = &s
+		default:
+			httpx.ErrCode(c, http.StatusBadRequest, "VALIDATION_ERROR", "invalid status filter")
+			return
+		}
 	}
 
 	if minStr := c.Query("minBudget"); minStr != "" {

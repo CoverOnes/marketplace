@@ -186,7 +186,7 @@ func tokenize(s string) map[string]bool {
 }
 
 // GetByIDs returns the listings for the given IDs in order, visibility-filtered.
-func (s *stubListingStoreH) GetByIDs(_ context.Context, ids []uuid.UUID, viewerID uuid.UUID) ([]*domain.Listing, error) {
+func (s *stubListingStoreH) GetByIDs(_ context.Context, ids []uuid.UUID, filter store.HydrationFilter) ([]*domain.Listing, error) {
 	out := make([]*domain.Listing, 0, len(ids))
 
 	for _, id := range ids {
@@ -196,7 +196,7 @@ func (s *stubListingStoreH) GetByIDs(_ context.Context, ids []uuid.UUID, viewerI
 		}
 
 		// Visibility: OPEN is public; non-OPEN only to owner.
-		if l.Status != domain.ListingStatusOpen && l.OwnerUserID != viewerID {
+		if l.Status != domain.ListingStatusOpen && l.OwnerUserID != filter.ViewerID {
 			continue
 		}
 
@@ -656,6 +656,12 @@ func TestListingHandler_Search(t *testing.T) {
 		{
 			name:       "error: invalid status filter -> 400",
 			query:      "status=BOGUS",
+			wantStatus: http.StatusBadRequest,
+			wantCode:   "VALIDATION_ERROR",
+		},
+		{
+			name:       "error: invalid mode -> 400",
+			query:      "mode=bogus",
 			wantStatus: http.StatusBadRequest,
 			wantCode:   "VALIDATION_ERROR",
 		},

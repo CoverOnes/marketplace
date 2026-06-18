@@ -301,14 +301,22 @@ func (s *ListingService) searchSemantic(ctx context.Context, in *SearchListingsI
 		return s.searchLexical(ctx, in, limit)
 	}
 
-	// Cap to page size and hydrate.
-	if len(semIDs) > limit {
-		semIDs = semIDs[:limit]
-	}
-
-	rows, err := s.listings.GetByIDs(ctx, semIDs, in.CallerID)
+	// Pass all ranked candidates to GetByIDs. The SQL layer applies visibility
+	// AND optional status/budget filters, which may exclude some candidates.
+	// We cap the hydrated result to limit AFTER filtering to avoid returning
+	// fewer than limit rows when filters exclude candidates from the pre-cap set.
+	rows, err := s.listings.GetByIDs(ctx, semIDs, store.HydrationFilter{
+		ViewerID:  in.CallerID,
+		Status:    in.Status,
+		BudgetMin: in.BudgetMin,
+		BudgetMax: in.BudgetMax,
+	})
 	if err != nil {
 		return nil, fmt.Errorf("hydrate semantic results: %w", err)
+	}
+
+	if len(rows) > limit {
+		rows = rows[:limit]
 	}
 
 	return &SearchListingsResult{Listings: nonNilListings(rows)}, nil
@@ -342,18 +350,30 @@ func (s *ListingService) searchHybrid(ctx context.Context, in *SearchListingsInp
 	semIDs, fallback := s.semanticIDs(ctx, in.Query)
 	if fallback {
 		slog.Warn("hybrid: embedding fallback; returning lexical-only results")
-		return buildSearchResult(lexRows, limit), nil
+		// Delegate to searchLexical so the response uses the correct over-fetch
+		// (limit+1) for reliable nextCursor detection, rather than the searchTopK
+		// over-fetch used for the RRF candidate set.
+		return s.searchLexical(ctx, in, limit)
 	}
 
-	// Fuse via RRF and hydrate.
+	// Fuse via RRF and hydrate. Pass all fused candidates to GetByIDs so the SQL
+	// layer can apply visibility + optional status/budget filters without
+	// under-returning when filters exclude candidates from a pre-cap set.
+	// Cap AFTER hydration.
 	fusedIDs := RRFCombine(lexIDs, semIDs)
-	if len(fusedIDs) > limit {
-		fusedIDs = fusedIDs[:limit]
-	}
 
-	rows, err := s.listings.GetByIDs(ctx, fusedIDs, in.CallerID)
+	rows, err := s.listings.GetByIDs(ctx, fusedIDs, store.HydrationFilter{
+		ViewerID:  in.CallerID,
+		Status:    in.Status,
+		BudgetMin: in.BudgetMin,
+		BudgetMax: in.BudgetMax,
+	})
 	if err != nil {
 		return nil, fmt.Errorf("hybrid: hydrate fused results: %w", err)
+	}
+
+	if len(rows) > limit {
+		rows = rows[:limit]
 	}
 
 	return &SearchListingsResult{Listings: nonNilListings(rows)}, nil

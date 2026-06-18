@@ -21,11 +21,13 @@ type ListingStore interface {
 	// Search runs a full-text + structured filter query with keyset pagination.
 	Search(ctx context.Context, filter SearchFilter) ([]*domain.Listing, error)
 	// GetByIDs fetches listings for a ranked candidate set, enforcing the
-	// visibility rule IN SQL (OPEN public, non-OPEN owner-only). IDs that the
-	// viewer cannot see are silently omitted — never post-filtered in Go, which
-	// would leak hidden-doc counts. The returned slice preserves the input ID
-	// order so the caller can apply RRF ranking without a secondary sort.
-	GetByIDs(ctx context.Context, ids []uuid.UUID, viewerID uuid.UUID) ([]*domain.Listing, error)
+	// visibility rule IN SQL (OPEN public, non-OPEN owner-only) AND any optional
+	// structured filters (Status, BudgetMin, BudgetMax). IDs that the viewer
+	// cannot see, or that fail the optional filters, are silently omitted —
+	// never post-filtered in Go, which would leak hidden-doc counts.
+	// The returned slice preserves the input ID order so the caller can apply
+	// RRF ranking without a secondary sort.
+	GetByIDs(ctx context.Context, ids []uuid.UUID, filter HydrationFilter) ([]*domain.Listing, error)
 	Update(ctx context.Context, l *domain.Listing) error
 }
 
@@ -72,6 +74,20 @@ type SearchFilter struct {
 	After           *SearchCursor
 	VisibleToUserID uuid.UUID
 	Limit           int
+}
+
+// HydrationFilter carries the caller identity and optional structured filters
+// applied when hydrating a ranked ID set via GetByIDs.
+//
+// ViewerID enforces the visibility rule IN SQL: OPEN listings are public,
+// non-OPEN listings are visible only to their owner. Combined with the
+// optional Status / BudgetMin / BudgetMax filters this gives semantic and
+// hybrid search the same filter contract as lexical search.
+type HydrationFilter struct {
+	ViewerID  uuid.UUID
+	Status    *domain.ListingStatus
+	BudgetMin *decimal.Decimal
+	BudgetMax *decimal.Decimal
 }
 
 // BidStore defines persistence operations for bids.

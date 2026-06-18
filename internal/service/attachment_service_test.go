@@ -54,7 +54,7 @@ func (f *fakeListingStore) Search(_ context.Context, _ store.SearchFilter) ([]*d
 	return nil, nil
 }
 
-func (f *fakeListingStore) GetByIDs(_ context.Context, ids []uuid.UUID, _ uuid.UUID) ([]*domain.Listing, error) {
+func (f *fakeListingStore) GetByIDs(_ context.Context, ids []uuid.UUID, _ store.HydrationFilter) ([]*domain.Listing, error) {
 	out := make([]*domain.Listing, 0, len(ids))
 
 	for _, id := range ids {
