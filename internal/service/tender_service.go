@@ -910,3 +910,152 @@ func validateMilestoneInput(title string, amount, currency *string) error {
 
 	return nil
 }
+
+// --- Milestone transition ---
+
+// UpdateMilestoneInput carries validated input for transitioning a tender milestone status.
+type UpdateMilestoneInput struct {
+	MilestoneID uuid.UUID
+	CallerID    uuid.UUID // must equal listing.OwnerUserID
+	// Status is the target status: REACHED or SKIPPED.
+	// PENDING is not a legal target (milestones cannot be reverted).
+	Status domain.MilestoneStatus
+}
+
+// validMilestoneTransition returns true when the from→to transition is legal.
+// PENDING → REACHED: allowed (owner marks milestone reached, records reached_at).
+// PENDING → SKIPPED: allowed (owner decides to skip the milestone).
+// All other transitions are illegal; milestones cannot be reverted.
+func validMilestoneTransition(from, to domain.MilestoneStatus) bool {
+	if from == to {
+		return false
+	}
+
+	if from == domain.MilestoneStatusPending {
+		switch to {
+		case domain.MilestoneStatusReached, domain.MilestoneStatusSkipped:
+			return true
+		}
+	}
+
+	return false
+}
+
+// isTenderTerminal returns true when ts represents a terminal tender state
+// (SETTLING, COMPLETED, or CANCELED) in which milestone transitions are disallowed.
+// nil ts means the listing is CLASSIC — also treated as terminal for milestone purposes.
+func isTenderTerminal(ts *domain.TenderStatus) bool {
+	if ts == nil {
+		return true
+	}
+
+	switch *ts {
+	case domain.TenderStatusSettling, domain.TenderStatusCompleted, domain.TenderStatusCancelled:
+		return true
+	}
+
+	return false
+}
+
+// UpdateMilestone transitions a milestone from PENDING to REACHED (sets reached_at)
+// or SKIPPED. Owner-only (404 enumeration guard for non-owner). Terminal tenders
+// (SETTLING, COMPLETED, CANCELED) reject all milestone changes.
+func (s *TenderService) UpdateMilestone(ctx context.Context, in *UpdateMilestoneInput) (*domain.TenderMilestone, error) {
+	if in.Status != domain.MilestoneStatusReached && in.Status != domain.MilestoneStatusSkipped {
+		return nil, fmt.Errorf("%w: target status must be REACHED or SKIPPED", domain.ErrValidation)
+	}
+
+	m, err := s.milestones.GetByID(ctx, in.MilestoneID)
+	if err != nil {
+		return nil, err
+	}
+
+	// Load the parent listing to enforce owner guard and terminal-state gate.
+	listing, err := s.listings.GetByID(ctx, m.ListingID)
+	if err != nil {
+		return nil, err
+	}
+
+	if !listing.IsTender {
+		return nil, domain.ErrNotTenderListing
+	}
+
+	// 404 enumeration guard: non-owner sees the same error as "not found".
+	if listing.OwnerUserID != in.CallerID {
+		return nil, domain.ErrTenderMilestoneNotFound
+	}
+
+	if isTenderTerminal(listing.TenderStatus) {
+		return nil, fmt.Errorf("%w: cannot modify milestone on a terminal tender", domain.ErrInvalidTenderTransition)
+	}
+
+	if !validMilestoneTransition(m.Status, in.Status) {
+		return nil, fmt.Errorf("%w: milestone cannot transition from %s to %s",
+			domain.ErrInvalidTenderTransition, m.Status, in.Status)
+	}
+
+	now := time.Now().UTC()
+	m.Status = in.Status
+	m.UpdatedAt = now
+
+	if in.Status == domain.MilestoneStatusReached {
+		m.ReachedAt = &now
+	}
+
+	if err := s.milestones.Update(ctx, m); err != nil {
+		return nil, fmt.Errorf("update tender milestone: %w", err)
+	}
+
+	slog.Info("milestone transitioned",
+		"milestone_id", m.ID,
+		"listing_id", m.ListingID,
+		"status", m.Status,
+	)
+
+	return m, nil
+}
+
+// MilestoneProgress summarizes the milestone status counts for a tender listing.
+type MilestoneProgress struct {
+	Total   int `json:"total"`
+	Pending int `json:"pending"`
+	Reached int `json:"reached"`
+	Skipped int `json:"skipped"`
+}
+
+// GetMilestoneProgress returns aggregated milestone status counts for a tender listing.
+// Owner-only (404 enumeration guard for non-owner).
+func (s *TenderService) GetMilestoneProgress(ctx context.Context, listingID, callerID uuid.UUID) (*MilestoneProgress, error) {
+	listing, err := s.listings.GetByID(ctx, listingID)
+	if err != nil {
+		return nil, err
+	}
+
+	if !listing.IsTender {
+		return nil, domain.ErrNotTenderListing
+	}
+
+	if listing.OwnerUserID != callerID {
+		return nil, domain.ErrListingNotFound // 404 to avoid enumeration
+	}
+
+	milestones, err := s.milestones.ListByListing(ctx, listingID)
+	if err != nil {
+		return nil, err
+	}
+
+	progress := &MilestoneProgress{Total: len(milestones)}
+
+	for _, ms := range milestones {
+		switch ms.Status {
+		case domain.MilestoneStatusPending:
+			progress.Pending++
+		case domain.MilestoneStatusReached:
+			progress.Reached++
+		case domain.MilestoneStatusSkipped:
+			progress.Skipped++
+		}
+	}
+
+	return progress, nil
+}
