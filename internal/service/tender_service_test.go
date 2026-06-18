@@ -176,6 +176,10 @@ func (s *stubTenderMilestoneStore) GetByID(_ context.Context, id uuid.UUID) (*do
 	return m, nil
 }
 
+func (s *stubTenderMilestoneStore) GetByIDForUpdate(ctx context.Context, id uuid.UUID) (*domain.TenderMilestone, error) {
+	return s.GetByID(ctx, id)
+}
+
 func (s *stubTenderMilestoneStore) ListByListing(_ context.Context, listingID uuid.UUID) ([]*domain.TenderMilestone, error) {
 	var result []*domain.TenderMilestone
 
@@ -228,6 +232,19 @@ func (m *stubOutboxTxManager) WithOutboxTx(
 	}
 
 	return fn(ctx, m.listings, m.roles, m.collaborators, ob)
+}
+
+// stubMilestoneTxManager calls fn synchronously with the provided stores, simulating a transaction.
+type stubMilestoneTxManager struct {
+	listings   store.ListingStore
+	milestones store.TenderMilestoneStore
+}
+
+func (m *stubMilestoneTxManager) WithMilestoneTx(
+	ctx context.Context,
+	fn func(context.Context, store.ListingStore, store.TenderMilestoneStore) error,
+) error {
+	return fn(ctx, m.listings, m.milestones)
 }
 
 // noopTenderOutboxStore satisfies store.OutboxStore for tender unit tests.
@@ -310,8 +327,9 @@ func newTenderSvc(
 ) *service.TenderService {
 	txm := &stubTenderTxManager{listings: ls, roles: rs, collaborators: cs}
 	outboxTxm := &stubOutboxTxManager{listings: ls, roles: rs, collaborators: cs}
+	milestoneTxm := &stubMilestoneTxManager{listings: ls, milestones: ms}
 
-	return service.NewTenderService(ls, rs, cs, ms, txm, outboxTxm, nil, events.NewNoopPublisher())
+	return service.NewTenderService(ls, rs, cs, ms, txm, outboxTxm, milestoneTxm, nil, events.NewNoopPublisher())
 }
 
 // newTenderSvcWithWorkspace builds a TenderService with a custom workspace client.
@@ -324,8 +342,9 @@ func newTenderSvcWithWorkspace(
 ) *service.TenderService {
 	txm := &stubTenderTxManager{listings: ls, roles: rs, collaborators: cs}
 	outboxTxm := &stubOutboxTxManager{listings: ls, roles: rs, collaborators: cs}
+	milestoneTxm := &stubMilestoneTxManager{listings: ls, milestones: ms}
 
-	return service.NewTenderService(ls, rs, cs, ms, txm, outboxTxm, wc, events.NewNoopPublisher())
+	return service.NewTenderService(ls, rs, cs, ms, txm, outboxTxm, milestoneTxm, wc, events.NewNoopPublisher())
 }
 
 // --- stub workspace client ---
@@ -1489,7 +1508,8 @@ func TestCollaboratorJoined_EnqueuedToOutbox(t *testing.T) {
 	// Wire the recording outbox store into the outbox tx manager.
 	txm := &stubTenderTxManager{listings: ls, roles: rs, collaborators: cs}
 	outboxTxm := &stubOutboxTxManager{listings: ls, roles: rs, collaborators: cs, outboxStore: recOutbox}
-	svc := service.NewTenderService(ls, rs, cs, ms, txm, outboxTxm, wc, events.NewNoopPublisher())
+	milestoneTxm := &stubMilestoneTxManager{listings: ls, milestones: ms}
+	svc := service.NewTenderService(ls, rs, cs, ms, txm, outboxTxm, milestoneTxm, wc, events.NewNoopPublisher())
 
 	_, err := svc.AcceptCollaborator(context.Background(), &service.AcceptCollaboratorInput{
 		CollaboratorID: collab.ID,

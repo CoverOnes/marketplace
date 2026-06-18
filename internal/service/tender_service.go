@@ -23,9 +23,10 @@ type TenderService struct {
 	roles           store.TenderRoleStore
 	collaborators   store.TenderCollaboratorStore
 	milestones      store.TenderMilestoneStore
-	tenderTx        store.TenderTxManager  // used by non-outbox operations
-	outboxTx        store.OutboxTxManager  // used by AcceptCollaborator (same-tx enqueue)
-	workspaceClient client.WorkspaceClient // nil = workspace call skipped (dev/test)
+	tenderTx        store.TenderTxManager    // used by non-outbox operations
+	outboxTx        store.OutboxTxManager    // used by AcceptCollaborator (same-tx enqueue)
+	milestoneTx     store.MilestoneTxManager // used by UpdateMilestone (serialize transitions)
+	workspaceClient client.WorkspaceClient   // nil = workspace call skipped (dev/test)
 	publisher       events.Publisher
 }
 
@@ -34,6 +35,8 @@ type TenderService struct {
 // publisher must not be nil; pass events.NewNoopPublisher() when Redis is absent.
 // outboxTx wraps AcceptCollaborator's transaction so collaborator_joined events are
 // enqueued in the same DB transaction (same-tx outbox pattern).
+// milestoneTx serializes concurrent UpdateMilestone calls via SELECT FOR UPDATE inside
+// a transaction, preventing TOCTOU races on reached_at (the settlement timestamp).
 func NewTenderService(
 	listings store.ListingStore,
 	roles store.TenderRoleStore,
@@ -41,6 +44,7 @@ func NewTenderService(
 	milestones store.TenderMilestoneStore,
 	tenderTx store.TenderTxManager,
 	outboxTx store.OutboxTxManager,
+	milestoneTx store.MilestoneTxManager,
 	workspaceClient client.WorkspaceClient,
 	publisher events.Publisher,
 ) *TenderService {
@@ -51,6 +55,7 @@ func NewTenderService(
 		milestones:      milestones,
 		tenderTx:        tenderTx,
 		outboxTx:        outboxTx,
+		milestoneTx:     milestoneTx,
 		workspaceClient: workspaceClient,
 		publisher:       publisher,
 	}
@@ -960,59 +965,84 @@ func isTenderTerminal(ts *domain.TenderStatus) bool {
 // UpdateMilestone transitions a milestone from PENDING to REACHED (sets reached_at)
 // or SKIPPED. Owner-only (404 enumeration guard for non-owner). Terminal tenders
 // (SETTLING, COMPLETED, CANCELED) reject all milestone changes.
+//
+// TOCTOU fix (M-1): all reads and the update run inside a single transaction with
+// SELECT ... FOR UPDATE on the milestone row. Two concurrent PATCH calls for the
+// same milestone both read PENDING outside the lock; inside the lock the second
+// caller will either see the already-committed transition and receive
+// ErrInvalidTenderTransition, or block until the first commit. This prevents
+// reached_at (the settlement timestamp) from being corrupted by last-writer-wins.
 func (s *TenderService) UpdateMilestone(ctx context.Context, in *UpdateMilestoneInput) (*domain.TenderMilestone, error) {
+	// Input validation can run before the tx — it never touches the DB.
 	if in.Status != domain.MilestoneStatusReached && in.Status != domain.MilestoneStatusSkipped {
 		return nil, fmt.Errorf("%w: target status must be REACHED or SKIPPED", domain.ErrValidation)
 	}
 
-	m, err := s.milestones.GetByID(ctx, in.MilestoneID)
-	if err != nil {
-		return nil, err
+	var result *domain.TenderMilestone
+
+	txErr := s.milestoneTx.WithMilestoneTx(ctx, func(
+		txCtx context.Context,
+		txListings store.ListingStore,
+		txMilestones store.TenderMilestoneStore,
+	) error {
+		// Lock the milestone row first to prevent concurrent transitions.
+		m, err := txMilestones.GetByIDForUpdate(txCtx, in.MilestoneID)
+		if err != nil {
+			return err
+		}
+
+		// Load the parent listing to enforce owner guard and terminal-state gate.
+		listing, err := txListings.GetByIDForUpdate(txCtx, m.ListingID)
+		if err != nil {
+			return err
+		}
+
+		if !listing.IsTender {
+			return domain.ErrNotTenderListing
+		}
+
+		// 404 enumeration guard: non-owner sees the same error as "not found".
+		if listing.OwnerUserID != in.CallerID {
+			return domain.ErrTenderMilestoneNotFound
+		}
+
+		if isTenderTerminal(listing.TenderStatus) {
+			return fmt.Errorf("%w: cannot modify milestone on a terminal tender", domain.ErrInvalidTenderTransition)
+		}
+
+		if !validMilestoneTransition(m.Status, in.Status) {
+			return fmt.Errorf("%w: milestone cannot transition from %s to %s",
+				domain.ErrInvalidTenderTransition, m.Status, in.Status)
+		}
+
+		now := time.Now().UTC()
+		m.Status = in.Status
+		m.UpdatedAt = now
+
+		if in.Status == domain.MilestoneStatusReached {
+			m.ReachedAt = &now
+		}
+
+		if err := txMilestones.Update(txCtx, m); err != nil {
+			return fmt.Errorf("update tender milestone: %w", err)
+		}
+
+		result = m
+
+		return nil
+	})
+	if txErr != nil {
+		return result, txErr
 	}
 
-	// Load the parent listing to enforce owner guard and terminal-state gate.
-	listing, err := s.listings.GetByID(ctx, m.ListingID)
-	if err != nil {
-		return nil, err
-	}
-
-	if !listing.IsTender {
-		return nil, domain.ErrNotTenderListing
-	}
-
-	// 404 enumeration guard: non-owner sees the same error as "not found".
-	if listing.OwnerUserID != in.CallerID {
-		return nil, domain.ErrTenderMilestoneNotFound
-	}
-
-	if isTenderTerminal(listing.TenderStatus) {
-		return nil, fmt.Errorf("%w: cannot modify milestone on a terminal tender", domain.ErrInvalidTenderTransition)
-	}
-
-	if !validMilestoneTransition(m.Status, in.Status) {
-		return nil, fmt.Errorf("%w: milestone cannot transition from %s to %s",
-			domain.ErrInvalidTenderTransition, m.Status, in.Status)
-	}
-
-	now := time.Now().UTC()
-	m.Status = in.Status
-	m.UpdatedAt = now
-
-	if in.Status == domain.MilestoneStatusReached {
-		m.ReachedAt = &now
-	}
-
-	if err := s.milestones.Update(ctx, m); err != nil {
-		return nil, fmt.Errorf("update tender milestone: %w", err)
-	}
-
-	slog.Info("milestone transitioned",
-		"milestone_id", m.ID,
-		"listing_id", m.ListingID,
-		"status", m.Status,
+	slog.Info(
+		"milestone transitioned",
+		"milestone_id", result.ID,
+		"listing_id", result.ListingID,
+		"status", result.Status,
 	)
 
-	return m, nil
+	return result, nil
 }
 
 // MilestoneProgress summarizes the milestone status counts for a tender listing.

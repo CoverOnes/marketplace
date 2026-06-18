@@ -415,6 +415,16 @@ func (h *TenderHandler) UpdateMilestone(c *gin.Context) {
 		return
 	}
 
+	// M-2: allowlist BEFORE the cast to prevent attacker-controlled strings
+	// (including newlines and control characters) from flowing into error messages
+	// and logs (log injection vector).
+	switch req.Status {
+	case "REACHED", "SKIPPED":
+	default:
+		httpx.ErrCode(c, http.StatusBadRequest, "VALIDATION_ERROR", "status must be REACHED or SKIPPED")
+		return
+	}
+
 	status := domain.MilestoneStatus(req.Status)
 
 	milestone, err := h.svc.UpdateMilestone(c.Request.Context(), &service.UpdateMilestoneInput{

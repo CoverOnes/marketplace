@@ -23,6 +23,33 @@ func NewTenderMilestoneStore(pool *pgxpool.Pool) *TenderMilestoneStore {
 	return &TenderMilestoneStore{q: pool}
 }
 
+// txTenderMilestoneStore is a transaction-scoped TenderMilestoneStore.
+type txTenderMilestoneStore struct {
+	tx querier
+}
+
+func (s *txTenderMilestoneStore) Create(ctx context.Context, m *domain.TenderMilestone) error {
+	return createTenderMilestone(ctx, s.tx, m)
+}
+
+func (s *txTenderMilestoneStore) GetByID(ctx context.Context, id uuid.UUID) (*domain.TenderMilestone, error) {
+	return getTenderMilestoneByID(ctx, s.tx, id)
+}
+
+func (s *txTenderMilestoneStore) GetByIDForUpdate(ctx context.Context, id uuid.UUID) (*domain.TenderMilestone, error) {
+	return getTenderMilestoneByIDForUpdate(ctx, s.tx, id)
+}
+
+func (s *txTenderMilestoneStore) ListByListing(ctx context.Context, listingID uuid.UUID) ([]*domain.TenderMilestone, error) {
+	return listTenderMilestonesByListing(ctx, s.tx, listingID)
+}
+
+func (s *txTenderMilestoneStore) Update(ctx context.Context, m *domain.TenderMilestone) error {
+	return updateTenderMilestone(ctx, s.tx, m)
+}
+
+// --- pool-backed methods ---
+
 // Create inserts a new tender milestone.
 func (s *TenderMilestoneStore) Create(ctx context.Context, m *domain.TenderMilestone) error {
 	return createTenderMilestone(ctx, s.q, m)
@@ -30,6 +57,11 @@ func (s *TenderMilestoneStore) Create(ctx context.Context, m *domain.TenderMiles
 
 // GetByID fetches a tender milestone by primary key.
 func (s *TenderMilestoneStore) GetByID(ctx context.Context, id uuid.UUID) (*domain.TenderMilestone, error) {
+	return getTenderMilestoneByID(ctx, s.q, id)
+}
+
+// GetByIDForUpdate is not meaningful outside a transaction; delegates to regular read.
+func (s *TenderMilestoneStore) GetByIDForUpdate(ctx context.Context, id uuid.UUID) (*domain.TenderMilestone, error) {
 	return getTenderMilestoneByID(ctx, s.q, id)
 }
 
@@ -71,6 +103,20 @@ func getTenderMilestoneByID(ctx context.Context, q querier, id uuid.UUID) (*doma
 SELECT id, listing_id, title, due_date, amount, currency, status, reached_at, created_at, updated_at
 FROM tender_milestones
 WHERE id = $1
+`
+
+	return scanTenderMilestone(q.QueryRow(ctx, query, id))
+}
+
+// getTenderMilestoneByIDForUpdate fetches a milestone with SELECT ... FOR UPDATE
+// to prevent TOCTOU races on concurrent status transitions.
+// Must be called within an active transaction.
+func getTenderMilestoneByIDForUpdate(ctx context.Context, q querier, id uuid.UUID) (*domain.TenderMilestone, error) {
+	const query = `
+SELECT id, listing_id, title, due_date, amount, currency, status, reached_at, created_at, updated_at
+FROM tender_milestones
+WHERE id = $1
+FOR UPDATE
 `
 
 	return scanTenderMilestone(q.QueryRow(ctx, query, id))

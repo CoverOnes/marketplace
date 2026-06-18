@@ -39,6 +39,7 @@ func buildTenderTestService( //nolint:gocritic // unnamedResult: return types ar
 	milestoneStore := postgres.NewTenderMilestoneStore(pool)
 	txMgr := postgres.NewTenderTxManager(pool)
 	outboxTxMgr := postgres.NewOutboxTxManager(pool)
+	milestoneTxMgr := postgres.NewMilestoneTxManager(pool)
 	publisher := events.NewNoopPublisher()
 
 	svc := service.NewTenderService(
@@ -48,6 +49,7 @@ func buildTenderTestService( //nolint:gocritic // unnamedResult: return types ar
 		milestoneStore,
 		txMgr,
 		outboxTxMgr,
+		milestoneTxMgr,
 		wsClient,
 		publisher,
 	)
