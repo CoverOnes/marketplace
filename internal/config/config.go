@@ -102,6 +102,33 @@ type Config struct {
 	// rate limiter. MUST be > 0 when UserRateLimitPerMin > 0.
 	// Default: 20. Env: MARKETPLACE_USER_RATE_LIMIT_BURST
 	UserRateLimitBurst int `mapstructure:"user_rate_limit_burst"`
+
+	// Embedding configuration for the AI matching provider (OpenRouter).
+
+	// EmbeddingBaseURL is the base URL for the embedding API (default: "https://openrouter.ai").
+	// The client appends /api/v1/embeddings to this base; do NOT include the path here.
+	// Override for testing or alternate providers.
+	// Env: MARKETPLACE_EMBEDDING_BASE_URL
+	EmbeddingBaseURL string `mapstructure:"embedding_base_url"`
+
+	// EmbeddingModel is the model to use for embeddings (default: "text-embedding-3-small").
+	// Env: MARKETPLACE_EMBEDDING_MODEL
+	EmbeddingModel string `mapstructure:"embedding_model"`
+
+	// EmbeddingAPIKey is the OpenRouter API key (Bearer token). Sent in the
+	// Authorization header — NEVER in the URL. Required in non-dev unless
+	// EmbeddingDisabled is true (fail-closed posture).
+	// Env: MARKETPLACE_EMBEDDING_API_KEY
+	EmbeddingAPIKey string `mapstructure:"embedding_api_key"`
+
+	// EmbeddingTimeoutSec is the per-request timeout in seconds (default: 30, range: 1-300).
+	// Env: MARKETPLACE_EMBEDDING_TIMEOUT_SEC
+	EmbeddingTimeoutSec int `mapstructure:"embedding_timeout_sec"`
+
+	// EmbeddingDisabled, when true, returns ErrEmbeddingDisabled instead of calling the
+	// upstream API. Use in non-dev environments that have not yet configured an API key.
+	// Env: MARKETPLACE_EMBEDDING_DISABLED
+	EmbeddingDisabled bool `mapstructure:"embedding_disabled"`
 }
 
 // Load reads configuration from environment variables (prefix MARKETPLACE_).
@@ -145,6 +172,11 @@ func Load() (*Config, error) {
 		"gateway_hmac_secret":     "MARKETPLACE_GATEWAY_HMAC_SECRET",
 		"user_rate_limit_per_min": "MARKETPLACE_USER_RATE_LIMIT_PER_MIN",
 		"user_rate_limit_burst":   "MARKETPLACE_USER_RATE_LIMIT_BURST",
+		"embedding_base_url":      "MARKETPLACE_EMBEDDING_BASE_URL",
+		"embedding_model":         "MARKETPLACE_EMBEDDING_MODEL",
+		"embedding_api_key":       "MARKETPLACE_EMBEDDING_API_KEY",
+		"embedding_timeout_sec":   "MARKETPLACE_EMBEDDING_TIMEOUT_SEC",
+		"embedding_disabled":      "MARKETPLACE_EMBEDDING_DISABLED",
 	}
 
 	for key, envKey := range bindings {
@@ -163,6 +195,7 @@ func Load() (*Config, error) {
 	v.SetDefault("db_min_conns", 2)
 	v.SetDefault("user_rate_limit_per_min", 120)
 	v.SetDefault("user_rate_limit_burst", 20)
+	v.SetDefault("embedding_timeout_sec", 30)
 
 	var cfg Config
 
@@ -218,6 +251,7 @@ func (c *Config) validate() error {
 	errs = append(errs, c.validateFileService()...)
 	errs = append(errs, c.validateGatewayHMAC()...)
 	errs = append(errs, c.validateUserRateLimit()...)
+	errs = append(errs, c.validateEmbedding()...)
 
 	if len(errs) > 0 {
 		return errors.New("config validation failed: " + strings.Join(errs, "; "))
@@ -385,4 +419,23 @@ func (c *Config) validateUserRateLimit() []string {
 // IsDev reports whether the service is running in development mode.
 func (c *Config) IsDev() bool {
 	return strings.EqualFold(c.Env, "development")
+}
+
+// validateEmbedding returns validation errors for the embedding provider config.
+//
+// Fail-closed posture: in non-dev environments, an API key MUST be provided
+// unless embedding is explicitly disabled via EmbeddingDisabled. This prevents
+// a misconfigured deploy from silently degrading AI matching without notice.
+func (c *Config) validateEmbedding() []string {
+	var errs []string
+
+	if !c.IsDev() && !c.EmbeddingDisabled && c.EmbeddingAPIKey == "" {
+		errs = append(errs, "MARKETPLACE_EMBEDDING_API_KEY must be set in non-dev environments (or set MARKETPLACE_EMBEDDING_DISABLED=true to opt out)")
+	}
+
+	if c.EmbeddingTimeoutSec < 1 || c.EmbeddingTimeoutSec > 300 {
+		errs = append(errs, "MARKETPLACE_EMBEDDING_TIMEOUT_SEC must be between 1 and 300 seconds")
+	}
+
+	return errs
 }

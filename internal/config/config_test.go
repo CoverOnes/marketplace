@@ -207,6 +207,7 @@ func TestConfig_Load(t *testing.T) {
 				"MARKETPLACE_FILE_BASE_URL":           "https://file:8083",
 				"MARKETPLACE_FILE_SERVICE_ID":         "marketplace",
 				"MARKETPLACE_FILE_SERVICE_TOKEN":      testServiceToken,
+				"MARKETPLACE_EMBEDDING_DISABLED":      "true",
 			},
 			wantErr: false,
 		},
@@ -275,6 +276,7 @@ func TestConfig_Load(t *testing.T) {
 				"MARKETPLACE_FILE_BASE_URL":           "https://file:8083",
 				"MARKETPLACE_FILE_SERVICE_ID":         "marketplace",
 				"MARKETPLACE_FILE_SERVICE_TOKEN":      testServiceToken,
+				"MARKETPLACE_EMBEDDING_DISABLED":      "true",
 			},
 			wantErr: false,
 		},
@@ -492,6 +494,100 @@ func TestConfig_Load(t *testing.T) {
 			},
 			wantErr: false,
 		},
+
+		// --- validateEmbedding cases ---
+
+		{
+			// Dev is exempt: empty API key with no EmbeddingDisabled is fine in dev
+			// (noop client is used instead; fail-closed only applies to non-dev).
+			name: "happy path: development without embedding API key (noop allowed)",
+			envVars: map[string]string{
+				"MARKETPLACE_POSTGRES_DSN": testDSN,
+				"MARKETPLACE_PORT":         "8081",
+				"MARKETPLACE_LOG_LEVEL":    "INFO",
+				"MARKETPLACE_ENV":          "development",
+			},
+			wantErr: false,
+		},
+		{
+			// Non-dev fail-closed: missing key without EmbeddingDisabled must fail.
+			name: "error: production without embedding API key (must set key or DISABLED)",
+			envVars: map[string]string{
+				"MARKETPLACE_POSTGRES_DSN":            testDSN,
+				"MARKETPLACE_PORT":                    "8081",
+				"MARKETPLACE_LOG_LEVEL":               "INFO",
+				"MARKETPLACE_ENV":                     "production",
+				"MARKETPLACE_WORKSPACE_BASE_URL":      "https://workspace:8082",
+				"MARKETPLACE_WORKSPACE_SERVICE_TOKEN": testServiceToken,
+				"MARKETPLACE_GATEWAY_HMAC_SECRET":     testHMACSecret,
+				"MARKETPLACE_FILE_BASE_URL":           "https://file:8083",
+				"MARKETPLACE_FILE_SERVICE_ID":         "marketplace",
+				"MARKETPLACE_FILE_SERVICE_TOKEN":      testServiceToken,
+				// No MARKETPLACE_EMBEDDING_API_KEY and no MARKETPLACE_EMBEDDING_DISABLED.
+			},
+			wantErr: true,
+		},
+		{
+			// Operator opts out of embedding in production via EmbeddingDisabled — must pass.
+			name: "happy path: production with embedding disabled (opt-out)",
+			envVars: map[string]string{
+				"MARKETPLACE_POSTGRES_DSN":            testDSN,
+				"MARKETPLACE_PORT":                    "8081",
+				"MARKETPLACE_LOG_LEVEL":               "INFO",
+				"MARKETPLACE_ENV":                     "production",
+				"MARKETPLACE_WORKSPACE_BASE_URL":      "https://workspace:8082",
+				"MARKETPLACE_WORKSPACE_SERVICE_TOKEN": testServiceToken,
+				"MARKETPLACE_GATEWAY_HMAC_SECRET":     testHMACSecret,
+				"MARKETPLACE_FILE_BASE_URL":           "https://file:8083",
+				"MARKETPLACE_FILE_SERVICE_ID":         "marketplace",
+				"MARKETPLACE_FILE_SERVICE_TOKEN":      testServiceToken,
+				"MARKETPLACE_EMBEDDING_DISABLED":      "true",
+			},
+			wantErr: false,
+		},
+		{
+			// Production with a real API key configured — must pass.
+			name: "happy path: production with embedding API key configured",
+			envVars: map[string]string{
+				"MARKETPLACE_POSTGRES_DSN":            testDSN,
+				"MARKETPLACE_PORT":                    "8081",
+				"MARKETPLACE_LOG_LEVEL":               "INFO",
+				"MARKETPLACE_ENV":                     "production",
+				"MARKETPLACE_WORKSPACE_BASE_URL":      "https://workspace:8082",
+				"MARKETPLACE_WORKSPACE_SERVICE_TOKEN": testServiceToken,
+				"MARKETPLACE_GATEWAY_HMAC_SECRET":     testHMACSecret,
+				"MARKETPLACE_FILE_BASE_URL":           "https://file:8083",
+				"MARKETPLACE_FILE_SERVICE_ID":         "marketplace",
+				"MARKETPLACE_FILE_SERVICE_TOKEN":      testServiceToken,
+				"MARKETPLACE_EMBEDDING_API_KEY":       "sk-or-v1-production-key-placeholder-x",
+			},
+			wantErr: false,
+		},
+		{
+			// Timeout of 0 is below the valid range of 1-300s (default is applied
+			// before validate, so setting "0" explicitly bypasses the default of 30).
+			name: "error: embedding timeout of 0 is invalid",
+			envVars: map[string]string{
+				"MARKETPLACE_POSTGRES_DSN":          testDSN,
+				"MARKETPLACE_PORT":                  "8081",
+				"MARKETPLACE_LOG_LEVEL":             "INFO",
+				"MARKETPLACE_ENV":                   "development",
+				"MARKETPLACE_EMBEDDING_TIMEOUT_SEC": "0",
+			},
+			wantErr: true,
+		},
+		{
+			// Timeout of 999 exceeds the maximum of 300s.
+			name: "error: embedding timeout of 999 exceeds maximum",
+			envVars: map[string]string{
+				"MARKETPLACE_POSTGRES_DSN":          testDSN,
+				"MARKETPLACE_PORT":                  "8081",
+				"MARKETPLACE_LOG_LEVEL":             "INFO",
+				"MARKETPLACE_ENV":                   "development",
+				"MARKETPLACE_EMBEDDING_TIMEOUT_SEC": "999",
+			},
+			wantErr: true,
+		},
 	}
 
 	for _, tc := range tests {
@@ -507,6 +603,9 @@ func TestConfig_Load(t *testing.T) {
 				"MARKETPLACE_GATEWAY_HMAC_SECRET",
 				"MARKETPLACE_USER_RATE_LIMIT_PER_MIN", "MARKETPLACE_USER_RATE_LIMIT_BURST",
 				"MARKETPLACE_FILE_BASE_URL", "MARKETPLACE_FILE_SERVICE_ID", "MARKETPLACE_FILE_SERVICE_TOKEN",
+				"MARKETPLACE_EMBEDDING_BASE_URL", "MARKETPLACE_EMBEDDING_MODEL",
+				"MARKETPLACE_EMBEDDING_API_KEY", "MARKETPLACE_EMBEDDING_TIMEOUT_SEC",
+				"MARKETPLACE_EMBEDDING_DISABLED",
 			}
 			for _, k := range allKnownVars {
 				t.Setenv(k, "")
