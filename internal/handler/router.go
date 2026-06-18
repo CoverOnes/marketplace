@@ -124,10 +124,6 @@ func NewRouter(cfg *RouterConfig) *gin.Engine {
 	// Milestones sub-resource under /listings/:id/tender/.
 	api.POST("/listings/:id/tender/milestones", middleware.RequireTier(2), tenderH.CreateMilestone)
 	api.GET("/listings/:id/tender/milestones", middleware.RequireTier(2), tenderH.ListMilestones)
-	// /milestones/progress MUST be registered before /milestones/:milestoneId so the static segment
-	// takes precedence over the param route.
-	api.GET("/listings/:id/tender/milestones/progress", middleware.RequireTier(2), tenderH.GetMilestoneProgress)
-	api.PATCH("/listings/:id/tender/milestones/:milestoneId", middleware.RequireTier(2), tenderH.UpdateMilestone)
 	// Collaborators: apply is vendor-initiated; accept/reject are owner-initiated; exit is vendor-initiated.
 	api.POST("/tender/roles/:roleId/apply", middleware.RequireTier(2), tenderH.ApplyToRole)
 	api.GET("/listings/:id/tender/collaborators", middleware.RequireTier(2), tenderH.ListCollaborators)
