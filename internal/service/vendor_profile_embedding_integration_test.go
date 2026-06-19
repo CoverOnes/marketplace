@@ -196,7 +196,11 @@ func TestVendorProfile_Embedding_Create_Integration(t *testing.T) {
 	assert.Equal(t, 1, countVendorEmbeddingRows(t, ctx, ownerID),
 		"exactly one vendor embedding row must be created after indexer drain")
 
-	// Verify entity_id = owner_user_id in the DB directly.
+	// Verify dim = 1536 and genuinely confirm entity_id = owner_user_id via DB read-back.
+	// NOTE: profile.ID != ownerID trivially (both are uuid.New()), so NotEqual is theater.
+	// The real guard is: SELECT entity_id WHERE entity_type='vendor' AND entity_id=ownerID
+	// must return ownerID — if indexVendor passed profile.ID instead, the row would be
+	// keyed by profile.ID and this query would return no rows (Scan fails → test fails).
 	pool, err := pgstore.NewEmbeddingPool(ctx, sharedServiceDSN, "", pgstore.PoolOptions{})
 	require.NoError(t, err)
 
@@ -210,9 +214,26 @@ func TestVendorProfile_Embedding_Create_Integration(t *testing.T) {
 	).Scan(&dim))
 	assert.Equal(t, 1536, dim, "vendor embedding must be 1536-dimensional") //nolint:mnd // text-embedding-3-small
 
-	// Confirm entity_id != profile row id (load-bearing: T5 maps back to user IDs).
-	assert.NotEqual(t, profile.ID, ownerID,
-		"entity_id in embeddings table is owner_user_id (not profile row id)")
+	// Genuine entity_id read-back — would fail if indexVendor stored profile.ID instead
+	// of owner_user_id, because SELECT … WHERE entity_id=ownerID would find no row.
+	var storedEntityID uuid.UUID
+
+	require.NoError(t, pool.QueryRow(
+		ctx,
+		`SELECT entity_id FROM embeddings WHERE entity_type='vendor' AND entity_id=$1`, ownerID,
+	).Scan(&storedEntityID))
+	assert.Equal(t, ownerID, storedEntityID,
+		"entity_id MUST equal owner_user_id (not profile row id)")
+
+	// Negative assertion: no vendor embedding row must be keyed by the profile row id.
+	// If indexVendor wrongly passed profile.ID, this would be 1 (regression catch).
+	var wrongKeyRows int
+
+	require.NoError(t, pool.QueryRow(
+		ctx,
+		`SELECT count(*) FROM embeddings WHERE entity_type='vendor' AND entity_id=$1`, profile.ID,
+	).Scan(&wrongKeyRows))
+	assert.Equal(t, 0, wrongKeyRows, "no vendor embedding may be keyed by profile.ID")
 }
 
 // TestVendorProfile_Embedding_Rollback_Integration verifies that when the outbox

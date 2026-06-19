@@ -148,6 +148,11 @@ func validateVendorProfile(p *domain.VendorProfile) error {
 
 	for i, sk := range p.Skills {
 		skLen := utf8.RuneCountInString(sk)
+		if skLen == 0 {
+			return fmt.Errorf("upsert vendor_profile: %w: skills[%d] must not be empty",
+				domain.ErrValidation, i)
+		}
+
 		if skLen > maxSkillRunes {
 			return fmt.Errorf("upsert vendor_profile: %w: skills[%d] must be ≤%d runes (got %d)",
 				domain.ErrValidation, i, maxSkillRunes, skLen)

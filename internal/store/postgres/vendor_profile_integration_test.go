@@ -189,6 +189,22 @@ func TestVendorProfileStore_ValidationErrors_Integration(t *testing.T) {
 			},
 			wantErr: "skills[0] must be ≤100 runes",
 		},
+		{
+			// Store-layer guard: a direct store caller (bypassing the service) must not
+			// be able to persist an empty-string skill entry. (reviewer M-3)
+			name: "empty string skill rejected at store layer",
+			mutate: func(p *domain.VendorProfile) {
+				p.Skills = []string{"Go", ""}
+			},
+			wantErr: "skills[1] must not be empty",
+		},
+		{
+			name: "single empty skill at index 0",
+			mutate: func(p *domain.VendorProfile) {
+				p.Skills = []string{""}
+			},
+			wantErr: "skills[0] must not be empty",
+		},
 	}
 
 	for _, tc := range tests {
