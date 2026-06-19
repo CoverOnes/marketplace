@@ -53,16 +53,30 @@ func TestRedactBasis_CredentialPatterns(t *testing.T) {
 			want:  "config: [REDACTED] is set",
 		},
 		{
-			name:  "api_key in key=value form",
+			name:  "api_key single-quoted value — closing quote consumed, no trailing quote",
 			input: "api_key: 'abc123secret' attached",
-			// The regex `(?i)api[_-]?key[=:]\s*['"]?[^\s'"]+` matches up to the
-			// closing quote but not including it. The trailing "' attached" remains.
-			want: "[REDACTED]' attached",
+			// Tightened regex now captures the full 'value' including closing quote.
+			want: "[REDACTED] attached",
 		},
 		{
-			name:  "api-key variant",
+			name:  "api_key double-quoted value — closing quote consumed",
+			input: `config: api_key="supersecret" end`,
+			want:  "config: [REDACTED] end",
+		},
+		{
+			name:  "api-key unquoted variant",
 			input: "api-key=deadbeef is passed",
 			want:  "[REDACTED] is passed",
+		},
+		{ //nolint:gosec // G101 false positive: test fixture DSN used to verify redactBasis, not a real credential
+			name:  "MongoDB DSN with credentials",
+			input: "mongodb://appuser:s3cr3t@mongo.example.com/mydb was configured",
+			want:  "[REDACTED] was configured",
+		},
+		{
+			name:  "MongoDB DSN with special chars in password",
+			input: "uri=mongodb://admin:P@ssw0rd!@cluster.mongodb.net/prod",
+			want:  "uri=[REDACTED]",
 		},
 		{
 			name:  "no credential pattern — clean text unchanged",

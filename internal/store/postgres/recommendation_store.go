@@ -42,9 +42,13 @@ var credentialPatterns = []*regexp.Regexp{ // package-level compiled regexes; in
 	regexp.MustCompile(`xoxb-[A-Za-z0-9_-]+`),
 	regexp.MustCompile(`Bearer ey[A-Za-z0-9._-]+`),
 	regexp.MustCompile(`postgres://[^:]+:[^@]+@\S+`),
+	regexp.MustCompile(`mongodb://[^:]+:[^@]+@\S+`),
 	regexp.MustCompile(`AKIA[0-9A-Z]{16}`),
 	regexp.MustCompile(`(?i)password[=:]\s*['"]?[^\s'"]+`),
-	regexp.MustCompile(`(?i)api[_-]?key[=:]\s*['"]?[^\s'"]+`),
+	// api_key pattern: consume optional opening quote, value chars (no whitespace/quote),
+	// and optional matching closing quote — prevents a trailing quote from leaking out
+	// when the value is written as api_key: 'secret' (backend-security §3.1).
+	regexp.MustCompile(`(?i)api[_-]?key[=:]\s*(?:'[^\s'"]*'|"[^\s'"]*"|[^\s'"]+)`),
 }
 
 // redactBasis applies the §3.1 credential patterns to text, replacing each
