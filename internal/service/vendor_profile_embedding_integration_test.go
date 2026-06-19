@@ -425,7 +425,8 @@ func TestVendorProfile_Embedding_DualChannel_Integration(t *testing.T) {
 		for time.Now().Before(deadline) {
 			var cnt int
 
-			if qErr := pool.QueryRow(ctx,
+			if qErr := pool.QueryRow(
+				ctx,
 				"SELECT COUNT(*) FROM embeddings WHERE entity_type=$1 AND entity_id=$2",
 				entityType, entityID,
 			).Scan(&cnt); qErr != nil || cnt > 0 {

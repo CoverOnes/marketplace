@@ -236,7 +236,8 @@ func (ix *Indexer) generateAndUpsert(
 		if errors.Is(err, client.ErrEmbeddingDisabled) {
 			// Embedding disabled (no API key). Log and skip — the entity write is
 			// already committed; we must not block or retry on this condition.
-			slog.Info("embedding indexer: client disabled; skipping reindex",
+			slog.Info(
+				"embedding indexer: client disabled; skipping reindex",
 				skipLogKey, entityID,
 			)
 
@@ -250,7 +251,8 @@ func (ix *Indexer) generateAndUpsert(
 		return fmt.Errorf("upsert embedding for %s %s: %w", entityType, entityID, upsertErr)
 	}
 
-	slog.Info("embedding indexer: entity reindexed",
+	slog.Info(
+		"embedding indexer: entity reindexed",
 		"entity_type", entityType,
 		skipLogKey, entityID,
 		"model", ix.modelVersion,
