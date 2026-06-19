@@ -104,6 +104,13 @@ func TestRedactCredentials(t *testing.T) {
 			// "sk-" + "short123" = 8 chars, well under the {20,} minimum — must pass through
 			want: `config key: sk-short123`,
 		},
+		{
+			name:  "embedded sk- inside a benign word is NOT redacted (word-boundary guard)",
+			input: `processing task-completed-successfully-now-foobar done`,
+			// "sk-" appears mid-word inside "ta·sk-completed-…"; the \b anchor must prevent
+			// matching it, else legitimate error/log text gets mangled to "ta[REDACTED]".
+			want: `processing task-completed-successfully-now-foobar done`,
+		},
 		// FIX B: HTTP(S) URLs with Basic Auth credentials embedded.
 		{
 			name:  "HTTPS URL with basic auth credentials is redacted",

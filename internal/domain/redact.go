@@ -33,9 +33,11 @@ var credentialPatterns = []*regexp.Regexp{
 	regexp.MustCompile(`(?i)password[=:]\s*(?:'[^']*'|"[^"]*"|[^\s'"]+)`),
 	regexp.MustCompile(`(?i)api[_-]?key[=:]\s*(?:'[^']*'|"[^"]*"|[^\s'"]+)`),
 	// sk- prefixed keys: OpenRouter (sk-or-v1-*), Anthropic (sk-ant-*), generic provider
-	// keys. Require ≥20 chars after "sk-" to avoid false positives on short identifiers
-	// (e.g. "sk-1234" in non-credential contexts). The {20,} quantifier is intentional.
-	regexp.MustCompile(`sk-[A-Za-z0-9_-]{20,}`),
+	// keys. The \b word-boundary anchor prevents matching "sk-" embedded mid-word — without
+	// it, benign kebab text like "task-completed-…", "disk-usage-…", "risk-report-…" gets
+	// mangled (the "sk-" inside ta·sk / di·sk / ri·sk would match). Require ≥20 chars after
+	// "sk-" to avoid false positives on short identifiers. Both \b and {20,} are intentional.
+	regexp.MustCompile(`\bsk-[A-Za-z0-9_-]{20,}`),
 	// HTTP(S) URLs with embedded Basic Auth credentials (user:pass@host).
 	// [^:\s]+ captures the username (non-empty, no colon or whitespace).
 	// [^@\s]+ captures the password (non-empty, no @ or whitespace).
