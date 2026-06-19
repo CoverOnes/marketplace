@@ -609,3 +609,81 @@ func TestOutboxStore_MarkDeadLettered_RetainsRow_Integration(t *testing.T) {
 	require.NoError(t, err, "dead-lettered row must still exist in DB")
 	assert.Equal(t, evt.Payload, payload, "payload must be intact after dead-lettering")
 }
+
+// TestOutboxStore_DeleteDeadLetteredBefore_Integration verifies that
+// DeleteDeadLetteredBefore removes dead-lettered rows older than the cutoff
+// while retaining newer dead-lettered rows and non-dead-lettered rows.
+func TestOutboxStore_DeleteDeadLetteredBefore_Integration(t *testing.T) {
+	ctx := context.Background()
+	resetOutbox(ctx, t)
+	s := pgstore.NewOutboxStore(sharedTestPool)
+
+	// Enqueue and dead-letter a row, then backdate its dead_lettered_at to 31 days ago.
+	old := makeOutboxEvent(uuid.New(), "marketplace.dead_letter_old_retention")
+	require.NoError(t, s.Enqueue(ctx, old))
+	require.NoError(t, s.MarkDeadLettered(ctx, old.ID))
+
+	_, err := sharedTestPool.Exec(
+		ctx,
+		`UPDATE event_outbox SET dead_lettered_at = now() - interval '31 days' WHERE id = $1`,
+		old.ID,
+	)
+	require.NoError(t, err, "backdate old dead-lettered row")
+
+	// Enqueue and dead-letter a second row — its dead_lettered_at is now() (recent).
+	recent := makeOutboxEvent(uuid.New(), "marketplace.dead_letter_recent_retention")
+	require.NoError(t, s.Enqueue(ctx, recent))
+	require.NoError(t, s.MarkDeadLettered(ctx, recent.ID))
+
+	// Enqueue a third row that is neither published nor dead-lettered (active).
+	active := makeOutboxEvent(uuid.New(), "marketplace.dead_letter_active_retention")
+	require.NoError(t, s.Enqueue(ctx, active))
+
+	// Delete dead-lettered rows older than 30 days.
+	cutoff := time.Now().UTC().Add(-30 * 24 * time.Hour)
+
+	n, err := s.DeleteDeadLetteredBefore(ctx, cutoff)
+	require.NoError(t, err)
+	assert.GreaterOrEqual(t, n, int64(1), "at least the old dead-lettered row must be deleted")
+
+	// Old dead-lettered row must be gone.
+	var oldExists bool
+
+	err = sharedTestPool.QueryRow(
+		ctx,
+		`SELECT EXISTS (SELECT 1 FROM event_outbox WHERE id = $1)`,
+		old.ID,
+	).Scan(&oldExists)
+
+	require.NoError(t, err)
+	assert.False(t, oldExists, "old dead-lettered row must be deleted")
+
+	// Recent dead-lettered row must still exist.
+	var recentExists bool
+
+	err = sharedTestPool.QueryRow(
+		ctx,
+		`SELECT EXISTS (SELECT 1 FROM event_outbox WHERE id = $1)`,
+		recent.ID,
+	).Scan(&recentExists)
+
+	require.NoError(t, err)
+	assert.True(t, recentExists, "recent dead-lettered row must be retained")
+
+	// Active (unpublished, non-dead-lettered) row must still be pollable.
+	events, err := s.PollReady(ctx, 100)
+	require.NoError(t, err)
+
+	var activeFound bool
+
+	for _, e := range events {
+		if e.ID == active.ID {
+			activeFound = true
+		}
+	}
+
+	assert.True(t, activeFound, "active event must survive dead-letter retention delete")
+
+	// Cleanup.
+	require.NoError(t, s.MarkPublished(ctx, active.ID))
+}

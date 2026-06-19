@@ -16,6 +16,7 @@ import (
 	migrations "github.com/CoverOnes/marketplace/migrations"
 	"github.com/alicebob/miniredis/v2"
 	"github.com/google/uuid"
+	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/redis/go-redis/v9"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -301,4 +302,271 @@ func TestPoller_Retention_Integration(t *testing.T) {
 	for _, e := range events {
 		assert.NotEqual(t, evt.ID, e.ID, "deleted event must not reappear in PollReady")
 	}
+}
+
+// newPollerTestStoreWithPool is like newPollerTestStore but also returns the
+// underlying pool so tests can execute raw SQL (e.g. to pre-set attempts).
+func newPollerTestStoreWithPool(t *testing.T) (*pgstore.OutboxStore, *pgxpool.Pool) {
+	t.Helper()
+
+	ctx := context.Background()
+
+	ctr, err := tcpostgres.Run(
+		ctx,
+		"pgvector/pgvector:pg17",
+		tcpostgres.WithDatabase("testdb"),
+		tcpostgres.WithUsername("testuser"),
+		tcpostgres.WithPassword("testpass"),
+		tcpostgres.BasicWaitStrategies(),
+	)
+	require.NoError(t, err, "start poller dead-letter test container")
+
+	t.Cleanup(func() {
+		if termErr := ctr.Terminate(ctx); termErr != nil {
+			t.Logf("terminate poller dead-letter container: %v", termErr)
+		}
+	})
+
+	dsn, err := ctr.ConnectionString(ctx, "sslmode=disable")
+	require.NoError(t, err, "get poller dead-letter container DSN")
+
+	pool, err := pgstore.NewPool(ctx, dsn, "", pgstore.PoolOptions{})
+	require.NoError(t, err, "create poller dead-letter pool")
+
+	t.Cleanup(func() { pool.Close() })
+
+	var upFiles []string
+
+	walkErr := fs.WalkDir(migrations.FS, ".", func(path string, d fs.DirEntry, walkErr error) error {
+		if walkErr != nil {
+			return walkErr
+		}
+
+		if !d.IsDir() && strings.HasSuffix(path, ".up.sql") {
+			upFiles = append(upFiles, path)
+		}
+
+		return nil
+	})
+
+	require.NoError(t, walkErr, "walk migrations FS for poller dead-letter test")
+	require.NotEmpty(t, upFiles, "must find .up.sql migration files")
+
+	sort.Strings(upFiles)
+
+	for _, file := range upFiles {
+		data, readErr := migrations.FS.ReadFile(file)
+		require.NoError(t, readErr, "read migration %s", file)
+
+		_, execErr := pool.Exec(ctx, string(data))
+		require.NoError(t, execErr, "apply migration %s", file)
+	}
+
+	return pgstore.NewOutboxStore(pool), pool
+}
+
+// pollerSetAttempts sets attempts on an outbox row and backdates next_attempt_at
+// so that PollReady considers it immediately eligible.
+func pollerSetAttempts(t *testing.T, ctx context.Context, pool *pgxpool.Pool, id uuid.UUID, attempts int) {
+	t.Helper()
+
+	_, err := pool.Exec(
+		ctx,
+		`UPDATE event_outbox
+		 SET attempts = $2, next_attempt_at = now() - interval '1 minute'
+		 WHERE id = $1`,
+		id, attempts,
+	)
+	require.NoError(t, err, "set attempts for poller dead-letter test")
+}
+
+// failingRawPublisher always returns an error from PublishRaw, driving the
+// poller into the MarkFailed / dead-letter path.
+type failingRawPublisher struct{ err error }
+
+func (p *failingRawPublisher) PublishRaw(_ context.Context, _ string, _ []byte) error {
+	return p.err
+}
+
+// successRawPublisher always succeeds, driving the poller into the MarkPublished path.
+type successRawPublisher struct{}
+
+func (p *successRawPublisher) PublishRaw(_ context.Context, _ string, _ []byte) error {
+	return nil
+}
+
+// TestPoller_DeadLettersAfterMaxAttempts_Integration verifies that the outbox
+// poller's processEvent dead-letters a row when attempts+1 >= domain.MaxOutboxAttempts,
+// and does NOT dead-letter when the event succeeds or when attempts is below the cap.
+func TestPoller_DeadLettersAfterMaxAttempts_Integration(t *testing.T) {
+	t.Parallel()
+
+	t.Run("dead-letters when attempt count reaches cap", func(t *testing.T) {
+		t.Parallel()
+
+		ctx := context.Background()
+		s, pool := newPollerTestStoreWithPool(t)
+
+		evt := pollerTestEvent("marketplace.poller_deadletter_cap")
+		require.NoError(t, s.Enqueue(ctx, evt))
+
+		// Pre-set attempts to maxOutboxAttempts-1 so the next failure trips the cap.
+		pollerSetAttempts(t, ctx, pool, evt.ID, domain.MaxOutboxAttempts-1)
+
+		pub := &failingRawPublisher{err: fmt.Errorf("redis: connection refused")}
+		poller := outbox.NewPoller(s, pub, 50*time.Millisecond)
+
+		pollerCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
+		defer cancel()
+
+		go func() { poller.Run(pollerCtx) }()
+
+		// Wait until dead_lettered_at is set.
+		var deadLetteredAt *time.Time
+
+		require.Eventually(t, func() bool {
+			err := pool.QueryRow(
+				ctx,
+				`SELECT dead_lettered_at FROM event_outbox WHERE id = $1`,
+				evt.ID,
+			).Scan(&deadLetteredAt)
+
+			return err == nil && deadLetteredAt != nil
+		}, 5*time.Second, 50*time.Millisecond, "dead_lettered_at must be set after max attempts")
+
+		// Row must not appear in PollReady.
+		events, err := s.PollReady(ctx, 100)
+		require.NoError(t, err)
+
+		for _, e := range events {
+			assert.NotEqual(t, evt.ID, e.ID, "dead-lettered event must not appear in PollReady")
+		}
+	})
+
+	t.Run("no dead-letter when succeeds on attempt equal to max", func(t *testing.T) {
+		t.Parallel()
+
+		ctx := context.Background()
+		s, pool := newPollerTestStoreWithPool(t)
+
+		evt := pollerTestEvent("marketplace.poller_deadletter_success")
+		require.NoError(t, s.Enqueue(ctx, evt))
+
+		// At maxOutboxAttempts-1, a success must NOT dead-letter.
+		pollerSetAttempts(t, ctx, pool, evt.ID, domain.MaxOutboxAttempts-1)
+
+		pub := &successRawPublisher{}
+		poller := outbox.NewPoller(s, pub, 50*time.Millisecond)
+
+		pollerCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
+		defer cancel()
+
+		go func() { poller.Run(pollerCtx) }()
+
+		// Wait until published_at is set (event processed successfully).
+		require.Eventually(t, func() bool {
+			var publishedAt *time.Time
+
+			err := pool.QueryRow(
+				ctx,
+				`SELECT published_at FROM event_outbox WHERE id = $1`,
+				evt.ID,
+			).Scan(&publishedAt)
+
+			return err == nil && publishedAt != nil
+		}, 5*time.Second, 50*time.Millisecond, "published_at must be set after successful publish")
+
+		// dead_lettered_at must NOT be set.
+		var deadLetteredAt *time.Time
+
+		err := pool.QueryRow(
+			ctx,
+			`SELECT dead_lettered_at FROM event_outbox WHERE id = $1`,
+			evt.ID,
+		).Scan(&deadLetteredAt)
+
+		require.NoError(t, err)
+		assert.Nil(t, deadLetteredAt, "successful event must not be dead-lettered")
+	})
+
+	t.Run("no dead-letter when fails fewer than max attempts", func(t *testing.T) {
+		t.Parallel()
+
+		ctx := context.Background()
+		s, pool := newPollerTestStoreWithPool(t)
+
+		evt := pollerTestEvent("marketplace.poller_deadletter_low")
+		require.NoError(t, s.Enqueue(ctx, evt))
+
+		// Set attempts to 5 — well below the cap.
+		pollerSetAttempts(t, ctx, pool, evt.ID, 5)
+
+		pub := &failingRawPublisher{err: fmt.Errorf("redis: connection refused")}
+		poller := outbox.NewPoller(s, pub, 50*time.Millisecond)
+
+		pollerCtx, cancel := context.WithTimeout(ctx, 3*time.Second)
+		defer cancel()
+
+		go func() { poller.Run(pollerCtx) }()
+
+		// Wait until attempts advances to 6 (poller ran at least once).
+		require.Eventually(t, func() bool {
+			var attempts int
+
+			err := pool.QueryRow(
+				ctx,
+				`SELECT attempts FROM event_outbox WHERE id = $1`,
+				evt.ID,
+			).Scan(&attempts)
+
+			return err == nil && attempts == 6
+		}, 3*time.Second, 50*time.Millisecond, "attempts must advance to 6 after one failure")
+
+		// dead_lettered_at must NOT be set.
+		var deadLetteredAt *time.Time
+
+		err := pool.QueryRow(
+			ctx,
+			`SELECT dead_lettered_at FROM event_outbox WHERE id = $1`,
+			evt.ID,
+		).Scan(&deadLetteredAt)
+
+		require.NoError(t, err)
+		assert.Nil(t, deadLetteredAt, "event below cap must not be dead-lettered")
+	})
+}
+
+// TestPoller_DeadLettersAfterMaxAttempts_BoundaryCheck_Integration is a focused
+// boundary regression: attempts = maxOutboxAttempts-1 + one more failure → dead-lettered.
+func TestPoller_DeadLettersAfterMaxAttempts_BoundaryCheck_Integration(t *testing.T) {
+	t.Parallel()
+
+	ctx := context.Background()
+	s, pool := newPollerTestStoreWithPool(t)
+
+	evt := pollerTestEvent("marketplace.poller_deadletter_boundary")
+	require.NoError(t, s.Enqueue(ctx, evt))
+
+	pollerSetAttempts(t, ctx, pool, evt.ID, domain.MaxOutboxAttempts-1)
+
+	pub := &failingRawPublisher{err: fmt.Errorf("publish timeout")}
+	poller := outbox.NewPoller(s, pub, 50*time.Millisecond)
+
+	pollerCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
+	defer cancel()
+
+	go func() { poller.Run(pollerCtx) }()
+
+	var deadLetteredAt *time.Time
+
+	require.Eventually(t, func() bool {
+		err := pool.QueryRow(
+			ctx,
+			`SELECT dead_lettered_at FROM event_outbox WHERE id = $1`,
+			evt.ID,
+		).Scan(&deadLetteredAt)
+
+		return err == nil && deadLetteredAt != nil
+	}, 5*time.Second, 50*time.Millisecond,
+		"boundary: dead_lettered_at must be set at attempt %d (== MaxOutboxAttempts)", domain.MaxOutboxAttempts)
 }

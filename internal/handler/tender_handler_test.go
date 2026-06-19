@@ -192,6 +192,10 @@ func (*noopTenderOutboxStoreH) DeletePublishedBefore(_ context.Context, _ time.T
 	return 0, nil
 }
 
+func (*noopTenderOutboxStoreH) DeleteDeadLetteredBefore(_ context.Context, _ time.Time) (int64, error) {
+	return 0, nil
+}
+
 // noopRoleStoreH satisfies store.TenderRoleStore with no-op implementations.
 type noopRoleStoreH struct{}
 

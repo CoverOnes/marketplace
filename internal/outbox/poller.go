@@ -35,17 +35,15 @@ const (
 	// retentionPeriod is how long published outbox rows are kept before deletion.
 	retentionPeriod = 7 * 24 * time.Hour
 
+	// deadLetterRetentionPeriod is how long dead-lettered rows are kept before deletion.
+	deadLetterRetentionPeriod = 30 * 24 * time.Hour
+
 	// staleUnpublishedThreshold triggers a slog.Warn when an unpublished event
 	// is older than this duration.
 	staleUnpublishedThreshold = time.Hour
 
 	// pollBatchSize is the maximum number of rows claimed per poll cycle.
 	pollBatchSize = 100
-
-	// maxOutboxAttempts is the dead-letter threshold. At 2^N s backoff capped at 600 s,
-	// attempts 1-20 span ~1.8 h before dead-lettering — long enough for transient outages,
-	// finite for true poison events. Duplicated in internal/embedding/indexer.go (see comment there).
-	maxOutboxAttempts = 20
 )
 
 // Publisher is the subset of events.Publisher needed by the poller.
@@ -136,6 +134,7 @@ func (p *Poller) tick() {
 	}
 
 	p.deletePublished()
+	p.deleteDeadLettered()
 	p.alertStale()
 }
 
@@ -150,14 +149,14 @@ func (p *Poller) processEvent(evt *domain.OutboxEvent) {
 	defer markCancel()
 
 	if pubErr != nil {
-		if evt.Attempts+1 >= maxOutboxAttempts {
+		if evt.Attempts+1 >= domain.MaxOutboxAttempts {
 			slog.Error(
 				"outbox poller: dead-lettering poison event",
 				"outbox_id", evt.ID,
 				"event_id", evt.EventID,
 				"channel", evt.Channel,
 				"attempts", evt.Attempts+1,
-				"last_err", pubErr.Error(),
+				"last_err", domain.RedactErrString(pubErr.Error()),
 			)
 
 			if dlErr := p.outbox.MarkDeadLettered(markCtx, evt.ID); dlErr != nil {
@@ -208,6 +207,25 @@ func (p *Poller) deletePublished() {
 
 	if n > 0 {
 		slog.Info("outbox retention: deleted published rows", "count", n)
+	}
+}
+
+// deleteDeadLettered removes dead-lettered rows older than deadLetterRetentionPeriod (30 days).
+func (p *Poller) deleteDeadLettered() {
+	retCtx, retCancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer retCancel()
+
+	cutoff := time.Now().UTC().Add(-deadLetterRetentionPeriod)
+
+	n, err := p.outbox.DeleteDeadLetteredBefore(retCtx, cutoff)
+	if err != nil {
+		slog.Warn("outbox dead-letter retention delete failed", "err", err)
+
+		return
+	}
+
+	if n > 0 {
+		slog.Info("outbox dead-letter retention: deleted dead-lettered rows", "count", n)
 	}
 }
 

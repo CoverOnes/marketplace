@@ -265,6 +265,10 @@ func (*noopTenderOutboxStore) DeletePublishedBefore(_ context.Context, _ time.Ti
 	return 0, nil
 }
 
+func (*noopTenderOutboxStore) DeleteDeadLetteredBefore(_ context.Context, _ time.Time) (int64, error) {
+	return 0, nil
+}
+
 // recordingOutboxStore captures Enqueue calls for assertions in unit tests.
 type recordingOutboxStore struct {
 	mu       sync.Mutex
@@ -291,6 +295,10 @@ func (*recordingOutboxStore) MarkFailed(_ context.Context, _ uuid.UUID, _ string
 func (*recordingOutboxStore) MarkDeadLettered(_ context.Context, _ uuid.UUID) error { return nil }
 
 func (*recordingOutboxStore) DeletePublishedBefore(_ context.Context, _ time.Time) (int64, error) {
+	return 0, nil
+}
+
+func (*recordingOutboxStore) DeleteDeadLetteredBefore(_ context.Context, _ time.Time) (int64, error) {
 	return 0, nil
 }
 

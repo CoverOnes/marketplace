@@ -105,6 +105,10 @@ func (r *recordingListingOutboxStore) DeletePublishedBefore(_ context.Context, _
 	return 0, nil
 }
 
+func (r *recordingListingOutboxStore) DeleteDeadLetteredBefore(_ context.Context, _ time.Time) (int64, error) {
+	return 0, nil
+}
+
 // splitTxManager is a ListingOutboxTxManager that calls the callback with the
 // splitReadListingStore so GetByIDForUpdate returns the "concurrent writer" row.
 type splitTxManager struct {

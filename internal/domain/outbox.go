@@ -6,6 +6,13 @@ import (
 	"github.com/google/uuid"
 )
 
+// MaxOutboxAttempts is the dead-letter threshold for outbox event processing.
+// At 2^N seconds exponential backoff capped at 600 s, attempts 1–20 span ~1.8 h
+// before a poison event is dead-lettered — long enough for transient outages,
+// finite for true poison events. Used by both the embedding indexer and the
+// main outbox poller so drift between the two is impossible.
+const MaxOutboxAttempts = 20
+
 // OutboxEvent is a row in the event_outbox table.
 // It is enqueued inside the same DB transaction as the business operation and
 // delivered by the in-process poller (at-least-once; consumer MUST dedup on EventID).
@@ -18,9 +25,9 @@ import (
 // ClaimedUntil is set atomically by PollReady to prevent concurrent pollers from
 // picking up the same row. MarkPublished and MarkFailed both clear it.
 //
-// DeadLetteredAt is set by MarkDeadLettered when Attempts reaches the cap
-// (maxOutboxAttempts). Once set, the row is permanently excluded from PollReady
-// and is retained for manual inspection. Requeue by setting dead_lettered_at = NULL.
+// DeadLetteredAt is set by MarkDeadLettered when Attempts reaches MaxOutboxAttempts.
+// Once set, the row is permanently excluded from PollReady and is retained for
+// manual inspection. Requeue by setting dead_lettered_at = NULL.
 type OutboxEvent struct {
 	ID             uuid.UUID
 	AggregateType  string

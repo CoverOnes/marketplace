@@ -190,6 +190,10 @@ func (*noopOutboxStoreH) DeletePublishedBefore(_ context.Context, _ time.Time) (
 	return 0, nil
 }
 
+func (*noopOutboxStoreH) DeleteDeadLetteredBefore(_ context.Context, _ time.Time) (int64, error) {
+	return 0, nil
+}
+
 // buildBidRouter builds a test router with BidHandler wired.
 func buildBidRouter(listingStore store.ListingStore, bidStore store.BidStore, awardStore store.AwardStore) *gin.Engine {
 	gin.SetMode(gin.TestMode)

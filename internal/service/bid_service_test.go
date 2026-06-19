@@ -262,6 +262,10 @@ func (*noopOutboxStore) DeletePublishedBefore(_ context.Context, _ time.Time) (i
 	return 0, nil
 }
 
+func (*noopOutboxStore) DeleteDeadLetteredBefore(_ context.Context, _ time.Time) (int64, error) {
+	return 0, nil
+}
+
 // --- tests ---
 
 func TestBidService_CreateBid(t *testing.T) {

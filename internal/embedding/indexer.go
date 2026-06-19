@@ -29,11 +29,6 @@ const defaultIndexerInterval = 2 * time.Second
 // Allows one embedding API call (up to 30 s) plus DB upsert headroom.
 const defaultWorkerTimeout = 45 * time.Second
 
-// maxOutboxAttempts is the dead-letter threshold. At 2^N s backoff capped at 600 s,
-// attempts 1-20 span ~1.8 h before dead-lettering — long enough for transient outages,
-// finite for true poison events. Duplicated in internal/outbox/poller.go (see comment there).
-const maxOutboxAttempts = 20
-
 // reindexPayload is the JSON envelope published by EnqueueTenderEmbeddingReindex.
 // The indexer parses only the data.tenderId field; the rest is informational.
 type reindexPayload struct {
@@ -187,14 +182,14 @@ func (ix *Indexer) processEvent(evt *domain.OutboxEvent) {
 	defer markCancel()
 
 	if processErr != nil {
-		if evt.Attempts+1 >= maxOutboxAttempts {
+		if evt.Attempts+1 >= domain.MaxOutboxAttempts {
 			slog.Error(
 				"embedding indexer: dead-lettering poison event",
 				"outbox_id", evt.ID,
 				"event_id", evt.EventID,
 				"channel", evt.Channel,
 				"attempts", evt.Attempts+1,
-				"last_err", processErr.Error(),
+				"last_err", domain.RedactErrString(processErr.Error()),
 			)
 
 			if dlErr := ix.outboxStore.MarkDeadLettered(markCtx, evt.ID); dlErr != nil {
