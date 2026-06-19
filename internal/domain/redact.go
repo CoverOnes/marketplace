@@ -9,33 +9,51 @@ import (
 // stored or logged at the dead-letter site (backend-security §3.1 / CWE-532).
 const maxRedactedErrLen = 500
 
-// errCredentialPatterns are the credential regex patterns applied by RedactErrString.
-// These mirror the patterns in internal/store/postgres/credential_redact.go; both sets
-// must be kept in sync when new credential patterns are added.
+// credentialPatterns is the single canonical list of credential regex patterns
+// (backend-security §3.1). It is the ONLY copy — both the domain-level
+// RedactCredentials/RedactErrString and the postgres-level redactBasis delegate
+// here so that adding a new pattern automatically covers all redaction paths.
 // Package-level: compiled once at init, never mutated.
-var errCredentialPatterns = []*regexp.Regexp{
+var credentialPatterns = []*regexp.Regexp{
 	regexp.MustCompile(`sk_live_[A-Za-z0-9_]+`),
 	regexp.MustCompile(`ghp_[A-Za-z0-9_]+`),
 	regexp.MustCompile(`xoxb-[A-Za-z0-9_-]+`),
 	regexp.MustCompile(`Bearer ey[A-Za-z0-9._-]+`),
+	// postgres:// and postgresql:// (RFC-correct scheme) DSNs (backend-security §3.1, Mi-1).
 	regexp.MustCompile(`postgres(?:ql)?://[^:]+:[^@]+@\S+`),
+	// mongodb:// and mongodb+srv:// (Atlas DNS-seedlist, the common hosted form) DSNs.
 	regexp.MustCompile(`mongodb(?:\+srv)?://[^:]+:[^@]+@\S+`),
 	// redis:// DSNs with embedded passwords — username may be empty (redis://:pw@host form).
 	regexp.MustCompile(`redis://[^:]*:[^@]+@\S+`),
 	regexp.MustCompile(`AKIA[0-9A-Z]{16}`),
+	// password / api_key key=value pairs. The quoted branches use [^']* / [^"]* (NOT
+	// [^\s'"]*) so a value containing the opposite quote style — e.g. api_key: 'secret"x' —
+	// is still fully consumed including its closing quote, and the closing quote never
+	// leaks out (backend-security §3.1, M-2 mixed-quote evasion + Mi-3 trailing quote).
 	regexp.MustCompile(`(?i)password[=:]\s*(?:'[^']*'|"[^"]*"|[^\s'"]+)`),
 	regexp.MustCompile(`(?i)api[_-]?key[=:]\s*(?:'[^']*'|"[^"]*"|[^\s'"]+)`),
 }
 
-// RedactErrString scrubs credential-like substrings from an error message and
-// caps the result at maxRedactedErrLen bytes with a "...[truncated]" marker.
-// Use before logging at slog.Error dead-letter sites (CWE-532 / backend-security §3.1).
-func RedactErrString(s string) string {
-	for _, re := range errCredentialPatterns {
+// RedactCredentials applies the §3.1 credential patterns to s, replacing each
+// match with [REDACTED]. No length cap — use for basis fields where truncation
+// is handled by the caller (e.g. recommendation_store maxBasisRunes check).
+func RedactCredentials(s string) string {
+	for _, re := range credentialPatterns {
 		s = re.ReplaceAllString(s, "[REDACTED]")
 	}
 
+	return s
+}
+
+// RedactErrString scrubs credential-like substrings from an error message and
+// caps the result at maxRedactedErrLen bytes with a "...[truncated]" marker.
+// Use before persisting last_error or logging at slog.Error dead-letter sites
+// (CWE-532 / backend-security §3.1).
+func RedactErrString(s string) string {
+	s = RedactCredentials(s)
+
 	if len(s) > maxRedactedErrLen {
+		// Truncate at a valid UTF-8 boundary so the stored/logged string is safe.
 		truncated := strings.ToValidUTF8(s[:maxRedactedErrLen], "")
 		return truncated + "...[truncated]"
 	}

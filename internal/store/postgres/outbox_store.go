@@ -229,7 +229,7 @@ WHERE id = $1
   AND dead_lettered_at IS NULL
 `
 
-	_, err := q.Exec(ctx, query, id, redactErrString(lastErr), outboxMaxBackoff.Seconds())
+	_, err := q.Exec(ctx, query, id, domain.RedactErrString(lastErr), outboxMaxBackoff.Seconds())
 	if err != nil {
 		return fmt.Errorf("mark outbox failed: %w", err)
 	}
