@@ -485,7 +485,19 @@ type UpdateListingInput struct {
 // When updating a tender and the embeddable text (title or description) changes,
 // an embedding_reindex event is enqueued in the same transaction as the update.
 // Budget-only or currency-only updates do NOT enqueue a reindex (cost control).
+//
+// For tender listings with an outbox tx manager configured, the entire read +
+// patch + textChanged detection + Update + enqueue is performed inside a single
+// transaction with a SELECT … FOR UPDATE row-lock (via GetByIDForUpdate). This
+// serializes concurrent updates to the same tender and eliminates the stale-read
+// race where a pre-tx GetByID snapshot could be overwritten by a concurrent
+// update between the read and the tx-write (TOCTOU lost-update).
 func (s *ListingService) UpdateListing(ctx context.Context, in UpdateListingInput) (*domain.Listing, error) {
+	// Fast-path pre-flight: load the row without a lock to validate caller identity
+	// and listing status before opening any transaction. This is an optimistic guard
+	// that avoids opening a tx for clearly-invalid inputs (IDOR, non-OPEN).
+	// For the tender+outbox path the authoritative locked re-read happens inside
+	// updateTenderWithOutbox; all decisions there are based on the locked row.
 	l, err := s.listings.GetByID(ctx, in.ID)
 	if err != nil {
 		return nil, err
@@ -500,11 +512,30 @@ func (s *ListingService) UpdateListing(ctx context.Context, in UpdateListingInpu
 		return nil, fmt.Errorf("%w: only OPEN listings can be updated", domain.ErrListingNotOpen)
 	}
 
-	// Snapshot embeddable text before applying changes, to detect drift.
-	oldTitle := l.Title
-	oldDescription := l.Description
+	// Tender listings with an outbox tx manager: perform the locked read, patch,
+	// textChanged detection, Update, and conditional enqueue all inside a single
+	// transaction to prevent the stale-read TOCTOU race.
+	if l.IsTender && s.listingOutbox != nil {
+		return s.updateTenderWithOutbox(ctx, in)
+	}
 
-	// Apply partial fields.
+	// Non-tender or outbox-disabled path: apply patch inline (no race risk because
+	// no concurrent embedding enqueue depends on oldTitle/oldDescription).
+	applyListingPatch(l, in)
+
+	if err := validateListingInput(l.Title, l.Description, l.BudgetMin, l.BudgetMax, l.Currency); err != nil {
+		return nil, err
+	}
+
+	if err := s.listings.Update(ctx, l); err != nil {
+		return nil, err
+	}
+
+	return l, nil
+}
+
+// applyListingPatch applies the non-nil fields from in onto l in place.
+func applyListingPatch(l *domain.Listing, in UpdateListingInput) {
 	if in.Title != nil {
 		l.Title = *in.Title
 	}
@@ -524,37 +555,53 @@ func (s *ListingService) UpdateListing(ctx context.Context, in UpdateListingInpu
 	if in.Currency != nil {
 		l.Currency = *in.Currency
 	}
-
-	if err := validateListingInput(l.Title, l.Description, l.BudgetMin, l.BudgetMax, l.Currency); err != nil {
-		return nil, err
-	}
-
-	// Determine whether embeddable text changed — only then schedule a reindex.
-	textChanged := l.Title != oldTitle || l.Description != oldDescription
-
-	if l.IsTender && textChanged && s.listingOutbox != nil {
-		return s.updateTenderWithOutbox(ctx, l)
-	}
-
-	if err := s.listings.Update(ctx, l); err != nil {
-		return nil, err
-	}
-
-	return l, nil
 }
 
-// updateTenderWithOutbox updates the tender listing and enqueues an
-// embedding_reindex event in a single Postgres transaction.
-func (s *ListingService) updateTenderWithOutbox(ctx context.Context, l *domain.Listing) (*domain.Listing, error) {
+// updateTenderWithOutbox serializes concurrent tender updates by performing the
+// locked read (SELECT … FOR UPDATE), patch application, textChanged detection,
+// Update, and conditional embedding_reindex enqueue all inside a single Postgres
+// transaction. The FOR UPDATE row-lock prevents the stale-read TOCTOU race where
+// a concurrent UpdateListing could overwrite a concurrent change undetected.
+func (s *ListingService) updateTenderWithOutbox(ctx context.Context, in UpdateListingInput) (*domain.Listing, error) {
 	var updated *domain.Listing
 
 	err := s.listingOutbox.WithListingOutboxTx(ctx, func(txCtx context.Context, listings store.ListingStore, ob store.OutboxStore) error {
+		// Locked read inside the tx — authoritative row, no concurrent update
+		// can modify it until this transaction commits or rolls back.
+		l, lockErr := listings.GetByIDForUpdate(txCtx, in.ID)
+		if lockErr != nil {
+			return lockErr
+		}
+
+		// Re-check guards inside the tx against the locked row.
+		if l.OwnerUserID != in.CallerID {
+			return domain.ErrListingNotFound
+		}
+
+		if l.Status != domain.ListingStatusOpen {
+			return fmt.Errorf("%w: only OPEN listings can be updated", domain.ErrListingNotOpen)
+		}
+
+		// Snapshot embeddable text from the locked row before applying the patch.
+		oldTitle := l.Title
+		oldDescription := l.Description
+
+		applyListingPatch(l, in)
+
+		if validateErr := validateListingInput(l.Title, l.Description, l.BudgetMin, l.BudgetMax, l.Currency); validateErr != nil {
+			return validateErr
+		}
+
 		if updateErr := listings.Update(txCtx, l); updateErr != nil {
 			return updateErr
 		}
 
-		if enqErr := outbox.EnqueueTenderEmbeddingReindex(txCtx, ob, l.ID); enqErr != nil {
-			return fmt.Errorf("enqueue embedding_reindex: %w", enqErr)
+		// Enqueue embedding_reindex only when embeddable text changed (cost control).
+		textChanged := l.Title != oldTitle || l.Description != oldDescription
+		if textChanged {
+			if enqErr := outbox.EnqueueTenderEmbeddingReindex(txCtx, ob, l.ID); enqErr != nil {
+				return fmt.Errorf("enqueue embedding_reindex: %w", enqErr)
+			}
 		}
 
 		updated = l
