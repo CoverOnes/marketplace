@@ -38,3 +38,13 @@ type Embedding struct {
 	ModelVersion string
 	CreatedAt    time.Time
 }
+
+// EmbeddingWithDistance extends Embedding with the cosine distance returned by
+// NearestNeighborsWithDistance. CosineDistance is in [0, 2]:
+//   - 0.0 = identical direction
+//   - 1.0 = orthogonal
+//   - 2.0 = opposite direction
+type EmbeddingWithDistance struct {
+	*Embedding
+	CosineDistance float32
+}

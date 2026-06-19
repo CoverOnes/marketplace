@@ -275,6 +275,15 @@ type EmbeddingStore interface {
 	// topK is clamped to [1, 200] by the implementation: values ≤ 0 default to 10,
 	// values > 200 are reduced to 200 to prevent full-index OOM scans.
 	NearestNeighbors(ctx context.Context, queryVec []float32, entityType domain.EmbeddingEntityType, topK int) ([]*domain.Embedding, error)
+
+	// GetByEntityID returns the embedding for the given (entityType, entityID) pair,
+	// or domain.ErrNotFound when no row exists.
+	GetByEntityID(ctx context.Context, entityType domain.EmbeddingEntityType, entityID uuid.UUID) (*domain.Embedding, error)
+
+	// NearestNeighborsWithDistance is like NearestNeighbors but also returns the
+	// cosine distance for each result row ((embedding <=> queryVec)::float4).
+	// topK is clamped to [1, 200] identically to NearestNeighbors.
+	NearestNeighborsWithDistance(ctx context.Context, queryVec []float32, entityType domain.EmbeddingEntityType, topK int) ([]*domain.EmbeddingWithDistance, error)
 }
 
 // RecommendationStore defines persistence operations for AI recommendation audit rows.

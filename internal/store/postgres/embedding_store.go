@@ -56,6 +56,46 @@ func (s *EmbeddingStore) NearestNeighbors(
 	return nearestNeighborEmbeddings(ctx, s.q, queryVec, entityType, topK)
 }
 
+// GetByEntityID returns the single embedding row for (entityType, entityID),
+// or domain.ErrNotFound when no row exists.
+func (s *EmbeddingStore) GetByEntityID(
+	ctx context.Context,
+	entityType domain.EmbeddingEntityType,
+	entityID uuid.UUID,
+) (*domain.Embedding, error) {
+	// M-2: validate entity_type before any DB call.
+	if !entityType.IsValid() {
+		return nil, fmt.Errorf("get embedding by entity id: %w %q", domain.ErrInvalidEntityType, entityType)
+	}
+
+	const query = `
+SELECT id, entity_type, entity_id, embedding, model_version, created_at
+FROM embeddings
+WHERE entity_type = $1 AND entity_id = $2
+`
+
+	row := s.q.QueryRow(ctx, query, string(entityType), entityID)
+
+	e, err := scanEmbedding(row)
+	if err != nil {
+		return nil, fmt.Errorf("get embedding by entity id: %w", err)
+	}
+
+	return e, nil
+}
+
+// NearestNeighborsWithDistance returns up to topK embeddings ordered by
+// ascending cosine distance, including the distance value for each row.
+// topK is clamped to [1, 200] identically to NearestNeighbors.
+func (s *EmbeddingStore) NearestNeighborsWithDistance(
+	ctx context.Context,
+	queryVec []float32,
+	entityType domain.EmbeddingEntityType,
+	topK int,
+) ([]*domain.EmbeddingWithDistance, error) {
+	return nearestNeighborsWithDistance(ctx, s.q, queryVec, entityType, topK)
+}
+
 // --- helpers ---
 
 // embeddingDimensions is the expected vector length for all embeddings.
@@ -113,20 +153,22 @@ ON CONFLICT (entity_type, entity_id) DO UPDATE
 	return nil
 }
 
-func nearestNeighborEmbeddings(
-	ctx context.Context,
-	q querier,
+// validateNearestNeighborsArgs validates and normalises the shared arguments
+// for both NearestNeighbors and NearestNeighborsWithDistance to avoid duplication.
+// It returns the clamped topK on success.
+func validateNearestNeighborsArgs(
+	callerName string,
 	queryVec []float32,
 	entityType domain.EmbeddingEntityType,
 	topK int,
-) ([]*domain.Embedding, error) {
+) (int, error) {
 	// M-2: validate entity_type before any DB call.
 	if !entityType.IsValid() {
-		return nil, fmt.Errorf("nearest neighbors: %w %q", domain.ErrInvalidEntityType, entityType)
+		return 0, fmt.Errorf("%s: %w %q", callerName, domain.ErrInvalidEntityType, entityType)
 	}
 
 	if len(queryVec) != embeddingDimensions {
-		return nil, fmt.Errorf("nearest neighbors: %w (got %d)", domain.ErrInvalidEmbeddingDimension, len(queryVec))
+		return 0, fmt.Errorf("%s: %w (got %d)", callerName, domain.ErrInvalidEmbeddingDimension, len(queryVec))
 	}
 
 	const maxTopK = 200
@@ -137,6 +179,21 @@ func nearestNeighborEmbeddings(
 
 	if topK > maxTopK {
 		topK = maxTopK
+	}
+
+	return topK, nil
+}
+
+func nearestNeighborEmbeddings(
+	ctx context.Context,
+	q querier,
+	queryVec []float32,
+	entityType domain.EmbeddingEntityType,
+	topK int,
+) ([]*domain.Embedding, error) {
+	topK, err := validateNearestNeighborsArgs("nearest neighbors", queryVec, entityType, topK)
+	if err != nil {
+		return nil, err
 	}
 
 	const query = `
@@ -170,6 +227,77 @@ LIMIT $3
 	}
 
 	return results, nil
+}
+
+func nearestNeighborsWithDistance(
+	ctx context.Context,
+	q querier,
+	queryVec []float32,
+	entityType domain.EmbeddingEntityType,
+	topK int,
+) ([]*domain.EmbeddingWithDistance, error) {
+	topK, err := validateNearestNeighborsArgs("nearest neighbors with distance", queryVec, entityType, topK)
+	if err != nil {
+		return nil, err
+	}
+
+	const query = `
+SELECT id, entity_type, entity_id, embedding, model_version, created_at,
+       (embedding <=> $2)::float4 AS cosine_distance
+FROM embeddings
+WHERE entity_type = $1
+ORDER BY embedding <=> $2
+LIMIT $3
+`
+
+	rows, err := q.Query(ctx, query, string(entityType), pgvector.NewVector(queryVec), topK)
+	if err != nil {
+		return nil, fmt.Errorf("nearest neighbors with distance query: %w", err)
+	}
+
+	defer rows.Close()
+
+	var results []*domain.EmbeddingWithDistance
+
+	for rows.Next() {
+		ewd, scanErr := scanEmbeddingWithDistance(rows)
+		if scanErr != nil {
+			return nil, scanErr
+		}
+
+		results = append(results, ewd)
+	}
+
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("iterate embeddings with distance: %w", err)
+	}
+
+	return results, nil
+}
+
+func scanEmbeddingWithDistance(row rowScanner) (*domain.EmbeddingWithDistance, error) {
+	var (
+		e    domain.Embedding
+		et   string
+		vec  pgvector.Vector
+		dist float32
+	)
+
+	if err := row.Scan(&e.ID, &et, &e.EntityID, &vec, &e.ModelVersion, &e.CreatedAt, &dist); err != nil {
+		if errors.Is(err, pgx.ErrNoRows) {
+			return nil, domain.ErrNotFound
+		}
+
+		return nil, fmt.Errorf("scan embedding with distance: %w", err)
+	}
+
+	e.EntityType = domain.EmbeddingEntityType(et)
+	e.Vector = vec.Slice()
+
+	return &domain.EmbeddingWithDistance{
+		Embedding:      &e,
+		CosineDistance: dist,
+	}, nil
 }
 
 func scanEmbedding(row rowScanner) (*domain.Embedding, error) {

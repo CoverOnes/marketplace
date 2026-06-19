@@ -60,4 +60,9 @@ var (
 	// ErrUpstreamFile is returned when the synchronous S2S call to the file
 	// service fails during register or presign. Callers map this to HTTP 502.
 	ErrUpstreamFile = errors.New("upstream file service error")
+
+	// ErrTenderNotIndexed is returned by MatchService.GetMatches when the tender
+	// has no embedding row in the embeddings table yet.
+	// Callers map this to HTTP 422 TENDER_NOT_INDEXED.
+	ErrTenderNotIndexed = errors.New("tender has no embedding; reindex pending")
 )
