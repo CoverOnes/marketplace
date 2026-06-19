@@ -128,7 +128,8 @@ func buildMatchRouter(
 // we use the existing stubListingStoreH from listing_handler_test.go which is in the same package.
 type stubListingStoreInterface = *stubListingStoreH
 
-// newMatchReq builds a GET request for the match endpoint with the given query string.
+// newMatchReq builds a GET request for the match endpoint.
+// userID="" omits the X-User-Id header (unauthenticated). kycTier="" omits X-Kyc-Tier.
 func newMatchReq(path, userID, kycTier string) *http.Request {
 	req := httptest.NewRequestWithContext(context.Background(), http.MethodGet, path, http.NoBody)
 	if userID != "" {
@@ -142,19 +143,12 @@ func newMatchReq(path, userID, kycTier string) *http.Request {
 	return req
 }
 
-// TestMatchHandler_GetMatches tests the GET /v1/tenders/:id/matches handler.
-func TestMatchHandler_GetMatches(t *testing.T) {
-	t.Parallel()
-
-	ownerID := uuid.New()
-	vendor1ID := uuid.New()
-	vendor2ID := uuid.New()
-	vendor3ID := uuid.New()
-	tenderID := uuid.New()
-
+// openTenderListing builds a minimal OPEN tender listing with the given owner.
+func openTenderListing(ownerID uuid.UUID) *domain.Listing {
 	ts := domain.TenderStatusOpen
-	listing := &domain.Listing{
-		ID:           tenderID,
+
+	return &domain.Listing{
+		ID:           uuid.New(),
 		OwnerUserID:  ownerID,
 		Title:        "Test tender",
 		Currency:     "TWD",
@@ -164,8 +158,20 @@ func TestMatchHandler_GetMatches(t *testing.T) {
 		CreatedAt:    time.Now().UTC(),
 		UpdatedAt:    time.Now().UTC(),
 	}
+}
 
-	t.Run("returns ranked results partial=true and breakdown.reliability==0", func(t *testing.T) {
+// TestMatchHandler_GetMatches tests the GET /v1/tenders/:id/matches handler.
+func TestMatchHandler_GetMatches(t *testing.T) {
+	t.Parallel()
+
+	ownerID := uuid.New()
+	vendor1ID := uuid.New()
+	vendor2ID := uuid.New()
+	vendor3ID := uuid.New()
+
+	listing := openTenderListing(ownerID)
+
+	t.Run("owner gets ranked results partial=true and breakdown.reliability==0", func(t *testing.T) {
 		t.Parallel()
 
 		listingStore := newStubListingStoreH(listing)
@@ -184,7 +190,8 @@ func TestMatchHandler_GetMatches(t *testing.T) {
 		}
 
 		router := buildMatchRouter(listingStore, embStore)
-		req := newMatchReq("/v1/tenders/"+listing.ID.String()+"/matches?limit=3", uuid.New().String(), "2")
+		// Owner calls the endpoint.
+		req := newMatchReq("/v1/tenders/"+listing.ID.String()+"/matches?limit=3", ownerID.String(), "2")
 
 		w := httptest.NewRecorder()
 		router.ServeHTTP(w, req)
@@ -211,7 +218,7 @@ func TestMatchHandler_GetMatches(t *testing.T) {
 		assert.True(t, resp.Data.Partial, "partial must be true with NoopWorkspaceStatsClient")
 		require.Len(t, resp.Data.Results, 3)
 
-		// Results sorted descending by overall score → vendor1 first.
+		// Results sorted descending by overall score → vendor1 first (distance=0 → skill=1).
 		assert.Equal(t, vendor1ID.String(), resp.Data.Results[0].VendorUserID)
 		assert.Greater(t, resp.Data.Results[0].OverallScore, resp.Data.Results[1].OverallScore)
 
@@ -240,7 +247,7 @@ func TestMatchHandler_GetMatches(t *testing.T) {
 		}
 
 		router := buildMatchRouter(listingStore, embStore)
-		req := newMatchReq("/v1/tenders/"+listing.ID.String()+"/matches", uuid.New().String(), "2")
+		req := newMatchReq("/v1/tenders/"+listing.ID.String()+"/matches", ownerID.String(), "2")
 
 		w := httptest.NewRecorder()
 		router.ServeHTTP(w, req)
@@ -262,14 +269,14 @@ func TestMatchHandler_GetMatches(t *testing.T) {
 		}
 	})
 
-	t.Run("422 on unindexed tender", func(t *testing.T) {
+	t.Run("422 on unindexed tender (owner caller)", func(t *testing.T) {
 		t.Parallel()
 
 		listingStore := newStubListingStoreH(listing)
 		embStore := newStubEmbeddingStoreH() // no tender embedding seeded
 
 		router := buildMatchRouter(listingStore, embStore)
-		req := newMatchReq("/v1/tenders/"+listing.ID.String()+"/matches", uuid.New().String(), "2")
+		req := newMatchReq("/v1/tenders/"+listing.ID.String()+"/matches", ownerID.String(), "2")
 
 		w := httptest.NewRecorder()
 		router.ServeHTTP(w, req)
@@ -282,10 +289,55 @@ func TestMatchHandler_GetMatches(t *testing.T) {
 		assert.Equal(t, "TENDER_NOT_INDEXED", errObj["code"])
 	})
 
-	t.Run("404 on non-visible non-OPEN tender", func(t *testing.T) {
+	t.Run("404 non-owner Tier-2 on OPEN tender (M-2 owner-only closed)", func(t *testing.T) {
 		t.Parallel()
 
-		// Create an AWARDED (non-OPEN) listing owned by ownerID.
+		listingStore := newStubListingStoreH(listing)
+		embStore := newStubEmbeddingStoreH()
+
+		router := buildMatchRouter(listingStore, embStore)
+
+		nonOwnerID := uuid.New()
+		req := newMatchReq("/v1/tenders/"+listing.ID.String()+"/matches", nonOwnerID.String(), "2")
+
+		w := httptest.NewRecorder()
+		router.ServeHTTP(w, req)
+
+		assert.Equal(t, http.StatusNotFound, w.Code)
+	})
+
+	t.Run("404 classic listing IsTender=false OPEN (M-1 existence oracle closed)", func(t *testing.T) {
+		t.Parallel()
+
+		// Classic listing: OPEN but NOT a tender — must return 404, not 422.
+		classicListing := &domain.Listing{
+			ID:          uuid.New(),
+			OwnerUserID: ownerID,
+			Title:       "Classic listing",
+			Currency:    "TWD",
+			Status:      domain.ListingStatusOpen,
+			IsTender:    false, // not a tender
+			CreatedAt:   time.Now().UTC(),
+			UpdatedAt:   time.Now().UTC(),
+		}
+
+		listingStore := newStubListingStoreH(classicListing)
+		embStore := newStubEmbeddingStoreH()
+
+		router := buildMatchRouter(listingStore, embStore)
+		// Even the owner calling on a classic listing gets 404, not 422.
+		req := newMatchReq("/v1/tenders/"+classicListing.ID.String()+"/matches", ownerID.String(), "2")
+
+		w := httptest.NewRecorder()
+		router.ServeHTTP(w, req)
+
+		assert.Equal(t, http.StatusNotFound, w.Code)
+	})
+
+	t.Run("404 non-OPEN tender non-owner (subsumed by owner-only guard)", func(t *testing.T) {
+		t.Parallel()
+
+		// AWARDED tender owned by ownerID.
 		awardedListing := &domain.Listing{
 			ID:          uuid.New(),
 			OwnerUserID: ownerID,
@@ -335,7 +387,7 @@ func TestMatchHandler_GetMatches(t *testing.T) {
 		}
 
 		router := buildMatchRouter(listingStore, embStore)
-		req := newMatchReq("/v1/tenders/"+listing.ID.String()+"/matches?limit=51", uuid.New().String(), "2")
+		req := newMatchReq("/v1/tenders/"+listing.ID.String()+"/matches?limit=51", ownerID.String(), "2")
 
 		w := httptest.NewRecorder()
 		router.ServeHTTP(w, req)
@@ -364,7 +416,7 @@ func TestMatchHandler_GetMatches(t *testing.T) {
 			domain.EmbeddingEntityTypeTender, listing.ID, tenderVec, "v1"))
 
 		router := buildMatchRouter(listingStore, embStore)
-		req := newMatchReq("/v1/tenders/"+listing.ID.String()+"/matches?limit=0", uuid.New().String(), "2")
+		req := newMatchReq("/v1/tenders/"+listing.ID.String()+"/matches?limit=0", ownerID.String(), "2")
 
 		w := httptest.NewRecorder()
 		router.ServeHTTP(w, req)
@@ -389,7 +441,7 @@ func TestMatchHandler_GetMatches(t *testing.T) {
 		embStore := newStubEmbeddingStoreH()
 
 		router := buildMatchRouter(listingStore, embStore)
-		req := newMatchReq("/v1/tenders/"+uuid.New().String()+"/matches", uuid.New().String(), "2")
+		req := newMatchReq("/v1/tenders/"+uuid.New().String()+"/matches", ownerID.String(), "2")
 
 		w := httptest.NewRecorder()
 		router.ServeHTTP(w, req)
@@ -404,7 +456,22 @@ func TestMatchHandler_GetMatches(t *testing.T) {
 		embStore := newStubEmbeddingStoreH()
 
 		router := buildMatchRouter(listingStore, embStore)
-		req := newMatchReq("/v1/tenders/not-a-uuid/matches", uuid.New().String(), "2")
+		req := newMatchReq("/v1/tenders/not-a-uuid/matches", ownerID.String(), "2")
+
+		w := httptest.NewRecorder()
+		router.ServeHTTP(w, req)
+
+		assert.Equal(t, http.StatusBadRequest, w.Code)
+	})
+
+	t.Run("400 on non-integer limit param", func(t *testing.T) {
+		t.Parallel()
+
+		listingStore := newStubListingStoreH()
+		embStore := newStubEmbeddingStoreH()
+
+		router := buildMatchRouter(listingStore, embStore)
+		req := newMatchReq("/v1/tenders/"+uuid.New().String()+"/matches?limit=abc", ownerID.String(), "2")
 
 		w := httptest.NewRecorder()
 		router.ServeHTTP(w, req)

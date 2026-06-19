@@ -64,13 +64,19 @@ func (h *MatchHandler) GetMatches(c *gin.Context) {
 		return
 	}
 
-	// Parse and clamp limit query parameter.
+	// Parse limit query parameter.
+	// Absent or empty → default 10. Present but non-integer → 400.
 	limit := 10
 
 	if rawLimit := c.Query("limit"); rawLimit != "" {
-		if parsed, parseErr := strconv.Atoi(rawLimit); parseErr == nil {
-			limit = parsed
+		parsed, parseErr := strconv.Atoi(rawLimit)
+		if parseErr != nil {
+			httpx.ErrCode(c, http.StatusBadRequest, "VALIDATION_ERROR", "limit must be an integer")
+
+			return
 		}
+
+		limit = parsed
 	}
 
 	result, err := h.svc.GetMatches(c.Request.Context(), identity.UserID, tenderID, limit)

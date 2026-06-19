@@ -99,14 +99,16 @@ func clampSimilarity(cosineDistance float32) float64 {
 	return s
 }
 
-// GetMatches returns a ranked vendor list for the given tender, applying the
-// visibility rule (non-OPEN tenders visible only to owner), owner exclusion, and
-// partial scoring when workspace stats are unavailable.
+// GetMatches returns a ranked vendor list for the given tender, applying
+// owner-only access control, owner exclusion from results, and partial scoring
+// when workspace stats are unavailable.
 //
 // Security invariants enforced here:
-//   - Visibility rule: mirrors GetListing — non-OPEN listing visible only to owner.
-//     If listing not visible: ErrListingNotFound (404, no resource enumeration).
-//   - IDOR: excludes the tender owner from match results.
+//   - Owner-only + tender guard: match results are private to the tender owner.
+//     Classic listings (is_tender=false) and any caller who is not the owner
+//     all receive ErrListingNotFound (404) — no resource enumeration.
+//   - IDOR: excludes the tender owner from match results (owner cannot match
+//     themselves as a vendor on their own tender).
 //   - GET side-effect: no write — no ai_recommendation row is inserted.
 func (s *MatchService) GetMatches(
 	ctx context.Context,
@@ -123,14 +125,15 @@ func (s *MatchService) GetMatches(
 		limit = 50
 	}
 
-	// Fetch listing with visibility rule (mirrors GetListing in listing_service.go).
+	// Fetch listing; not-found errors propagate as-is (→ 404).
 	listing, err := s.listings.GetByID(ctx, tenderID)
 	if err != nil {
 		return nil, err
 	}
 
-	// Non-OPEN listings visible only to their owner — collapse to 404 (IDOR defense).
-	if listing.Status != domain.ListingStatusOpen && listing.OwnerUserID != callerID {
+	// Match results are private to the tender owner; the endpoint serves tenders only.
+	// Classic listings (IsTender=false) and non-owner callers → 404 (no enumeration).
+	if !listing.IsTender || listing.OwnerUserID != callerID {
 		return nil, domain.ErrListingNotFound
 	}
 
