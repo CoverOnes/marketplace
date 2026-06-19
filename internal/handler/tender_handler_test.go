@@ -186,7 +186,13 @@ func (*noopTenderOutboxStoreH) MarkFailed(_ context.Context, _ uuid.UUID, _ stri
 	return nil
 }
 
+func (*noopTenderOutboxStoreH) MarkDeadLettered(_ context.Context, _ uuid.UUID) error { return nil }
+
 func (*noopTenderOutboxStoreH) DeletePublishedBefore(_ context.Context, _ time.Time) (int64, error) {
+	return 0, nil
+}
+
+func (*noopTenderOutboxStoreH) DeleteDeadLetteredBefore(_ context.Context, _ time.Time) (int64, error) {
 	return 0, nil
 }
 

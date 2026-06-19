@@ -259,7 +259,13 @@ func (*noopTenderOutboxStore) MarkFailed(_ context.Context, _ uuid.UUID, _ strin
 	return nil
 }
 
+func (*noopTenderOutboxStore) MarkDeadLettered(_ context.Context, _ uuid.UUID) error { return nil }
+
 func (*noopTenderOutboxStore) DeletePublishedBefore(_ context.Context, _ time.Time) (int64, error) {
+	return 0, nil
+}
+
+func (*noopTenderOutboxStore) DeleteDeadLetteredBefore(_ context.Context, _ time.Time) (int64, error) {
 	return 0, nil
 }
 
@@ -286,7 +292,13 @@ func (*recordingOutboxStore) MarkFailed(_ context.Context, _ uuid.UUID, _ string
 	return nil
 }
 
+func (*recordingOutboxStore) MarkDeadLettered(_ context.Context, _ uuid.UUID) error { return nil }
+
 func (*recordingOutboxStore) DeletePublishedBefore(_ context.Context, _ time.Time) (int64, error) {
+	return 0, nil
+}
+
+func (*recordingOutboxStore) DeleteDeadLetteredBefore(_ context.Context, _ time.Time) (int64, error) {
 	return 0, nil
 }
 

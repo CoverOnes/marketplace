@@ -53,8 +53,16 @@ func (s *txOutboxStore) MarkFailed(ctx context.Context, id uuid.UUID, lastErr st
 	return markOutboxFailed(ctx, s.tx, id, lastErr)
 }
 
+func (s *txOutboxStore) MarkDeadLettered(ctx context.Context, id uuid.UUID) error {
+	return markOutboxDeadLettered(ctx, s.tx, id)
+}
+
 func (s *txOutboxStore) DeletePublishedBefore(ctx context.Context, cutoff time.Time) (int64, error) {
 	return deleteOutboxPublishedBefore(ctx, s.tx, cutoff)
+}
+
+func (s *txOutboxStore) DeleteDeadLetteredBefore(ctx context.Context, cutoff time.Time) (int64, error) {
+	return deleteOutboxDeadLetteredBefore(ctx, s.tx, cutoff)
 }
 
 // --- pool-backed methods ---
@@ -68,6 +76,7 @@ func (s *OutboxStore) Enqueue(ctx context.Context, e *domain.OutboxEvent) error 
 // claimed_until = now() + outboxClaimDuration via a single UPDATE...RETURNING CTE.
 // Concurrent pollers skip rows already claimed (claimed_until > now()), preventing
 // duplicate delivery within the claim window.
+// Dead-lettered rows (dead_lettered_at IS NOT NULL) are permanently excluded.
 func (s *OutboxStore) PollReady(ctx context.Context, limit int) ([]*domain.OutboxEvent, error) {
 	return pollReadyOutboxEvents(ctx, s.q, limit)
 }
@@ -83,9 +92,21 @@ func (s *OutboxStore) MarkFailed(ctx context.Context, id uuid.UUID, lastErr stri
 	return markOutboxFailed(ctx, s.q, id, lastErr)
 }
 
+// MarkDeadLettered sets dead_lettered_at = now() and clears claimed_until, permanently
+// excluding the row from PollReady. Called when attempts >= domain.MaxOutboxAttempts. Row retained.
+func (s *OutboxStore) MarkDeadLettered(ctx context.Context, id uuid.UUID) error {
+	return markOutboxDeadLettered(ctx, s.q, id)
+}
+
 // DeletePublishedBefore removes published rows older than cutoff. Returns the number of rows deleted.
 func (s *OutboxStore) DeletePublishedBefore(ctx context.Context, cutoff time.Time) (int64, error) {
 	return deleteOutboxPublishedBefore(ctx, s.q, cutoff)
+}
+
+// DeleteDeadLetteredBefore removes dead-lettered rows older than cutoff.
+// Returns the number of rows deleted. Retention housekeeping for poison events.
+func (s *OutboxStore) DeleteDeadLetteredBefore(ctx context.Context, cutoff time.Time) (int64, error) {
+	return deleteOutboxDeadLetteredBefore(ctx, s.q, cutoff)
 }
 
 // --- shared helpers ---
@@ -116,6 +137,7 @@ ON CONFLICT (event_id) DO NOTHING
 // them.  Only rows where claimed_until IS NULL OR claimed_until < now() are
 // eligible, so a second concurrent poller will skip in-flight rows even though
 // the SELECT and UPDATE happen outside an explicit long-lived transaction.
+// Dead-lettered rows (dead_lettered_at IS NOT NULL) are permanently excluded.
 func pollReadyOutboxEvents(ctx context.Context, q querier, limit int) ([]*domain.OutboxEvent, error) {
 	if limit <= 0 {
 		limit = 10
@@ -129,6 +151,7 @@ WITH claimed AS (
         SELECT id
         FROM event_outbox
         WHERE published_at IS NULL
+          AND dead_lettered_at IS NULL
           AND next_attempt_at <= now()
           AND (claimed_until IS NULL OR claimed_until < now())
         ORDER BY next_attempt_at ASC, created_at ASC
@@ -136,7 +159,8 @@ WITH claimed AS (
         FOR UPDATE SKIP LOCKED
     )
     RETURNING id, aggregate_type, aggregate_id, event_id, channel, payload,
-              created_at, published_at, attempts, last_error, next_attempt_at, claimed_until
+              created_at, published_at, attempts, last_error, next_attempt_at, claimed_until,
+              dead_lettered_at
 )
 SELECT * FROM claimed
 ORDER BY next_attempt_at ASC, created_at ASC
@@ -202,11 +226,29 @@ SET attempts        = attempts + 1,
     claimed_until   = NULL
 WHERE id = $1
   AND published_at IS NULL
+  AND dead_lettered_at IS NULL
 `
 
-	_, err := q.Exec(ctx, query, id, lastErr, outboxMaxBackoff.Seconds())
+	_, err := q.Exec(ctx, query, id, domain.RedactErrString(lastErr), outboxMaxBackoff.Seconds())
 	if err != nil {
 		return fmt.Errorf("mark outbox failed: %w", err)
+	}
+
+	return nil
+}
+
+// markOutboxDeadLettered sets dead_lettered_at = now() and clears claimed_until,
+// permanently excluding the row from PollReady.
+// Called when attempts >= domain.MaxOutboxAttempts.
+// The row is retained for manual inspection; requeue by setting dead_lettered_at = NULL.
+func markOutboxDeadLettered(ctx context.Context, q querier, id uuid.UUID) error {
+	const query = `
+UPDATE event_outbox
+SET dead_lettered_at = now(), claimed_until = NULL
+WHERE id = $1 AND published_at IS NULL AND dead_lettered_at IS NULL`
+
+	if _, err := q.Exec(ctx, query, id); err != nil {
+		return fmt.Errorf("mark outbox dead-lettered: %w", err)
 	}
 
 	return nil
@@ -227,6 +269,21 @@ WHERE published_at IS NOT NULL
 	return tag.RowsAffected(), nil
 }
 
+func deleteOutboxDeadLetteredBefore(ctx context.Context, q querier, cutoff time.Time) (int64, error) {
+	const query = `
+DELETE FROM event_outbox
+WHERE dead_lettered_at IS NOT NULL
+  AND dead_lettered_at < $1
+`
+
+	tag, err := q.Exec(ctx, query, cutoff)
+	if err != nil {
+		return 0, fmt.Errorf("delete dead-lettered outbox rows: %w", err)
+	}
+
+	return tag.RowsAffected(), nil
+}
+
 func scanOutboxEvent(row rowScanner) (*domain.OutboxEvent, error) {
 	var e domain.OutboxEvent
 
@@ -235,6 +292,7 @@ func scanOutboxEvent(row rowScanner) (*domain.OutboxEvent, error) {
 		&e.Channel, &e.Payload,
 		&e.CreatedAt, &e.PublishedAt,
 		&e.Attempts, &e.LastError, &e.NextAttemptAt, &e.ClaimedUntil,
+		&e.DeadLetteredAt,
 	)
 	if err != nil {
 		if errors.Is(err, pgx.ErrNoRows) {

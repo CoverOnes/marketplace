@@ -5,7 +5,6 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
-	"regexp"
 	"time"
 	"unicode/utf8"
 
@@ -33,37 +32,7 @@ const (
 	defaultListBySubjectLimit = 200
 )
 
-// credentialPatterns are the regex patterns applied by redactBasis to scrub
-// credential-like strings from AI-generated basis text before persisting
-// (backend-security §3.1). Patterns mirror the spec in backend-security-design.md.
-var credentialPatterns = []*regexp.Regexp{ // package-level compiled regexes; initialized once at startup, never mutated
-	regexp.MustCompile(`sk_live_[A-Za-z0-9_]+`),
-	regexp.MustCompile(`ghp_[A-Za-z0-9_]+`),
-	regexp.MustCompile(`xoxb-[A-Za-z0-9_-]+`),
-	regexp.MustCompile(`Bearer ey[A-Za-z0-9._-]+`),
-	// postgres:// and postgresql:// (RFC-correct scheme) DSNs (backend-security §3.1, Mi-1).
-	regexp.MustCompile(`postgres(?:ql)?://[^:]+:[^@]+@\S+`),
-	// mongodb:// and mongodb+srv:// (Atlas DNS-seedlist, the common hosted form) DSNs
-	// (backend-security §3.1, M-1).
-	regexp.MustCompile(`mongodb(?:\+srv)?://[^:]+:[^@]+@\S+`),
-	regexp.MustCompile(`AKIA[0-9A-Z]{16}`),
-	// password / api_key key=value pairs. The quoted branches use [^']* / [^"]* (NOT
-	// [^\s'"]*) so a value containing the opposite quote style — e.g. api_key: 'secret"x' —
-	// is still fully consumed including its closing quote, and the closing quote never
-	// leaks out (backend-security §3.1, M-2 mixed-quote evasion + Mi-3 trailing quote).
-	regexp.MustCompile(`(?i)password[=:]\s*(?:'[^']*'|"[^"]*"|[^\s'"]+)`),
-	regexp.MustCompile(`(?i)api[_-]?key[=:]\s*(?:'[^']*'|"[^"]*"|[^\s'"]+)`),
-}
-
-// redactBasis applies the §3.1 credential patterns to text, replacing each
-// match with [REDACTED]. It is called on *r.Basis before any DB Exec.
-func redactBasis(text string) string {
-	for _, re := range credentialPatterns {
-		text = re.ReplaceAllString(text, "[REDACTED]")
-	}
-
-	return text
-}
+// credentialPatterns and redactBasis are defined in credential_redact.go (shared across the postgres package).
 
 // RecommendationStore is a pool-backed recommendation store.
 // It satisfies store.RecommendationStore.

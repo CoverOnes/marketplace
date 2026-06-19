@@ -35,6 +35,9 @@ const (
 	// retentionPeriod is how long published outbox rows are kept before deletion.
 	retentionPeriod = 7 * 24 * time.Hour
 
+	// deadLetterRetentionPeriod is how long dead-lettered rows are kept before deletion.
+	deadLetterRetentionPeriod = 30 * 24 * time.Hour
+
 	// staleUnpublishedThreshold triggers a slog.Warn when an unpublished event
 	// is older than this duration.
 	staleUnpublishedThreshold = time.Hour
@@ -121,7 +124,7 @@ func (p *Poller) tick() {
 
 	events, err := p.outbox.PollReady(pollCtx, pollBatchSize)
 	if err != nil {
-		slog.Warn("outbox poll failed", "err", err)
+		slog.Warn("outbox poll failed", "err", domain.RedactErrString(err.Error()))
 
 		return
 	}
@@ -131,6 +134,7 @@ func (p *Poller) tick() {
 	}
 
 	p.deletePublished()
+	p.deleteDeadLettered()
 	p.alertStale()
 }
 
@@ -145,16 +149,33 @@ func (p *Poller) processEvent(evt *domain.OutboxEvent) {
 	defer markCancel()
 
 	if pubErr != nil {
+		if evt.Attempts+1 >= domain.MaxOutboxAttempts {
+			slog.Error(
+				"outbox poller: dead-lettering poison event",
+				"outbox_id", evt.ID,
+				"event_id", evt.EventID,
+				"channel", evt.Channel,
+				"attempts", evt.Attempts+1,
+				"last_err", domain.RedactErrString(pubErr.Error()),
+			)
+
+			if dlErr := p.outbox.MarkDeadLettered(markCtx, evt.ID); dlErr != nil {
+				slog.Warn("outbox poller: mark-dead-lettered failed", "outbox_id", evt.ID, "err", domain.RedactErrString(dlErr.Error()))
+			}
+
+			return
+		}
+
 		slog.Warn(
 			"outbox publish failed; will retry",
 			"event_id", evt.EventID,
 			"channel", evt.Channel,
 			"attempts", evt.Attempts+1,
-			"err", pubErr,
+			"err", domain.RedactErrString(pubErr.Error()),
 		)
 
 		if markErr := p.outbox.MarkFailed(markCtx, evt.ID, pubErr.Error()); markErr != nil {
-			slog.Warn("outbox mark-failed failed", "outbox_id", evt.ID, "err", markErr)
+			slog.Warn("outbox mark-failed failed", "outbox_id", evt.ID, "err", domain.RedactErrString(markErr.Error()))
 		}
 
 		return
@@ -165,7 +186,7 @@ func (p *Poller) processEvent(evt *domain.OutboxEvent) {
 			"outbox mark-published failed; event was delivered but may be re-delivered",
 			"outbox_id", evt.ID,
 			"event_id", evt.EventID,
-			"err", markErr,
+			"err", domain.RedactErrString(markErr.Error()),
 		)
 	}
 }
@@ -179,13 +200,32 @@ func (p *Poller) deletePublished() {
 
 	n, err := p.outbox.DeletePublishedBefore(retCtx, cutoff)
 	if err != nil {
-		slog.Warn("outbox retention delete failed", "err", err)
+		slog.Warn("outbox retention delete failed", "err", domain.RedactErrString(err.Error()))
 
 		return
 	}
 
 	if n > 0 {
 		slog.Info("outbox retention: deleted published rows", "count", n)
+	}
+}
+
+// deleteDeadLettered removes dead-lettered rows older than deadLetterRetentionPeriod (30 days).
+func (p *Poller) deleteDeadLettered() {
+	retCtx, retCancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer retCancel()
+
+	cutoff := time.Now().UTC().Add(-deadLetterRetentionPeriod)
+
+	n, err := p.outbox.DeleteDeadLetteredBefore(retCtx, cutoff)
+	if err != nil {
+		slog.Warn("outbox dead-letter retention delete failed", "err", domain.RedactErrString(err.Error()))
+
+		return
+	}
+
+	if n > 0 {
+		slog.Info("outbox dead-letter retention: deleted dead-lettered rows", "count", n)
 	}
 }
 
