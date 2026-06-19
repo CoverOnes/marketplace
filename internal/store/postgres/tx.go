@@ -204,3 +204,31 @@ func (m *BidOutboxTxManager) WithBidOutboxTx(
 		return fn(ctx, txListings, txBids, txAwards, txOutbox)
 	})
 }
+
+// VendorProfileOutboxTxManager implements store.VendorProfileOutboxTxManager using
+// pgxpool.Pool. It wraps the vendor_profile upsert + outbox Enqueue in a single
+// transaction so the vendor_embedding_reindex event is never lost on crash
+// (same-tx outbox pattern — mirrors ListingOutboxTxManager).
+type VendorProfileOutboxTxManager struct {
+	pool *pgxpool.Pool
+}
+
+// NewVendorProfileOutboxTxManager returns a VendorProfileOutboxTxManager backed by
+// the given pool.
+func NewVendorProfileOutboxTxManager(pool *pgxpool.Pool) *VendorProfileOutboxTxManager {
+	return &VendorProfileOutboxTxManager{pool: pool}
+}
+
+// WithVendorProfileOutboxTx runs fn inside a single Postgres transaction with a
+// vendor_profile store and a transaction-scoped outbox store.
+func (m *VendorProfileOutboxTxManager) WithVendorProfileOutboxTx(
+	ctx context.Context,
+	fn func(ctx context.Context, profiles store.VendorProfileStore, outbox store.OutboxStore) error,
+) error {
+	return runTx(ctx, m.pool, func(tx pgx.Tx) error {
+		txProfiles := &txVendorProfileStore{tx: tx}
+		txOutbox := &txOutboxStore{tx: tx}
+
+		return fn(ctx, txProfiles, txOutbox)
+	})
+}

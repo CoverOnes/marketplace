@@ -2,11 +2,14 @@ package service
 
 import (
 	"context"
+	"errors"
 	"fmt"
+	"strings"
 	"time"
 	"unicode/utf8"
 
 	"github.com/CoverOnes/marketplace/internal/domain"
+	"github.com/CoverOnes/marketplace/internal/outbox"
 	"github.com/CoverOnes/marketplace/internal/store"
 	"github.com/google/uuid"
 )
@@ -24,33 +27,25 @@ const (
 
 // VendorProfileService handles vendor profile business logic.
 //
-// V2 extension point: pass a non-nil outboxEnqueuer to enable same-tx outbox
-// enqueue after Upsert (for auto-embedding). When nil, Upsert operates as a
-// plain store call (V1 behavior).
+// V2: pass a non-nil vendorProfileOutbox to enable same-tx outbox enqueue on
+// Upsert when embeddable text changes (auto-embedding pipeline). When nil, Upsert
+// operates as a plain store call (V1 / test stubs that bypass the tx manager).
 type VendorProfileService struct {
-	profiles store.VendorProfileStore
-	// outboxEnqueuer is intentionally nil in V1.  V2 will inject a real
-	// implementation that enqueues a vendor_profile_reindex event in the
-	// same Postgres transaction as the upsert.
-	outboxEnqueuer VendorProfileOutboxEnqueuer
-}
-
-// VendorProfileOutboxEnqueuer is the hook V2 will implement to enqueue a
-// reindex event in the same transaction as the vendor_profile upsert.
-// In V1 this is always nil; the service checks for nil before calling.
-type VendorProfileOutboxEnqueuer interface {
-	EnqueueReindex(ctx context.Context, ownerUserID uuid.UUID) error
+	profiles            store.VendorProfileStore
+	vendorProfileOutbox store.VendorProfileOutboxTxManager
 }
 
 // NewVendorProfileService returns a VendorProfileService.
-// outboxEnqueuer MUST be nil in V1; V2 passes a real implementation.
+// vendorProfileOutbox MUST be nil when no embedding pipeline is desired (test
+// stubs or V1 callers); pass a real VendorProfileOutboxTxManager to enable V2
+// same-tx outbox enqueue on create/update.
 func NewVendorProfileService(
 	profiles store.VendorProfileStore,
-	outboxEnqueuer VendorProfileOutboxEnqueuer,
+	vendorProfileOutbox store.VendorProfileOutboxTxManager,
 ) *VendorProfileService {
 	return &VendorProfileService{
-		profiles:       profiles,
-		outboxEnqueuer: outboxEnqueuer,
+		profiles:            profiles,
+		vendorProfileOutbox: vendorProfileOutbox,
 	}
 }
 
@@ -133,6 +128,11 @@ func validateSkills(skills []string) error {
 
 	for i, sk := range skills {
 		skLen := utf8.RuneCountInString(sk)
+		// V1 Minor #1: reject empty-string skill entries (e.g. ["Go", ""] → 400).
+		if skLen == 0 {
+			return fmt.Errorf("%w: skills[%d] must not be empty", domain.ErrValidation, i)
+		}
+
 		if skLen > vpMaxSkillRunes {
 			return fmt.Errorf("%w: skills[%d] must be ≤%d runes (got %d)",
 				domain.ErrValidation, i, vpMaxSkillRunes, skLen)
@@ -146,12 +146,43 @@ func validateSkills(skills []string) error {
 	return nil
 }
 
+// derefStr dereferences a string pointer, returning "" when nil.
+func derefStr(s *string) string {
+	if s == nil {
+		return ""
+	}
+
+	return *s
+}
+
+// vendorTextChanged reports whether the embeddable text fields of a vendor profile
+// differ between the current DB state (old) and the new values. Any change to
+// displayName, headline, bio, or skills triggers a reindex.
+func vendorTextChanged(old *domain.VendorProfile, newDisplayName string, newHeadline, newBio *string, newSkills []string) bool {
+	if old.DisplayName != newDisplayName {
+		return true
+	}
+
+	if derefStr(old.Headline) != derefStr(newHeadline) {
+		return true
+	}
+
+	if derefStr(old.Bio) != derefStr(newBio) {
+		return true
+	}
+
+	return strings.Join(old.Skills, ",") != strings.Join(newSkills, ",")
+}
+
 // Upsert creates or updates the vendor profile for the given owner.
 // Sanitizes and length-validates all text fields (backend-security §5.2, §5.4)
 // before delegating to the store layer.
 //
-// V2 hook: when outboxEnqueuer is non-nil, EnqueueReindex is called after a
-// successful upsert to schedule embedding regeneration.
+// V2 outbox: when vendorProfileOutbox is non-nil, the profile write and the
+// vendor_embedding_reindex enqueue happen in the SAME Postgres transaction.
+// For a create (no existing profile) the event is always enqueued. For an update
+// the event is enqueued only when the embeddable text changed (displayName,
+// headline, bio, or skills) — a re-PUT with identical values does NOT enqueue.
 func (s *VendorProfileService) Upsert(ctx context.Context, in UpsertVendorProfileInput) (*domain.VendorProfile, error) {
 	if err := validateUpsertInput(in); err != nil {
 		return nil, err
@@ -174,18 +205,66 @@ func (s *VendorProfileService) Upsert(ctx context.Context, in UpsertVendorProfil
 		UpdatedAt:   now,
 	}
 
+	if s.vendorProfileOutbox != nil {
+		return s.upsertWithOutbox(ctx, in, p)
+	}
+
 	if err := s.profiles.Upsert(ctx, p); err != nil {
 		return nil, err
 	}
 
-	// V2 hook — nil in V1.
-	if s.outboxEnqueuer != nil {
-		if err := s.outboxEnqueuer.EnqueueReindex(ctx, in.OwnerUserID); err != nil {
-			return nil, fmt.Errorf("enqueue vendor_profile reindex: %w", err)
-		}
+	return p, nil
+}
+
+// upsertWithOutbox performs the vendor_profile upsert and conditionally enqueues
+// a vendor_embedding_reindex event in the SAME Postgres transaction.
+// On create (ErrNotFound → no old row) the event is always enqueued.
+// On update the event is enqueued only when the embeddable text changed.
+func (s *VendorProfileService) upsertWithOutbox(
+	ctx context.Context,
+	in UpsertVendorProfileInput,
+	p *domain.VendorProfile,
+) (*domain.VendorProfile, error) {
+	// Peek at the existing row BEFORE opening the transaction so we can snapshot
+	// the old text for the textChanged check.  The record-not-found case is a
+	// create, which always enqueues.
+	old, lookupErr := s.profiles.GetByOwner(ctx, in.OwnerUserID)
+
+	isCreate := errors.Is(lookupErr, domain.ErrNotFound)
+	if lookupErr != nil && !isCreate {
+		return nil, fmt.Errorf("lookup vendor_profile before upsert: %w", lookupErr)
 	}
 
-	return p, nil
+	skills := p.Skills // already normalised above
+
+	shouldEnqueue := isCreate || vendorTextChanged(old, in.DisplayName, in.Headline, in.Bio, skills)
+
+	var created *domain.VendorProfile
+
+	err := s.vendorProfileOutbox.WithVendorProfileOutboxTx(ctx, func(
+		txCtx context.Context,
+		txProfiles store.VendorProfileStore,
+		ob store.OutboxStore,
+	) error {
+		if upsertErr := txProfiles.Upsert(txCtx, p); upsertErr != nil {
+			return fmt.Errorf("upsert vendor_profile: %w", upsertErr)
+		}
+
+		if shouldEnqueue {
+			if enqErr := outbox.EnqueueVendorEmbeddingReindex(txCtx, ob, in.OwnerUserID); enqErr != nil {
+				return fmt.Errorf("enqueue vendor_embedding_reindex: %w", enqErr)
+			}
+		}
+
+		created = p
+
+		return nil
+	})
+	if err != nil {
+		return nil, err
+	}
+
+	return created, nil
 }
 
 // Get returns the vendor profile for the given owner user.

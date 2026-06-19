@@ -228,6 +228,75 @@ func TestVendorProfileService_Get_NotFound(t *testing.T) {
 	require.ErrorIs(t, err, domain.ErrNotFound)
 }
 
+// TestVendorProfileService_Upsert_EmptySkillRejected verifies that an empty string
+// within the skills slice is rejected with ErrValidation. (V1 Minor #1)
+//
+// A skills slice such as ["Go", ""] — e.g. produced by a client splitting on commas
+// without trimming — must return 400, not silently store an empty skill entry.
+func TestVendorProfileService_Upsert_EmptySkillRejected(t *testing.T) {
+	t.Parallel()
+
+	ownerID := uuid.New()
+	st := newStubVendorProfileStore()
+	svc := service.NewVendorProfileService(st, nil)
+
+	tests := []struct {
+		name   string
+		skills []string
+	}{
+		{
+			name:   "single empty skill",
+			skills: []string{""},
+		},
+		{
+			name:   "mixed valid and empty skill",
+			skills: []string{"Go", ""},
+		},
+		{
+			name:   "empty skill at start",
+			skills: []string{"", "PostgreSQL"},
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+
+			in := makeUpsertInput(ownerID)
+			in.Skills = tc.skills
+
+			_, err := svc.Upsert(context.Background(), in)
+			require.Error(t, err, "empty skill entry must be rejected")
+			assert.True(t, errors.Is(err, domain.ErrValidation),
+				"empty skill must yield ErrValidation, got: %v", err)
+		})
+	}
+}
+
+// TestVendorProfileService_Upsert_BioAcceptsBareCarriageReturn verifies that bio
+// accepts a bare \r character (V1 Minor #3 documented behavior).
+//
+// Rationale: textarea inputs in some web clients (especially on Windows) may send
+// bare \r (CR without LF) as part of their line-ending encoding.
+// sanitizeMultilineText intentionally permits standalone \r — it only rejects \x00
+// and other ASCII control chars below 0x20 (excluding \t, \n, and \r).
+// This test documents and locks that intentional acceptance.
+func TestVendorProfileService_Upsert_BioAcceptsBareCarriageReturn(t *testing.T) {
+	t.Parallel()
+
+	ownerID := uuid.New()
+	st := newStubVendorProfileStore()
+	svc := service.NewVendorProfileService(st, nil)
+
+	in := makeUpsertInput(ownerID)
+	// Bare \r in bio — accepted by sanitizeMultilineText (see vendor_profile_store.go
+	// storeSanitizeMultiline: \r is in the explicit exception list alongside \t and \n).
+	in.Bio = strPtrSvc("Line one.\rLine two.")
+
+	_, err := svc.Upsert(context.Background(), in)
+	require.NoError(t, err, "bio with bare \\r must be accepted (sanitizeMultilineText intentionally permits standalone CR)")
+}
+
 // TestVendorProfileService_Upsert_LargeValidPayload verifies that the maximum
 // valid payload (display_name 200, headline 200, bio 5000, 50 skills each 100)
 // is accepted without error.
