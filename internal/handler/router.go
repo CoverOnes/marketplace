@@ -14,12 +14,13 @@ import (
 
 // RouterConfig holds all handler-level dependencies.
 type RouterConfig struct {
-	ListingSvc    *service.ListingService
-	BidSvc        *service.BidService
-	TenderSvc     *service.TenderService
-	AttachmentSvc *service.AttachmentService
-	Pool          *pgxpool.Pool
-	Redis         *redis.Client // may be nil in dev
+	ListingSvc       *service.ListingService
+	BidSvc           *service.BidService
+	TenderSvc        *service.TenderService
+	AttachmentSvc    *service.AttachmentService
+	VendorProfileSvc *service.VendorProfileService
+	Pool             *pgxpool.Pool
+	Redis            *redis.Client // may be nil in dev
 
 	// GatewayHMACSecret is the §24.1 shared secret used to verify the
 	// gateway-origin identity signature. Empty == dev posture (verification
@@ -70,6 +71,7 @@ func NewRouter(cfg *RouterConfig) *gin.Engine {
 	bidH := NewBidHandler(cfg.BidSvc)
 	tenderH := NewTenderHandler(cfg.TenderSvc)
 	attachmentH := NewAttachmentHandler(cfg.AttachmentSvc)
+	vendorProfileH := NewVendorProfileHandler(cfg.VendorProfileSvc)
 
 	api := r.Group("/v1")
 	// Defense-in-depth (§24.1): verify the gateway-origin HMAC signature BEFORE
@@ -134,6 +136,10 @@ func NewRouter(cfg *RouterConfig) *gin.Engine {
 	api.POST("/tender/collaborators/:id/accept", middleware.RequireTier(2), tenderH.AcceptCollaborator)
 	api.POST("/tender/collaborators/:id/reject", middleware.RequireTier(2), tenderH.RejectCollaborator)
 	api.POST("/tender/collaborators/:id/exit", middleware.RequireTier(2), tenderH.ExitCollaborator)
+
+	// Vendor profile — own-profile only (Slice-1). Tier>=2 for both read and write.
+	api.PUT("/vendor-profile", middleware.RequireTier(2), vendorProfileH.Upsert)
+	api.GET("/vendor-profile", middleware.RequireTier(2), vendorProfileH.GetOwn)
 
 	return r
 }

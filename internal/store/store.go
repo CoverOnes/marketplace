@@ -295,3 +295,18 @@ type RecommendationStore interface {
 	// Called by the retention runner (30-day TTL per migration 000013 comment).
 	DeleteOlderThan(ctx context.Context, cutoff time.Time) (int64, error)
 }
+
+// VendorProfileStore defines persistence operations for vendor profiles.
+// There is at most one profile per user (owner_user_id UNIQUE index).
+type VendorProfileStore interface {
+	// Upsert inserts or updates the vendor profile for the given owner_user_id.
+	// On conflict the row is updated in place; created_at is preserved and
+	// updated_at is set to now() (same-tx semantics as EmbeddingStore.Upsert).
+	// Go-level validation MUST be performed by the caller before calling Upsert
+	// (backend-security §5.2: don't surface raw DB check_violation to callers).
+	Upsert(ctx context.Context, p *domain.VendorProfile) error
+
+	// GetByOwner returns the vendor profile for the given owner_user_id, or
+	// domain.ErrNotFound when the user has no profile.
+	GetByOwner(ctx context.Context, ownerUserID uuid.UUID) (*domain.VendorProfile, error)
+}
