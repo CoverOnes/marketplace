@@ -279,10 +279,11 @@ type EmbeddingStore interface {
 
 // RecommendationStore defines persistence operations for AI recommendation audit rows.
 type RecommendationStore interface {
-	// Insert writes one AI recommendation audit row.
-	// The Basis field MUST be redacted by the caller before calling Insert
-	// (backend-security §3.1): any generated text matching credential patterns
-	// must be replaced with [REDACTED:type] before reaching the store layer.
+	// Insert writes one AI recommendation audit row. The store layer is the
+	// authoritative redaction boundary: Insert scrubs the Basis field through the
+	// §3.1 credential patterns (replacing each match with [REDACTED]) before any DB
+	// write, so a credential-bearing Basis can never be persisted in plaintext even
+	// if a caller forgets to pre-redact (backend-security §3.1).
 	Insert(ctx context.Context, r *domain.AIRecommendation) error
 
 	// ListBySubject returns up to limit recommendation rows for the given subject
