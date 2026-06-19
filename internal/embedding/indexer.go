@@ -107,7 +107,7 @@ func (ix *Indexer) DrainOnce(ctx context.Context) {
 
 	events, err := ix.outboxStore.PollReady(pollCtx, 20)
 	if err != nil {
-		slog.Warn("embedding indexer DrainOnce: poll failed", "err", err)
+		slog.Warn("embedding indexer DrainOnce: poll failed", "err", domain.RedactErrString(err.Error()))
 
 		return
 	}
@@ -153,7 +153,7 @@ func (ix *Indexer) tick() {
 
 	events, err := ix.outboxStore.PollReady(pollCtx, 20)
 	if err != nil {
-		slog.Warn("embedding indexer: poll failed", "err", err)
+		slog.Warn("embedding indexer: poll failed", "err", domain.RedactErrString(err.Error()))
 
 		return
 	}
@@ -193,7 +193,7 @@ func (ix *Indexer) processEvent(evt *domain.OutboxEvent) {
 			)
 
 			if dlErr := ix.outboxStore.MarkDeadLettered(markCtx, evt.ID); dlErr != nil {
-				slog.Warn("embedding indexer: mark-dead-lettered failed", "outbox_id", evt.ID, "err", dlErr)
+				slog.Warn("embedding indexer: mark-dead-lettered failed", "outbox_id", evt.ID, "err", domain.RedactErrString(dlErr.Error()))
 			}
 
 			return
@@ -205,11 +205,11 @@ func (ix *Indexer) processEvent(evt *domain.OutboxEvent) {
 			"event_id", evt.EventID,
 			"channel", evt.Channel,
 			"attempts", evt.Attempts+1,
-			"err", processErr,
+			"err", domain.RedactErrString(processErr.Error()),
 		)
 
 		if markErr := ix.outboxStore.MarkFailed(markCtx, evt.ID, processErr.Error()); markErr != nil {
-			slog.Warn("embedding indexer: mark-failed failed", "outbox_id", evt.ID, "err", markErr)
+			slog.Warn("embedding indexer: mark-failed failed", "outbox_id", evt.ID, "err", domain.RedactErrString(markErr.Error()))
 		}
 
 		return
@@ -220,7 +220,7 @@ func (ix *Indexer) processEvent(evt *domain.OutboxEvent) {
 			"embedding indexer: mark-published failed; event processed but may be re-processed",
 			"outbox_id", evt.ID,
 			"event_id", evt.EventID,
-			"err", markErr,
+			"err", domain.RedactErrString(markErr.Error()),
 		)
 	}
 }

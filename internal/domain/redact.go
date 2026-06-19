@@ -32,6 +32,14 @@ var credentialPatterns = []*regexp.Regexp{
 	// leaks out (backend-security §3.1, M-2 mixed-quote evasion + Mi-3 trailing quote).
 	regexp.MustCompile(`(?i)password[=:]\s*(?:'[^']*'|"[^"]*"|[^\s'"]+)`),
 	regexp.MustCompile(`(?i)api[_-]?key[=:]\s*(?:'[^']*'|"[^"]*"|[^\s'"]+)`),
+	// sk- prefixed keys: OpenRouter (sk-or-v1-*), Anthropic (sk-ant-*), generic provider
+	// keys. Require ≥20 chars after "sk-" to avoid false positives on short identifiers
+	// (e.g. "sk-1234" in non-credential contexts). The {20,} quantifier is intentional.
+	regexp.MustCompile(`sk-[A-Za-z0-9_-]{20,}`),
+	// HTTP(S) URLs with embedded Basic Auth credentials (user:pass@host).
+	// [^:\s]+ captures the username (non-empty, no colon or whitespace).
+	// [^@\s]+ captures the password (non-empty, no @ or whitespace).
+	regexp.MustCompile(`https?://[^:\s]+:[^@\s]+@\S+`),
 }
 
 // RedactCredentials applies the §3.1 credential patterns to s, replacing each

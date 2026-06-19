@@ -92,6 +92,30 @@ func TestRedactCredentials(t *testing.T) {
 			input: strings.Repeat("a", 600),
 			want:  strings.Repeat("a", 600),
 		},
+		// FIX B: sk- prefixed provider keys (OpenRouter, Anthropic, generic).
+		{
+			name:  "OpenRouter sk-or-v1- key is redacted",
+			input: `authorization failed: sk-or-v1-abcdefghijklmnopqrstu123456`,
+			want:  `authorization failed: [REDACTED]`,
+		},
+		{
+			name:  "short sk- value (under 20 chars) is NOT redacted",
+			input: `config key: sk-short123`,
+			// "sk-" + "short123" = 8 chars, well under the {20,} minimum — must pass through
+			want: `config key: sk-short123`,
+		},
+		// FIX B: HTTP(S) URLs with Basic Auth credentials embedded.
+		{
+			name:  "HTTPS URL with basic auth credentials is redacted",
+			input: `request to https://apiuser:s3cr3tP@ss@api.example.com/v1/embed failed`,
+			want:  `request to [REDACTED] failed`,
+		},
+		{
+			name:  "benign HTTPS URL without credentials is NOT redacted",
+			input: `request to https://api.example.com/v1/embed failed`,
+			// No user:pass@ component — must not be redacted
+			want: `request to https://api.example.com/v1/embed failed`,
+		},
 	}
 
 	for _, tc := range tests {
@@ -144,15 +168,28 @@ func TestRedactErrString(t *testing.T) {
 	}
 }
 
-// TestRedactErrString_Truncation verifies that strings exceeding 500 bytes are
-// truncated with the "...[truncated]" marker.
+// TestRedactErrString_Truncation verifies truncation behavior at the 500-byte boundary.
 func TestRedactErrString_Truncation(t *testing.T) {
 	t.Parallel()
 
-	long := strings.Repeat("a", 600)
-	got := domain.RedactErrString(long)
+	t.Run("600-byte string is truncated with marker", func(t *testing.T) {
+		t.Parallel()
 
-	assert.True(t, strings.HasSuffix(got, "...[truncated]"), "must end with truncation marker")
-	// 500 bytes of content + 14 bytes of "...[truncated]" = 514 max
-	assert.LessOrEqual(t, len(got), 514, "truncated string must not exceed maxRedactedErrLen + marker length")
+		long := strings.Repeat("a", 600)
+		got := domain.RedactErrString(long)
+
+		assert.True(t, strings.HasSuffix(got, "...[truncated]"), "must end with truncation marker")
+		// 500 bytes of content + 14 bytes of "...[truncated]" = 514 max
+		assert.LessOrEqual(t, len(got), 514, "truncated string must not exceed maxRedactedErrLen + marker length")
+	})
+
+	t.Run("exactly-500-byte string is NOT truncated", func(t *testing.T) {
+		t.Parallel()
+
+		exact := strings.Repeat("b", 500)
+		got := domain.RedactErrString(exact)
+
+		assert.Equal(t, exact, got, "exactly-500-byte benign string must pass through unchanged")
+		assert.False(t, strings.HasSuffix(got, "...[truncated]"), "must NOT have truncation marker at exactly 500 bytes")
+	})
 }

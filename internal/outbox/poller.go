@@ -124,7 +124,7 @@ func (p *Poller) tick() {
 
 	events, err := p.outbox.PollReady(pollCtx, pollBatchSize)
 	if err != nil {
-		slog.Warn("outbox poll failed", "err", err)
+		slog.Warn("outbox poll failed", "err", domain.RedactErrString(err.Error()))
 
 		return
 	}
@@ -160,7 +160,7 @@ func (p *Poller) processEvent(evt *domain.OutboxEvent) {
 			)
 
 			if dlErr := p.outbox.MarkDeadLettered(markCtx, evt.ID); dlErr != nil {
-				slog.Warn("outbox poller: mark-dead-lettered failed", "outbox_id", evt.ID, "err", dlErr)
+				slog.Warn("outbox poller: mark-dead-lettered failed", "outbox_id", evt.ID, "err", domain.RedactErrString(dlErr.Error()))
 			}
 
 			return
@@ -171,11 +171,11 @@ func (p *Poller) processEvent(evt *domain.OutboxEvent) {
 			"event_id", evt.EventID,
 			"channel", evt.Channel,
 			"attempts", evt.Attempts+1,
-			"err", pubErr,
+			"err", domain.RedactErrString(pubErr.Error()),
 		)
 
 		if markErr := p.outbox.MarkFailed(markCtx, evt.ID, pubErr.Error()); markErr != nil {
-			slog.Warn("outbox mark-failed failed", "outbox_id", evt.ID, "err", markErr)
+			slog.Warn("outbox mark-failed failed", "outbox_id", evt.ID, "err", domain.RedactErrString(markErr.Error()))
 		}
 
 		return
@@ -186,7 +186,7 @@ func (p *Poller) processEvent(evt *domain.OutboxEvent) {
 			"outbox mark-published failed; event was delivered but may be re-delivered",
 			"outbox_id", evt.ID,
 			"event_id", evt.EventID,
-			"err", markErr,
+			"err", domain.RedactErrString(markErr.Error()),
 		)
 	}
 }
@@ -200,7 +200,7 @@ func (p *Poller) deletePublished() {
 
 	n, err := p.outbox.DeletePublishedBefore(retCtx, cutoff)
 	if err != nil {
-		slog.Warn("outbox retention delete failed", "err", err)
+		slog.Warn("outbox retention delete failed", "err", domain.RedactErrString(err.Error()))
 
 		return
 	}
@@ -219,7 +219,7 @@ func (p *Poller) deleteDeadLettered() {
 
 	n, err := p.outbox.DeleteDeadLetteredBefore(retCtx, cutoff)
 	if err != nil {
-		slog.Warn("outbox dead-letter retention delete failed", "err", err)
+		slog.Warn("outbox dead-letter retention delete failed", "err", domain.RedactErrString(err.Error()))
 
 		return
 	}
