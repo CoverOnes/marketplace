@@ -93,6 +93,36 @@ func TestRedactBasis_CredentialPatterns(t *testing.T) {
 			input: "dsn=postgres://user:p@ssw0rd!@host/db",
 			want:  "dsn=[REDACTED]",
 		},
+		{ //nolint:gosec // G101 false positive: test fixture string used to verify the redactBasis function, not a real credential
+			name:  "PostgreSQL RFC-scheme DSN (postgresql://) redacted (Mi-1)",
+			input: "dsn=postgresql://user:password@host:5432/db here",
+			want:  "dsn=[REDACTED] here",
+		},
+		{ //nolint:gosec // G101 false positive: test fixture string used to verify the redactBasis function, not a real credential
+			name:  "MongoDB Atlas SRV DSN (mongodb+srv://) redacted (M-1)",
+			input: "mongodb+srv://admin:Secr3tPass@cluster0.mongodb.net/mydb?retryWrites=true",
+			want:  "[REDACTED]",
+		},
+		{
+			name:  "api_key mixed outer-single inner-double quote fully consumed (M-2)",
+			input: `api_key: 'real-secret"token' end`,
+			want:  "[REDACTED] end",
+		},
+		{
+			name:  "api_key mixed outer-double inner-single quote fully consumed (M-2)",
+			input: `api_key: "real-secret'token" end`,
+			want:  "[REDACTED] end",
+		},
+		{
+			name:  "password single-quoted value — closing quote consumed, no trailing quote (Mi-3)",
+			input: "config: password='hunter2' is set",
+			want:  "config: [REDACTED] is set",
+		},
+		{
+			name:  "password double-quoted value — closing quote consumed (Mi-3)",
+			input: `config: password="hunter2" is set`,
+			want:  "config: [REDACTED] is set",
+		},
 	}
 
 	for _, tc := range tests {

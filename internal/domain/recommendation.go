@@ -32,9 +32,9 @@ type AIRecommendation struct {
 	SubjectUserID      uuid.UUID
 	OverallScore       float64
 	ScoreBreakdown     ScoreBreakdown
-	// Basis is the human-readable explainability text.
-	// MUST be redacted (backend-security §3.1) before persist: any generated
-	// text that matches credential patterns is replaced with [REDACTED:type].
+	// Basis is the human-readable explainability text. The store layer redacts it
+	// (backend-security §3.1) inside RecommendationStore.Insert before persist: any
+	// text matching credential patterns is replaced with [REDACTED].
 	Basis        *string
 	Accepted     *bool
 	ModelVersion string
