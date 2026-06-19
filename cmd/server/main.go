@@ -173,6 +173,9 @@ func run() error {
 	// Attachment store.
 	attachmentStore := postgres.NewListingAttachmentStore(pool)
 
+	// Vendor profile store.
+	vendorProfileStore := postgres.NewVendorProfileStore(pool)
+
 	// Workspace S2S client (M-2 fix): marketplace calls workspace after AcceptBid
 	// to create the contract with authoritative award values.
 	// When MARKETPLACE_WORKSPACE_BASE_URL is empty, the call is skipped (local dev).
@@ -229,6 +232,10 @@ func run() error {
 	// fileClient may be nil when FILE_BASE_URL is unset (local dev — S2S calls are skipped).
 	attachmentSvc := service.NewAttachmentService(attachmentStore, listingStore, tenderCollabStore, fileClient)
 
+	// Vendor profile service — V1: outboxEnqueuer is nil (no embedding reindex yet).
+	// V2 will pass a real VendorProfileOutboxEnqueuer to trigger embedding on upsert.
+	vendorProfileSvc := service.NewVendorProfileService(vendorProfileStore, nil)
+
 	// Outbox poller — start only when Redis is available; interval from env (default 2s).
 	// The poller goroutine is canceled on graceful shutdown via pollerCtx.
 	pollerCtx, pollerCancel := context.WithCancel(ctx)
@@ -271,6 +278,7 @@ func run() error {
 		BidSvc:              bidSvc,
 		TenderSvc:           tenderSvc,
 		AttachmentSvc:       attachmentSvc,
+		VendorProfileSvc:    vendorProfileSvc,
 		Pool:                pool,
 		Redis:               redisClient,
 		GatewayHMACSecret:   cfg.GatewayHMACSecret,
