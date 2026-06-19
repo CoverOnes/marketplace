@@ -3,6 +3,7 @@
 package embedding
 
 import (
+	"strings"
 	"unicode/utf8"
 
 	"github.com/CoverOnes/marketplace/internal/domain"
@@ -28,6 +29,45 @@ func ComposeTenderText(l *domain.Listing) string {
 	}
 
 	composed := l.Title + "\n" + l.Description
+
+	if utf8.RuneCountInString(composed) > maxTextRunes {
+		runes := []rune(composed)
+		composed = string(runes[:maxTextRunes])
+	}
+
+	return composed
+}
+
+// ComposeVendorText returns the embeddable plain-text representation of a vendor
+// profile. All text fields (displayName, headline, bio, skills) are embedded
+// because every field contributes to semantic vendor discovery.
+//
+// The output is deterministic:
+//
+//	displayName + "\n" + headline + "\n" + bio + "\n" + skills (comma-joined)
+//
+// Nil profile → empty string. Nil pointer fields (headline, bio) are treated as
+// empty strings. Skills is joined with ", ". Output is capped at 20 000 runes
+// (same cap as ComposeTenderText). The function is pure (no I/O).
+//
+// IMPORTANT: entity_id for vendor embeddings is owner_user_id (NOT the
+// vendor_profile row id). T5 NearestNeighbors results are mapped back to user IDs.
+func ComposeVendorText(p *domain.VendorProfile) string {
+	if p == nil {
+		return ""
+	}
+
+	headline := ""
+	if p.Headline != nil {
+		headline = *p.Headline
+	}
+
+	bio := ""
+	if p.Bio != nil {
+		bio = *p.Bio
+	}
+
+	composed := p.DisplayName + "\n" + headline + "\n" + bio + "\n" + strings.Join(p.Skills, ", ")
 
 	if utf8.RuneCountInString(composed) > maxTextRunes {
 		runes := []rune(composed)

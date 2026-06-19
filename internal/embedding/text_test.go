@@ -109,3 +109,110 @@ func TestComposeTenderText_Deterministic(t *testing.T) {
 
 	assert.Equal(t, first, second, "ComposeTenderText must be deterministic")
 }
+
+// ─────────────────────────────────────────────────────────────────────────────
+// ComposeVendorText tests
+// ─────────────────────────────────────────────────────────────────────────────
+
+func strPtr(s string) *string { return &s }
+
+// TestComposeVendorText_Golden verifies the deterministic composition format and
+// nil-safety of ComposeVendorText.
+func TestComposeVendorText_Golden(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name string
+		in   *domain.VendorProfile
+		want string
+	}{
+		{
+			name: "happy path: all fields populated",
+			in: &domain.VendorProfile{
+				DisplayName: "Alice",
+				Headline:    strPtr("Go specialist"),
+				Bio:         strPtr("I write Go services."),
+				Skills:      []string{"Go", "PostgreSQL"},
+			},
+			want: "Alice\nGo specialist\nI write Go services.\nGo, PostgreSQL",
+		},
+		{
+			name: "happy path: nil headline and bio",
+			in: &domain.VendorProfile{
+				DisplayName: "Bob",
+				Skills:      []string{"Python"},
+			},
+			want: "Bob\n\n\nPython",
+		},
+		{
+			name: "happy path: empty skills slice",
+			in: &domain.VendorProfile{
+				DisplayName: "Carol",
+				Headline:    strPtr("Designer"),
+				Bio:         strPtr("UI/UX"),
+				Skills:      []string{},
+			},
+			want: "Carol\nDesigner\nUI/UX\n",
+		},
+		{
+			name: "edge case: nil profile returns empty string",
+			in:   nil,
+			want: "",
+		},
+		{
+			name: "edge case: nil skills treated as empty (no panic)",
+			in: &domain.VendorProfile{
+				DisplayName: "Dave",
+				Skills:      nil,
+			},
+			want: "Dave\n\n\n",
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+
+			got := embedding.ComposeVendorText(tc.in)
+			assert.Equal(t, tc.want, got)
+		})
+	}
+}
+
+// TestComposeVendorText_Cap verifies that a combined text exceeding 20 000 runes
+// is capped at exactly 20 000 runes.
+func TestComposeVendorText_Cap(t *testing.T) {
+	t.Parallel()
+
+	// Build a profile whose combined field text exceeds 20 000 runes.
+	longBio := strings.Repeat("A", 20_000)
+	p := &domain.VendorProfile{
+		DisplayName: "Alice",
+		Headline:    strPtr("specialist"),
+		Bio:         strPtr(longBio),
+		Skills:      []string{"Go"},
+	}
+
+	got := embedding.ComposeVendorText(p)
+
+	runeCount := len([]rune(got))
+	assert.Equal(t, 20_000, runeCount, "ComposeVendorText output MUST be capped at exactly 20 000 runes")
+}
+
+// TestComposeVendorText_Deterministic verifies that two calls with identical input
+// produce identical output.
+func TestComposeVendorText_Deterministic(t *testing.T) {
+	t.Parallel()
+
+	p := &domain.VendorProfile{
+		DisplayName: "Eve",
+		Headline:    strPtr("QA Engineer"),
+		Bio:         strPtr("I test things."),
+		Skills:      []string{"Testing", "Go"},
+	}
+
+	first := embedding.ComposeVendorText(p)
+	second := embedding.ComposeVendorText(p)
+
+	assert.Equal(t, first, second, "ComposeVendorText must be deterministic")
+}

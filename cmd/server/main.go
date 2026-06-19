@@ -232,9 +232,11 @@ func run() error {
 	// fileClient may be nil when FILE_BASE_URL is unset (local dev — S2S calls are skipped).
 	attachmentSvc := service.NewAttachmentService(attachmentStore, listingStore, tenderCollabStore, fileClient)
 
-	// Vendor profile service — V1: outboxEnqueuer is nil (no embedding reindex yet).
-	// V2 will pass a real VendorProfileOutboxEnqueuer to trigger embedding on upsert.
-	vendorProfileSvc := service.NewVendorProfileService(vendorProfileStore, nil)
+	// Vendor profile service — V2: same-tx outbox enqueue on create/update.
+	// VendorProfileOutboxTxManager wraps the upsert + EnqueueVendorEmbeddingReindex in
+	// one transaction so embedding events are never lost on crash. entity_id = owner_user_id.
+	vendorProfileOutboxTxManager := postgres.NewVendorProfileOutboxTxManager(pool)
+	vendorProfileSvc := service.NewVendorProfileService(vendorProfileStore, vendorProfileOutboxTxManager)
 
 	// Outbox poller — start only when Redis is available; interval from env (default 2s).
 	// The poller goroutine is canceled on graceful shutdown via pollerCtx.
@@ -243,19 +245,19 @@ func run() error {
 
 	startOutboxPoller(pollerCtx, redisClient, outboxStore)
 
-	// Embedding indexer — consumes marketplace.embedding_reindex outbox events,
-	// composes tender text, calls the embedding API, and upserts to the embeddings
-	// table. Starts only when the outbox poller is active (Redis present);
-	// when Redis is absent, outbox events are never delivered, so the indexer is a
-	// no-op drain — starting it is harmless but unnecessary.
+	// Embedding indexer — consumes marketplace.embedding_reindex (tender) and
+	// marketplace.vendor_embedding_reindex (vendor) outbox events, composes entity
+	// text, calls the embedding API, and upserts to the embeddings table.
+	// Starts only when the outbox poller is active (Redis present).
 	// The indexer goroutine is also canceled on graceful shutdown via pollerCtx.
 	indexerOutboxStore := postgres.NewOutboxStore(pool)
 	indexer := embedding.NewIndexer(&embedding.IndexerConfig{
-		OutboxStore:    indexerOutboxStore,
-		ListingStore:   listingStore,
-		EmbeddingStore: embeddingStore,
-		EmbClient:      embClient,
-		ModelVersion:   cfg.EmbeddingModel,
+		OutboxStore:        indexerOutboxStore,
+		ListingStore:       listingStore,
+		VendorProfileStore: vendorProfileStore,
+		EmbeddingStore:     embeddingStore,
+		EmbClient:          embClient,
+		ModelVersion:       cfg.EmbeddingModel,
 	})
 
 	go indexer.Run(pollerCtx)

@@ -310,3 +310,15 @@ type VendorProfileStore interface {
 	// domain.ErrNotFound when the user has no profile.
 	GetByOwner(ctx context.Context, ownerUserID uuid.UUID) (*domain.VendorProfile, error)
 }
+
+// VendorProfileOutboxTxManager wraps a vendor_profile upsert + outbox Enqueue in a
+// single Postgres transaction. Used by VendorProfileService.Upsert (V2) to enqueue
+// a vendor_embedding_reindex event in the same tx as the profile write.
+// (same-tx outbox pattern — mirrors ListingOutboxTxManager)
+type VendorProfileOutboxTxManager interface {
+	WithVendorProfileOutboxTx(ctx context.Context, fn func(
+		ctx context.Context,
+		profiles VendorProfileStore,
+		outbox OutboxStore,
+	) error) error
+}

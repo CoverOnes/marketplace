@@ -189,6 +189,22 @@ func TestVendorProfileStore_ValidationErrors_Integration(t *testing.T) {
 			},
 			wantErr: "skills[0] must be ≤100 runes",
 		},
+		{
+			// Store-layer guard: a direct store caller (bypassing the service) must not
+			// be able to persist an empty-string skill entry. (reviewer M-3)
+			name: "empty string skill rejected at store layer",
+			mutate: func(p *domain.VendorProfile) {
+				p.Skills = []string{"Go", ""}
+			},
+			wantErr: "skills[1] must not be empty",
+		},
+		{
+			name: "single empty skill at index 0",
+			mutate: func(p *domain.VendorProfile) {
+				p.Skills = []string{""}
+			},
+			wantErr: "skills[0] must not be empty",
+		},
 	}
 
 	for _, tc := range tests {
@@ -220,6 +236,91 @@ func TestVendorProfileStore_NullSkills_Integration(t *testing.T) {
 	require.NoError(t, err)
 	assert.NotNil(t, got.Skills, "skills must never be nil after round-trip")
 	assert.Empty(t, got.Skills, "nil skills must come back as empty slice")
+}
+
+// TestVendorProfileStore_ControlCharRejection_Integration verifies that the store-layer
+// sanitizers reject control characters in all text fields. (V1 Minor #2)
+//
+// This is a STORE-LAYER test (bypasses the service layer) to confirm that the indexer
+// path — which writes directly through the store without going through the service —
+// cannot persist malicious control characters.
+func TestVendorProfileStore_ControlCharRejection_Integration(t *testing.T) {
+	ctx := context.Background()
+	s := pgstore.NewVendorProfileStore(sharedTestPool)
+	ownerID := uuid.New()
+
+	tests := []struct {
+		name   string
+		mutate func(p *domain.VendorProfile)
+	}{
+		{
+			name:   "null byte in display_name rejected",
+			mutate: func(p *domain.VendorProfile) { p.DisplayName = "bad\x00name" },
+		},
+		{
+			name:   "LF in display_name rejected",
+			mutate: func(p *domain.VendorProfile) { p.DisplayName = "bad\nname" },
+		},
+		{
+			name:   "CR in display_name rejected",
+			mutate: func(p *domain.VendorProfile) { p.DisplayName = "bad\rname" },
+		},
+		{
+			name:   "ASCII control char (BEL) in display_name rejected",
+			mutate: func(p *domain.VendorProfile) { p.DisplayName = "bad\x07name" },
+		},
+		{
+			name: "null byte in headline rejected",
+			mutate: func(p *domain.VendorProfile) {
+				h := "bad\x00headline"
+				p.Headline = &h
+			},
+		},
+		{
+			name: "null byte in bio rejected",
+			mutate: func(p *domain.VendorProfile) {
+				b := "bad\x00bio"
+				p.Bio = &b
+			},
+		},
+		{
+			name: "ASCII control char (SOH) in bio rejected",
+			mutate: func(p *domain.VendorProfile) {
+				b := "bad\x01bio"
+				p.Bio = &b
+			},
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			p := makeProfile(ownerID)
+			tc.mutate(p)
+			err := s.Upsert(ctx, p)
+			require.Error(t, err, "store-layer must reject profile containing control character")
+		})
+	}
+}
+
+// TestVendorProfileStore_BioAcceptsBareCarriageReturn_Integration verifies that the
+// store-layer multiline sanitizer intentionally accepts standalone \r in bio.
+//
+// Documented intent: storeSanitizeMultiline permits \r alongside \t and \n
+// because textarea inputs on some clients send bare CR. Standalone \r is
+// harmless in Postgres text columns. (V1 Minor #3 documented behavior)
+func TestVendorProfileStore_BioAcceptsBareCarriageReturn_Integration(t *testing.T) {
+	ctx := context.Background()
+	resetVendorProfiles(ctx, t)
+
+	s := pgstore.NewVendorProfileStore(sharedTestPool)
+	ownerID := uuid.New()
+	p := makeProfile(ownerID)
+
+	bioWithCR := "Line one.\rLine two."
+	p.Bio = &bioWithCR
+
+	require.NoError(t, s.Upsert(ctx, p),
+		"store-layer must accept bio with bare \\r (storeSanitizeMultiline intentionally permits CR)")
 }
 
 // TestVendorProfileStore_MigrationDDL_Integration verifies that migration 000014
