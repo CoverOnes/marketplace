@@ -17,17 +17,22 @@ import (
 //
 // ClaimedUntil is set atomically by PollReady to prevent concurrent pollers from
 // picking up the same row. MarkPublished and MarkFailed both clear it.
+//
+// DeadLetteredAt is set by MarkDeadLettered when Attempts reaches the cap
+// (maxOutboxAttempts). Once set, the row is permanently excluded from PollReady
+// and is retained for manual inspection. Requeue by setting dead_lettered_at = NULL.
 type OutboxEvent struct {
-	ID            uuid.UUID
-	AggregateType string
-	AggregateID   uuid.UUID
-	EventID       uuid.UUID
-	Channel       string
-	Payload       []byte
-	CreatedAt     time.Time
-	PublishedAt   *time.Time
-	Attempts      int
-	LastError     *string
-	NextAttemptAt time.Time
-	ClaimedUntil  *time.Time
+	ID             uuid.UUID
+	AggregateType  string
+	AggregateID    uuid.UUID
+	EventID        uuid.UUID
+	Channel        string
+	Payload        []byte
+	CreatedAt      time.Time
+	PublishedAt    *time.Time
+	Attempts       int
+	LastError      *string
+	NextAttemptAt  time.Time
+	ClaimedUntil   *time.Time
+	DeadLetteredAt *time.Time
 }

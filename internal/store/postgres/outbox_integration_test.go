@@ -489,4 +489,123 @@ func TestOutboxStore_MigrationDDL_Integration(t *testing.T) {
 
 	require.NoError(t, err)
 	assert.True(t, claimedUntilExists, "claimed_until column must exist after migration")
+
+	// Verify dead_lettered_at column exists (migration 000015).
+	var deadLetteredAtExists bool
+
+	err = sharedTestPool.QueryRow(
+		ctx,
+		`SELECT EXISTS (
+			SELECT 1 FROM information_schema.columns
+			WHERE table_name  = 'event_outbox'
+			  AND column_name = 'dead_lettered_at'
+		)`,
+	).Scan(&deadLetteredAtExists)
+
+	require.NoError(t, err)
+	assert.True(t, deadLetteredAtExists, "dead_lettered_at column must exist after migration 000015")
+
+	// Verify dead-letter partial index exists.
+	var deadLetterIdxExists bool
+
+	err = sharedTestPool.QueryRow(
+		ctx,
+		`SELECT EXISTS (
+			SELECT 1 FROM pg_indexes
+			WHERE indexname = 'event_outbox_dead_letter_idx'
+		)`,
+	).Scan(&deadLetterIdxExists)
+
+	require.NoError(t, err)
+	assert.True(t, deadLetterIdxExists, "event_outbox_dead_letter_idx must exist after migration 000015")
+}
+
+// TestOutboxStore_MarkDeadLettered_Integration verifies that MarkDeadLettered sets
+// dead_lettered_at, clears claimed_until, and excludes the row from PollReady.
+func TestOutboxStore_MarkDeadLettered_Integration(t *testing.T) {
+	ctx := context.Background()
+	resetOutbox(ctx, t)
+	s := pgstore.NewOutboxStore(sharedTestPool)
+
+	evt := makeOutboxEvent(uuid.New(), "marketplace.dead_letter_test")
+	require.NoError(t, s.Enqueue(ctx, evt))
+
+	// Claim the row before dead-lettering (mirrors real poller flow).
+	claimed, err := s.PollReady(ctx, 10)
+	require.NoError(t, err)
+
+	var found bool
+
+	for _, e := range claimed {
+		if e.ID == evt.ID {
+			found = true
+		}
+	}
+
+	require.True(t, found, "event must be claimable before MarkDeadLettered")
+
+	// Dead-letter the row.
+	require.NoError(t, s.MarkDeadLettered(ctx, evt.ID))
+
+	// dead_lettered_at must be set; claimed_until must be cleared.
+	var deadLetteredAt *time.Time
+
+	var claimedUntil *time.Time
+
+	err = sharedTestPool.QueryRow(
+		ctx,
+		`SELECT dead_lettered_at, claimed_until FROM event_outbox WHERE id = $1`,
+		evt.ID,
+	).Scan(&deadLetteredAt, &claimedUntil)
+
+	require.NoError(t, err)
+	assert.NotNil(t, deadLetteredAt, "dead_lettered_at must be set after MarkDeadLettered")
+	assert.Nil(t, claimedUntil, "claimed_until must be cleared after MarkDeadLettered")
+
+	// Dead-lettered row must not appear in PollReady.
+	events, err := s.PollReady(ctx, 100)
+	require.NoError(t, err)
+
+	for _, e := range events {
+		assert.NotEqual(t, evt.ID, e.ID, "dead-lettered event must not appear in PollReady")
+	}
+}
+
+// TestOutboxStore_MarkDeadLettered_Idempotent verifies that calling MarkDeadLettered
+// on an already-dead-lettered row is a no-op (does not error).
+func TestOutboxStore_MarkDeadLettered_Idempotent_Integration(t *testing.T) {
+	ctx := context.Background()
+	resetOutbox(ctx, t)
+	s := pgstore.NewOutboxStore(sharedTestPool)
+
+	evt := makeOutboxEvent(uuid.New(), "marketplace.dead_letter_idem_test")
+	require.NoError(t, s.Enqueue(ctx, evt))
+
+	require.NoError(t, s.MarkDeadLettered(ctx, evt.ID), "first MarkDeadLettered must succeed")
+	require.NoError(t, s.MarkDeadLettered(ctx, evt.ID), "second MarkDeadLettered must not error (idempotent)")
+}
+
+// TestOutboxStore_MarkDeadLettered_RetainsRow verifies that dead-lettered rows are
+// retained in the DB (not deleted) and their payload is intact.
+func TestOutboxStore_MarkDeadLettered_RetainsRow_Integration(t *testing.T) {
+	ctx := context.Background()
+	resetOutbox(ctx, t)
+	s := pgstore.NewOutboxStore(sharedTestPool)
+
+	evt := makeOutboxEvent(uuid.New(), "marketplace.dead_letter_retain_test")
+	require.NoError(t, s.Enqueue(ctx, evt))
+
+	require.NoError(t, s.MarkDeadLettered(ctx, evt.ID))
+
+	// Row must still exist with its payload intact.
+	var payload []byte
+
+	err := sharedTestPool.QueryRow(
+		ctx,
+		`SELECT payload FROM event_outbox WHERE id = $1`,
+		evt.ID,
+	).Scan(&payload)
+
+	require.NoError(t, err, "dead-lettered row must still exist in DB")
+	assert.Equal(t, evt.Payload, payload, "payload must be intact after dead-lettering")
 }

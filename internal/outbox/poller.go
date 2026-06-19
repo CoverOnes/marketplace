@@ -41,6 +41,11 @@ const (
 
 	// pollBatchSize is the maximum number of rows claimed per poll cycle.
 	pollBatchSize = 100
+
+	// maxOutboxAttempts is the dead-letter threshold. At 2^N s backoff capped at 600 s,
+	// attempts 1-20 span ~1.8 h before dead-lettering — long enough for transient outages,
+	// finite for true poison events. Duplicated in internal/embedding/indexer.go (see comment there).
+	maxOutboxAttempts = 20
 )
 
 // Publisher is the subset of events.Publisher needed by the poller.
@@ -145,6 +150,23 @@ func (p *Poller) processEvent(evt *domain.OutboxEvent) {
 	defer markCancel()
 
 	if pubErr != nil {
+		if evt.Attempts+1 >= maxOutboxAttempts {
+			slog.Error(
+				"outbox poller: dead-lettering poison event",
+				"outbox_id", evt.ID,
+				"event_id", evt.EventID,
+				"channel", evt.Channel,
+				"attempts", evt.Attempts+1,
+				"last_err", pubErr.Error(),
+			)
+
+			if dlErr := p.outbox.MarkDeadLettered(markCtx, evt.ID); dlErr != nil {
+				slog.Warn("outbox poller: mark-dead-lettered failed", "outbox_id", evt.ID, "err", dlErr)
+			}
+
+			return
+		}
+
 		slog.Warn(
 			"outbox publish failed; will retry",
 			"event_id", evt.EventID,

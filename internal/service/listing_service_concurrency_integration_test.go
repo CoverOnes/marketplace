@@ -97,6 +97,10 @@ func (r *recordingListingOutboxStore) MarkFailed(_ context.Context, _ uuid.UUID,
 	return nil
 }
 
+func (r *recordingListingOutboxStore) MarkDeadLettered(_ context.Context, _ uuid.UUID) error {
+	return nil
+}
+
 func (r *recordingListingOutboxStore) DeletePublishedBefore(_ context.Context, _ time.Time) (int64, error) {
 	return 0, nil
 }

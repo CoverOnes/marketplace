@@ -53,6 +53,10 @@ func (s *txOutboxStore) MarkFailed(ctx context.Context, id uuid.UUID, lastErr st
 	return markOutboxFailed(ctx, s.tx, id, lastErr)
 }
 
+func (s *txOutboxStore) MarkDeadLettered(ctx context.Context, id uuid.UUID) error {
+	return markOutboxDeadLettered(ctx, s.tx, id)
+}
+
 func (s *txOutboxStore) DeletePublishedBefore(ctx context.Context, cutoff time.Time) (int64, error) {
 	return deleteOutboxPublishedBefore(ctx, s.tx, cutoff)
 }
@@ -68,6 +72,7 @@ func (s *OutboxStore) Enqueue(ctx context.Context, e *domain.OutboxEvent) error 
 // claimed_until = now() + outboxClaimDuration via a single UPDATE...RETURNING CTE.
 // Concurrent pollers skip rows already claimed (claimed_until > now()), preventing
 // duplicate delivery within the claim window.
+// Dead-lettered rows (dead_lettered_at IS NOT NULL) are permanently excluded.
 func (s *OutboxStore) PollReady(ctx context.Context, limit int) ([]*domain.OutboxEvent, error) {
 	return pollReadyOutboxEvents(ctx, s.q, limit)
 }
@@ -81,6 +86,12 @@ func (s *OutboxStore) MarkPublished(ctx context.Context, id uuid.UUID) error {
 // and clears claimed_until so the row is visible to the next poll cycle.
 func (s *OutboxStore) MarkFailed(ctx context.Context, id uuid.UUID, lastErr string) error {
 	return markOutboxFailed(ctx, s.q, id, lastErr)
+}
+
+// MarkDeadLettered sets dead_lettered_at = now() and clears claimed_until, permanently
+// excluding the row from PollReady. Called when attempts >= maxOutboxAttempts. Row retained.
+func (s *OutboxStore) MarkDeadLettered(ctx context.Context, id uuid.UUID) error {
+	return markOutboxDeadLettered(ctx, s.q, id)
 }
 
 // DeletePublishedBefore removes published rows older than cutoff. Returns the number of rows deleted.
@@ -116,6 +127,7 @@ ON CONFLICT (event_id) DO NOTHING
 // them.  Only rows where claimed_until IS NULL OR claimed_until < now() are
 // eligible, so a second concurrent poller will skip in-flight rows even though
 // the SELECT and UPDATE happen outside an explicit long-lived transaction.
+// Dead-lettered rows (dead_lettered_at IS NOT NULL) are permanently excluded.
 func pollReadyOutboxEvents(ctx context.Context, q querier, limit int) ([]*domain.OutboxEvent, error) {
 	if limit <= 0 {
 		limit = 10
@@ -129,6 +141,7 @@ WITH claimed AS (
         SELECT id
         FROM event_outbox
         WHERE published_at IS NULL
+          AND dead_lettered_at IS NULL
           AND next_attempt_at <= now()
           AND (claimed_until IS NULL OR claimed_until < now())
         ORDER BY next_attempt_at ASC, created_at ASC
@@ -136,7 +149,8 @@ WITH claimed AS (
         FOR UPDATE SKIP LOCKED
     )
     RETURNING id, aggregate_type, aggregate_id, event_id, channel, payload,
-              created_at, published_at, attempts, last_error, next_attempt_at, claimed_until
+              created_at, published_at, attempts, last_error, next_attempt_at, claimed_until,
+              dead_lettered_at
 )
 SELECT * FROM claimed
 ORDER BY next_attempt_at ASC, created_at ASC
@@ -212,6 +226,23 @@ WHERE id = $1
 	return nil
 }
 
+// markOutboxDeadLettered sets dead_lettered_at = now() and clears claimed_until,
+// permanently excluding the row from PollReady.
+// Called when attempts >= maxOutboxAttempts (defined in indexer and poller packages).
+// The row is retained for manual inspection; requeue by setting dead_lettered_at = NULL.
+func markOutboxDeadLettered(ctx context.Context, q querier, id uuid.UUID) error {
+	const query = `
+UPDATE event_outbox
+SET dead_lettered_at = now(), claimed_until = NULL
+WHERE id = $1 AND published_at IS NULL AND dead_lettered_at IS NULL`
+
+	if _, err := q.Exec(ctx, query, id); err != nil {
+		return fmt.Errorf("mark outbox dead-lettered: %w", err)
+	}
+
+	return nil
+}
+
 func deleteOutboxPublishedBefore(ctx context.Context, q querier, cutoff time.Time) (int64, error) {
 	const query = `
 DELETE FROM event_outbox
@@ -235,6 +266,7 @@ func scanOutboxEvent(row rowScanner) (*domain.OutboxEvent, error) {
 		&e.Channel, &e.Payload,
 		&e.CreatedAt, &e.PublishedAt,
 		&e.Attempts, &e.LastError, &e.NextAttemptAt, &e.ClaimedUntil,
+		&e.DeadLetteredAt,
 	)
 	if err != nil {
 		if errors.Is(err, pgx.ErrNoRows) {

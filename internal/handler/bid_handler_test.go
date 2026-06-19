@@ -185,6 +185,7 @@ func (*noopOutboxStoreH) PollReady(_ context.Context, _ int) ([]*domain.OutboxEv
 }
 func (*noopOutboxStoreH) MarkPublished(_ context.Context, _ uuid.UUID) error        { return nil }
 func (*noopOutboxStoreH) MarkFailed(_ context.Context, _ uuid.UUID, _ string) error { return nil }
+func (*noopOutboxStoreH) MarkDeadLettered(_ context.Context, _ uuid.UUID) error     { return nil }
 func (*noopOutboxStoreH) DeletePublishedBefore(_ context.Context, _ time.Time) (int64, error) {
 	return 0, nil
 }

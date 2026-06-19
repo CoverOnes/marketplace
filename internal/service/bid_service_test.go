@@ -256,6 +256,8 @@ func (*noopOutboxStore) MarkFailed(_ context.Context, _ uuid.UUID, _ string) err
 	return nil
 }
 
+func (*noopOutboxStore) MarkDeadLettered(_ context.Context, _ uuid.UUID) error { return nil }
+
 func (*noopOutboxStore) DeletePublishedBefore(_ context.Context, _ time.Time) (int64, error) {
 	return 0, nil
 }

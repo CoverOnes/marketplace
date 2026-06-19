@@ -195,6 +195,10 @@ type OutboxStore interface {
 	// using exponential backoff (2^attempts seconds, capped at 10 minutes).
 	MarkFailed(ctx context.Context, id uuid.UUID, lastErr string) error
 
+	// MarkDeadLettered sets dead_lettered_at = now() and clears claimed_until, permanently
+	// excluding the row from PollReady. Called when attempts >= maxOutboxAttempts. Row retained.
+	MarkDeadLettered(ctx context.Context, id uuid.UUID) error
+
 	// DeletePublishedBefore removes rows with published_at < cutoff.
 	// Retention housekeeping: called by the poller on each cycle.
 	DeletePublishedBefore(ctx context.Context, cutoff time.Time) (int64, error)
