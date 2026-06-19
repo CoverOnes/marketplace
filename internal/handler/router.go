@@ -19,6 +19,7 @@ type RouterConfig struct {
 	TenderSvc        *service.TenderService
 	AttachmentSvc    *service.AttachmentService
 	VendorProfileSvc *service.VendorProfileService
+	MatchSvc         *service.MatchService
 	Pool             *pgxpool.Pool
 	Redis            *redis.Client // may be nil in dev
 
@@ -72,6 +73,7 @@ func NewRouter(cfg *RouterConfig) *gin.Engine {
 	tenderH := NewTenderHandler(cfg.TenderSvc)
 	attachmentH := NewAttachmentHandler(cfg.AttachmentSvc)
 	vendorProfileH := NewVendorProfileHandler(cfg.VendorProfileSvc)
+	matchH := NewMatchHandler(cfg.MatchSvc)
 
 	api := r.Group("/v1")
 	// Defense-in-depth (§24.1): verify the gateway-origin HMAC signature BEFORE
@@ -140,6 +142,11 @@ func NewRouter(cfg *RouterConfig) *gin.Engine {
 	// Vendor profile — own-profile only (Slice-1). Tier>=2 for both read and write.
 	api.PUT("/vendor-profile", middleware.RequireTier(2), vendorProfileH.Upsert)
 	api.GET("/vendor-profile", middleware.RequireTier(2), vendorProfileH.GetOwn)
+
+	// Match engine — T5 AI vendor ranking for a tender. Tier>=2.
+	// /tenders/:id/matches is registered under /v1/tenders/ (not /listings/) to
+	// avoid conflicting with the existing /listings/:id param routes.
+	api.GET("/tenders/:id/matches", middleware.RequireTier(2), matchH.GetMatches)
 
 	return r
 }

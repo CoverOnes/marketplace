@@ -139,6 +139,10 @@ func translateTender(err error) (code string, status int, message string, ok boo
 	case errors.Is(err, domain.ErrUpstreamWorkspace):
 		return "UPSTREAM_WORKSPACE_ERROR", http.StatusBadGateway,
 			"workspace service error; collaborator is approved but contract update failed", true
+
+	case errors.Is(err, domain.ErrTenderNotIndexed):
+		return "TENDER_NOT_INDEXED", http.StatusUnprocessableEntity,
+			"tender has no embedding yet; please retry after the indexer has processed it", true
 	}
 
 	return "", 0, "", false

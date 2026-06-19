@@ -238,6 +238,11 @@ func run() error {
 	vendorProfileOutboxTxManager := postgres.NewVendorProfileOutboxTxManager(pool)
 	vendorProfileSvc := service.NewVendorProfileService(vendorProfileStore, vendorProfileOutboxTxManager)
 
+	// Match service — T5 AI vendor ranking.
+	// NoopWorkspaceStatsClient ships for reliability/collab/comm until the real
+	// workspace-stats endpoint is implemented; response sets partial=true.
+	matchSvc := service.NewMatchService(listingStore, embeddingStore, &client.NoopWorkspaceStatsClient{})
+
 	// Outbox poller — start only when Redis is available; interval from env (default 2s).
 	// The poller goroutine is canceled on graceful shutdown via pollerCtx.
 	pollerCtx, pollerCancel := context.WithCancel(ctx)
@@ -281,6 +286,7 @@ func run() error {
 		TenderSvc:           tenderSvc,
 		AttachmentSvc:       attachmentSvc,
 		VendorProfileSvc:    vendorProfileSvc,
+		MatchSvc:            matchSvc,
 		Pool:                pool,
 		Redis:               redisClient,
 		GatewayHMACSecret:   cfg.GatewayHMACSecret,
